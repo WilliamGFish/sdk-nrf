@@ -6,7 +6,7 @@
 
 #include <string.h>
 #include <zephyr.h>
-#include <device.h>
+#include <device.h> // For struct device
 #include <net/net_if.h> // For net_if_carrier_on/off
 #include <net/net_core.h> // For net_if_ipv6_addr_add
 #include <net/net_l2.h> // For NET_L2_GET_CTX
@@ -20,114 +20,704 @@
 #include <dect_nr_plus/dect_cvg.h> // For dect_net_if access
 #include <dect_nr_plus/dect_phy_nrf9161.h> /* For PHY layer interaction */
 #include <dect_nr_plus/dect_crypto.h> /* For encryption/decryption */
-#include <dect_nr_plus/dect_power_mgr.h> /* For power management awareness */
-#include <dect_nr_plus/dect_stats.h> /* For updating statistics */
-#include <dect_nr_plus/dect_security.h> /* For security context access (session key) */
+#include <dect_nr_plus/dect_stats.h> // For updating statistics
+#include <dect_nr_plus/dect_channel_mgr.h> // For channel management interaction
+#include <dect_nr_plus/dect_power_mgr.h> // For power management awareness
+#include <dect_nr_plus/dect_routing.h> // For routing layer interaction
 
 #include <logging/log.h>
 LOG_MODULE_REGISTER(dect_mac, CONFIG_DECT_NR_PLUS_LOG_LEVEL);
 
 /* Global MAC context instance definition */
 dect_mac_context_t mac_ctx = {
-	.device_role = MAC_ROLE_FP, // Default role, overwritten by config
+	.role = MAC_ROLE_PP, // Default role
 	.assoc_state = MAC_ASSOC_STATE_IDLE,
-	.sync_state = MAC_SYNC_STATE_UNSYNCHRONIZED,
-	.local_short_rd_id = 0, // Assigned during init or from config
-	.current_hpc = 0,
-	.current_psn = 0,
-	.net_if_ptr = NULL,
+	.sync_state = MAC_SYNC_STATE_IDLE,
+	.local_short_rd_id = 0, // Will be assigned on init or from config
 	.associated_fp_short_rd_id = 0,
-	.associated_pp_short_rd_id = 0, // Only for FP
-	.current_handover_phase = HANDOVER_PHASE_IDLE,
-	.target_fp_for_handover = 0,
-	.handover_retries_count = 0,
+	.current_modem_time = 0,
+	.net_if_ptr = NULL,
 	.num_fp_candidates = 0,
-	.last_scan_attempt_ms = 0,
+	.num_associated_peers = 0,
+	.num_multicast_members = 0,
+	.num_ipv6_to_short_rd_id_entries = 0,
 };
 
-/* Mutex to protect mac_ctx */
+/* Internal message queue for MAC TX requests from DLC */
+// K_MSGQ_DEFINE(mac_tx_msgq, sizeof(dlc_tx_msg_t), CONFIG_DECT_NR_PLUS_MAC_TX_QUEUE_COUNT, 4);
+
+/* Internal message queue for MAC RX indications to DLC */
+// K_MSGQ_DEFINE(mac_rx_msgq, sizeof(dlc_rx_msg_t), CONFIG_DECT_NR_PLUS_MAC_RX_QUEUE_COUNT, 4);
+
+/* Internal FIFO for tracking outstanding HARQ transmissions */
+// K_FIFO_DEFINE(mac_outstanding_tx_fifo);
+
+/* Mutex for protecting MAC context */
 K_MUTEX_DEFINE(mac_ctx_mutex);
 
-/* Net buffer pool for MAC transmit PDUs */
-NET_BUF_POOL_DEFINE(mac_tx_net_buf_pool, CONFIG_DECT_NR_PLUS_MAC_TX_BUF_COUNT,
-					CONFIG_DECT_NR_PLUS_MAC_TX_BUF_SIZE, 0, NULL);
+/* Timer for association process */
+static struct k_timer association_timer;
+/* Timer for synchronization process */
+static struct k_timer sync_timer;
 
-/* Net buffer pool for MAC receive PDUs from PHY */
-NET_BUF_POOL_DEFINE(mac_rx_net_buf_pool, CONFIG_DECT_NR_PLUS_MAC_RX_BUF_COUNT,
-					CONFIG_DECT_NR_PLUS_MAC_RX_BUF_SIZE, 0, NULL);
-
-/* Message queue for MAC transmit requests from DLC/Security */
-K_MSGQ_DEFINE(mac_tx_msgq, sizeof(mac_tx_msg_t),
-	      CONFIG_DECT_NR_PLUS_MAC_TX_QUEUE_SIZE, 4);
-
-/* Message queue for MAC receive indications from PHY */
-K_MSGQ_DEFINE(mac_rx_msgq, sizeof(nrf9161_dect_rx_packet_t),
-	      CONFIG_DECT_NR_PLUS_MAC_RX_QUEUE_SIZE, 4);
-
-/* FIFO for tracking outstanding TX PDUs to ensure correct HARQ feedback mapping */
-K_FIFO_DEFINE(mac_outstanding_tx_fifo);
-
-/* Forward declarations for internal functions */
-static void mac_association_timer_handler(struct k_timer *timer_id);
-static void mac_sync_timer_handler(struct k_timer *timer_id);
-static dect_status_t mac_process_mac_control_pdu(uint16_t src_short_rd_id, struct net_buf *mac_pdu_buf);
-static int find_multicast_member(uint16_t short_rd_id);
-static dect_status_t mac_add_multicast_member(uint16_t short_rd_id);
-static dect_status_t mac_remove_multicast_member(uint16_t short_rd_id);
-static bool mac_is_multicast_member(uint16_t short_rd_id);
+/* Forward declarations for internal static functions */
+static void association_timer_handler(struct k_timer *timer_id);
+static void sync_timer_handler(struct k_timer *timer_id);
 static void mac_clear_outstanding_tx_fifo(void);
+static dect_status_t handle_tx_buffer_allocation(struct net_buf **out_buf, struct net_buf_pool *pool, const char *caller_name,
+												   size_t size, enum dect_status_t error_code);
+static int find_ipv6_to_short_rd_id_entry(const struct in6_addr *ipv6_addr);
+
 
 /**
- * @brief Helper function to handle net_buf allocation for TX path.
+ * @brief Helper to handle net_buf allocation and error paths.
  *
- * This function attempts to allocate a net_buf from the specified pool.
- * If allocation fails, it logs an error and increments a statistic.
- *
- * @param out_buf Pointer to a net_buf pointer where the allocated buffer will be stored.
- * @param pool Pointer to the net_buf_pool to allocate from.
- * @return DECT_STATUS_OK on success, DECT_ERROR_NO_MEM if allocation fails.
+ * @param out_buf Pointer to net_buf pointer to store the allocated buffer.
+ * @param pool The net_buf_pool to allocate from.
+ * @param caller_name String name of the calling function for logging.
+ * @param size Size of the buffer to allocate.
+ * @param error_code The DECT_ERROR code to return on failure.
+ * @return DECT_STATUS_OK on success, or error_code on failure.
  */
-static dect_status_t handle_tx_buffer_allocation(struct net_buf **out_buf, struct net_buf_pool *pool)
+static dect_status_t handle_tx_buffer_allocation(struct net_buf **out_buf, struct net_buf_pool *pool, const char *caller_name,
+												   size_t size, enum dect_status_t error_code)
 {
 	*out_buf = net_buf_alloc(pool, K_NO_WAIT);
 	if (!(*out_buf)) {
-		DECT_ERROR_HANDLER(DECT_ERROR_NO_MEM, "MAC: Failed to allocate net_buf from pool %s. No memory.", pool->name->name);
-		STATS_INC(dect_stats.tx_drops_no_mem); // Increment global stat for TX drops due to no memory
-		return DECT_ERROR_NO_MEM;
+		DECT_ERROR_HANDLER(error_code, "%s: Failed to allocate TX net_buf of size %zu.", caller_name, size);
+		STATS_INC(dect_stats.mac_tx_drops);
+		return error_code;
 	}
 	return DECT_STATUS_OK;
 }
 
-dect_status_t dect_mac_init(const struct device *phy_dev)
+
+dect_status_t dect_mac_init(const struct device *dev)
 {
-	k_mutex_init(&mac_ctx.mutex);
+	ARG_UNUSED(dev); // dev is no longer explicitly used here as PHY init is separate
 
-	// Initialize PHY layer callbacks
-	nrf9161_dect_phy_init(phy_dev, dect_mac_phy_event_handler, dect_mac_phy_rx_packet_handler);
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
 
-	// Set initial configuration from dect_config
-	k_mutex_lock(&mac_ctx.mutex, K_FOREVER);
-	memcpy(mac_ctx.mac_address, dect_config.mac_address, LONG_RD_ID_LEN_BYTES);
-	mac_ctx.device_role = dect_config.device_role;
+	// Initialize MAC context
+	mac_ctx.role = dect_config.device_role;
+	mac_ctx.assoc_state = MAC_ASSOC_STATE_IDLE;
+	mac_ctx.sync_state = MAC_SYNC_STATE_IDLE;
+	mac_ctx.local_short_rd_id = dect_config.short_rd_id;
+	memcpy(mac_ctx.local_long_rd_id, dect_config.mac_address, LONG_RD_ID_LEN_BYTES);
+	mac_ctx.associated_fp_short_rd_id = 0;
+	mac_ctx.num_fp_candidates = 0;
+	mac_ctx.num_associated_peers = 0;
+	mac_ctx.num_multicast_members = 0;
+	mac_ctx.num_ipv6_to_short_rd_id_entries = 0;
 
-	// Assign Short RD ID (either from config or random)
-	if (dect_config.short_rd_id == 0) {
-		mac_ctx.local_short_rd_id = (uint16_t)sys_rand32_get(); // Assign random if 0 in config
-		LOG_WRN("MAC: Short RD ID was 0 in config, assigned random 0x%04x.", mac_ctx.local_short_rd_id);
-	} else {
-		mac_ctx.local_short_rd_id = dect_config.short_rd_id;
+	// Initialize timers
+	k_timer_init(&association_timer, association_timer_handler, NULL);
+	k_timer_init(&sync_timer, sync_timer_handler, NULL);
+
+	// Initialize IPv6 to Short RD ID map
+	for (int i = 0; i < MAX_IPV6_TO_RD_ID_MAP_ENTRIES; i++) {
+		mac_ctx.ipv6_to_short_rd_id_map[i].is_valid = false;
 	}
-	k_mutex_unlock(&mac_ctx.mutex);
 
-	k_timer_init(&mac_ctx.assoc_timer, mac_association_timer_handler, NULL);
-	k_timer_init(&mac_ctx.sync_timer, mac_sync_timer_handler, NULL);
-	k_timer_init(&mac_ctx.handover_timer, NULL, NULL); // Handover timer initialized, handler set during handover
 
-	LOG_INF("MAC: Module initialized. Role: %s, Local Short RD ID: 0x%04x.",
-		mac_ctx.device_role == MAC_ROLE_FP ? "Fixed Part" : "Portable Part",
-		mac_ctx.local_short_rd_id);
+	LOG_INF("MAC: Initialized as %s (Short RD ID: 0x%04x, Long RD ID: %02x:%02x:%02x:%02x)",
+			(mac_ctx.role == MAC_ROLE_FP) ? "Fixed Part" : "Portable Part",
+			mac_ctx.local_short_rd_id,
+			mac_ctx.local_long_rd_id[0], mac_ctx.local_long_rd_id[1],
+			mac_ctx.local_long_rd_id[2], mac_ctx.local_long_rd_id[3]);
+
+	k_mutex_unlock(&mac_ctx_mutex);
+	return DECT_STATUS_OK;
+}
+
+void dect_mac_set_association_state(mac_assoc_state_t state)
+{
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+	if (mac_ctx.assoc_state != state) {
+		LOG_DBG("MAC: Association state changed from %d to %d.", mac_ctx.assoc_state, state);
+		mac_ctx.assoc_state = state;
+		STATS_INC(dect_stats.mac_association_attempts); // Count every change as an attempt/state transition
+	}
+	k_mutex_unlock(&mac_ctx_mutex);
+}
+
+mac_assoc_state_t dect_mac_get_association_state(void)
+{
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+	mac_assoc_state_t state = mac_ctx.assoc_state;
+	k_mutex_unlock(&mac_ctx_mutex);
+	return state;
+}
+
+void dect_mac_set_sync_state(mac_sync_state_t state)
+{
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+	if (mac_ctx.sync_state != state) {
+		LOG_DBG("MAC: Synchronization state changed from %d to %d.", mac_ctx.sync_state, state);
+		mac_ctx.sync_state = state;
+		STATS_INC(dect_stats.mac_sync_attempts); // Count every change as an attempt/state transition
+	}
+	k_mutex_unlock(&mac_ctx_mutex);
+}
+
+mac_sync_state_t dect_mac_get_sync_state(void)
+{
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+	mac_sync_state_t state = mac_ctx.sync_state;
+	k_mutex_unlock(&mac_ctx_mutex);
+	return state;
+}
+
+dect_status_t dect_mac_start_association(void)
+{
+	if (mac_ctx.role == MAC_ROLE_FP) {
+		LOG_WRN("MAC: Fixed Part cannot initiate association (it waits for PPs).");
+		return DECT_ERROR_INVALID_STATE;
+	}
+
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+	if (mac_ctx.assoc_state == MAC_ASSOC_STATE_ASSOCIATED) {
+		LOG_INF("MAC: Already associated. No need to start new association.");
+		k_mutex_unlock(&mac_ctx_mutex);
+		return DECT_STATUS_OK;
+	}
+
+	LOG_DBG("MAC: Starting association process for Portable Part...");
+	dect_mac_set_association_state(MAC_ASSOC_STATE_ASSOCIATING);
+
+	// Start a timer to periodically scan for FPs and send Association Requests
+	k_timer_start(&association_timer, K_MSEC(CONFIG_DECT_NR_PLUS_MAC_ASSOC_RETRY_TIMEOUT_MS),
+				  K_MSEC(CONFIG_DECT_NR_PLUS_MAC_ASSOC_RETRY_TIMEOUT_MS));
+
+	k_mutex_unlock(&mac_ctx_mutex);
+	return DECT_STATUS_OK;
+}
+
+dect_status_t dect_mac_stop_association(void)
+{
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+	LOG_DBG("MAC: Stopping association process.");
+	k_timer_stop(&association_timer);
+	dect_mac_set_association_state(MAC_ASSOC_STATE_IDLE);
+	mac_ctx.associated_fp_short_rd_id = 0;
+	k_mutex_unlock(&mac_ctx_mutex);
+	return DECT_STATUS_OK;
+}
+
+/**
+ * @brief Timer handler for the association process (Portable Part).
+ * This function is called periodically to scan for Fixed Parts and send
+ * Association Request PDUs.
+ *
+ * @param timer_id Pointer to the k_timer that expired.
+ */
+static void association_timer_handler(struct k_timer *timer_id)
+{
+	ARG_UNUSED(timer_id);
+	dect_status_t status;
+
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+
+	if (mac_ctx.role == MAC_ROLE_PP && mac_ctx.assoc_state == MAC_ASSOC_STATE_ASSOCIATING) {
+		LOG_DBG("MAC: Association timer fired. Scanning for FPs and sending Assoc Request.");
+
+		// 1. Scan for Fixed Parts (using channel manager to scan channels)
+		// This is a simplified conceptual call. In a real scenario, this might involve
+		// using dect_channel_mgr_scan_channels and populating dect_fp_candidate_t.
+		// For now, assume a FP is found on channel 0 with a dummy Short RD ID.
+		uint16_t target_fp_short_rd_id = 0x0001; // Example FP Short RD ID
+		uint8_t target_channel = 0; // Example channel
+
+		// In a real implementation:
+		// if (dect_channel_mgr_find_best_fp(&target_fp_short_rd_id, &target_channel) != DECT_STATUS_OK) {
+		//     LOG_DBG("MAC: No suitable Fixed Part found yet.");
+		//     STATS_INC(dect_stats.mac_association_failures);
+		//     k_mutex_unlock(&mac_ctx_mutex);
+		//     return;
+		// }
+
+		// 2. Construct and send Association Request PDU to the found FP
+		struct net_buf *assoc_req_pdu = NULL;
+		status = handle_tx_buffer_allocation(&assoc_req_pdu, &mac_tx_net_buf_pool, __func__,
+											 MAC_CTRL_PDU_HEADER_SIZE, DECT_ERROR_MAC_NO_MEM);
+		if (status != DECT_STATUS_OK) {
+			k_mutex_unlock(&mac_ctx_mutex);
+			return;
+		}
+
+		// MAC Control PDU Header: Type 1 (unicast control) + Control Type (Assoc Req)
+		uint8_t mac_hdr_type_byte = (MAC_HEADER_TYPE_1_CONTROL << 4) | MAC_CONTROL_TYPE_ASSOC_REQ;
+		net_buf_add_u8(assoc_req_pdu, mac_hdr_type_byte);
+		net_buf_add_be16(assoc_req_pdu, mac_ctx.local_short_rd_id); // Source Short RD ID
+		net_buf_add_be16(assoc_req_pdu, target_fp_short_rd_id);   // Destination Short RD ID
+
+		LOG_DBG("MAC: Sending Association Request to FP 0x%04x on channel %u.",
+				target_fp_short_rd_id, target_channel);
+
+		// Send to PHY for transmission (simplified: actual scheduling needed)
+		status = nrf9161_dect_phy_transmit_receive(NULL, // Placeholder for PHY device
+												   assoc_req_pdu,
+												   NRF_MODEM_DECT_PHY_TX_TYPE_PCC, // Point Coordination Channel
+												   target_channel,
+												   0, // current_modem_time - for immediate TX (should be scheduled)
+												   0, // tx_offset - should be scheduled relative to current_modem_time
+												   0, // tx_duration - actual PDU duration
+												   NRF_MODEM_DECT_PHY_RX_MODE_CONTINUOUS, // Listen after TX
+												   0, // rx_offset
+												   0, // rx_duration
+												   true, // Perform LBT
+												   mac_ctx.local_short_rd_id, // Short RD ID
+												   sys_rand32_get()); // HARQ transaction ID (dummy)
+
+		if (status != DECT_STATUS_OK) {
+			DECT_ERROR_HANDLER(status, "MAC: Failed to send Assoc Request to PHY.");
+			net_buf_unref(assoc_req_pdu);
+			STATS_INC(dect_stats.mac_tx_drops);
+			STATS_INC(dect_stats.mac_association_failures);
+		} else {
+			LOG_DBG("MAC: Assoc Request sent. Waiting for response.");
+			// Keep timer running for retries or stop if response received.
+		}
+	} else {
+		LOG_DBG("MAC: Association timer fired in unexpected state (Role: %d, Assoc State: %d). Stopping.",
+				mac_ctx.role, mac_ctx.assoc_state);
+		k_timer_stop(&association_timer);
+	}
+	k_mutex_unlock(&mac_ctx_mutex);
+}
+
+dect_status_t dect_mac_send_pdu_from_dlc(uint16_t dest_short_rd_id,
+										 mac_header_type_t mac_pdu_type,
+										 struct net_buf *dlc_pdu_buf,
+										 uint8_t dlc_seq_num,
+										 qos_priority_t qos_priority,
+										 bool encrypted,
+										 bool is_retransmission,
+										 uint32_t harq_transaction_id)
+{
+	if (!dlc_pdu_buf) {
+		DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PARAM, "MAC TX: Received NULL DLC PDU buffer.");
+		STATS_INC(dect_stats.mac_tx_drops);
+		return DECT_ERROR_INVALID_PARAM;
+	}
+
+	struct net_buf *mac_pdu_buf = NULL;
+	// Calculate total MAC PDU size: MAC Header + DLC PDU length
+	size_t mac_hdr_len;
+	if (mac_pdu_type == MAC_HEADER_TYPE_1_DATA || mac_pdu_type == MAC_HEADER_TYPE_1_CONTROL) {
+		mac_hdr_len = MAC_TYPE1_HEADER_LEN_BYTES;
+	} else if (mac_pdu_type == MAC_HEADER_TYPE_2_DATA || mac_pdu_type == MAC_HEADER_TYPE_2_CONTROL) {
+		mac_hdr_len = MAC_TYPE2_HEADER_LEN_BYTES;
+	} else {
+		DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PARAM, "MAC TX: Invalid MAC PDU type %u.", mac_pdu_type);
+		net_buf_unref(dlc_pdu_buf);
+		STATS_INC(dect_stats.mac_tx_drops);
+		return DECT_ERROR_INVALID_PARAM;
+	}
+
+	size_t total_pdu_len = mac_hdr_len + dlc_pdu_buf->len;
+
+	// Check if PDU size exceeds max frame size
+	if (total_pdu_len > CONFIG_DECT_NR_PLUS_MAC_TX_BUF_SIZE) {
+		DECT_ERROR_HANDLER(DECT_ERROR_PDU_TOO_LARGE, "MAC TX: MAC PDU too large (%zu bytes), max is %u.",
+						   total_pdu_len, CONFIG_DECT_NR_PLUS_MAC_TX_BUF_SIZE);
+		net_buf_unref(dlc_pdu_buf);
+		STATS_INC(dect_stats.mac_tx_drops);
+		return DECT_ERROR_PDU_TOO_LARGE;
+	}
+
+	dect_status_t alloc_status = handle_tx_buffer_allocation(&mac_pdu_buf, &mac_tx_net_buf_pool, __func__,
+															 total_pdu_len, DECT_ERROR_MAC_NO_MEM);
+	if (alloc_status != DECT_STATUS_OK) {
+		net_buf_unref(dlc_pdu_buf);
+		return alloc_status;
+	}
+
+	// Build MAC Header
+	uint8_t mac_hdr_type_byte = (mac_pdu_type << 4) | (qos_priority & 0x0F); // Assuming 4 bits for QoS
+	net_buf_add_u8(mac_pdu_buf, mac_hdr_type_byte);
+	net_buf_add_be16(mac_pdu_buf, mac_ctx.local_short_rd_id); // Source Short RD ID
+	net_buf_add_be16(mac_pdu_buf, dest_short_rd_id);       // Destination Short RD ID
+
+	// Add DLC PDU payload
+	net_buf_write(mac_pdu_buf, dlc_pdu_buf->data, dlc_pdu_buf->len);
+	net_buf_add(mac_pdu_buf, dlc_pdu_buf->len);
+	net_buf_unref(dlc_pdu_buf); // MAC now owns the data, DLC buffer can be unref'd
+
+	// If encryption is enabled and security is established with the peer
+	if (encrypted && dect_config.enable_encryption && dect_security_is_established(dest_short_rd_id)) {
+		uint8_t *session_key;
+		size_t key_len;
+		dect_status_t crypto_status = dect_security_get_session_key(dest_short_rd_id, &session_key, &key_len);
+		if (crypto_status == DECT_STATUS_OK && session_key != NULL) {
+			// Encrypt the entire MAC PDU (excluding initial MAC header if MIC applies to payload)
+			// Assuming encryption applies to MAC payload (DLC PDU) + MAC overhead
+			// Adjust this based on where MIC/encryption boundary is in ETSI spec
+			uint8_t *payload_start = net_buf_pull_unaligned_mem(mac_pdu_buf, mac_hdr_len); // Data after MAC header
+			size_t payload_len = mac_pdu_buf->len - mac_hdr_len;
+
+			LOG_DBG("MAC TX: Encrypting PDU for 0x%04x, payload_len %zu.", dest_short_rd_id, payload_len);
+			crypto_status = dect_crypto_encrypt(session_key, key_len,
+												payload_start, payload_len,
+												mac_ctx.local_long_rd_id, // Local Long RD ID for nonce
+												mac_ctx.current_modem_time, // HPC for nonce
+												mac_ctx.current_modem_time, // PSN for nonce (simplified, should be actual PSN)
+												payload_start, // In-place encryption
+												&payload_len); // Updated length including MIC
+
+			if (crypto_status != DECT_STATUS_OK) {
+				DECT_ERROR_HANDLER(crypto_status, "MAC TX: Encryption failed for PDU to 0x%04x.", dest_short_rd_id);
+				net_buf_unref(mac_pdu_buf);
+				STATS_INC(dect_stats.mac_tx_drops);
+				return DECT_ERROR_ENCRYPTION_FAILED;
+			}
+			// Update the net_buf length if payload_len changed (due to MIC addition)
+			if (payload_len + mac_hdr_len > mac_pdu_buf->len) {
+				net_buf_add(mac_pdu_buf, payload_len + mac_hdr_len - mac_pdu_buf->len);
+			} else if (payload_len + mac_hdr_len < mac_pdu_buf->len) {
+				// This shouldn't happen for CTR mode + MIC (length increases)
+				net_buf_pull(mac_pdu_buf, mac_pdu_buf->len - (payload_len + mac_hdr_len));
+			}
+		} else {
+			LOG_WRN("MAC TX: Encryption requested but session key not available for peer 0x%04x. Sending unencrypted.", dest_short_rd_id);
+			// Continue sending unencrypted if key not available
+		}
+	} else if (encrypted && !dect_config.enable_encryption) {
+		LOG_WRN("MAC TX: Encryption requested but global encryption is disabled. Sending unencrypted.");
+	} else if (encrypted && !dect_security_is_established(dest_short_rd_id)) {
+		LOG_WRN("MAC TX: Encryption requested for peer 0x%04x, but security is not established. Sending unencrypted.", dest_short_rd_id);
+	}
+
+
+	// Create a TX entry for HARQ tracking
+	mac_tx_pdu_entry_t *tx_entry = k_malloc(sizeof(mac_tx_pdu_entry_t));
+	if (!tx_entry) {
+		DECT_ERROR_HANDLER(DECT_ERROR_NO_MEMORY, "MAC TX: Failed to allocate TX entry.");
+		net_buf_unref(mac_pdu_buf);
+		STATS_INC(dect_stats.mac_tx_drops);
+		return DECT_ERROR_NO_MEMORY;
+	}
+
+	tx_entry->mac_pdu_buf = mac_pdu_buf;
+	tx_entry->dest_short_rd_id = dest_short_rd_id;
+	tx_entry->mac_hdr_type = mac_pdu_type;
+	tx_entry->dlc_pdu_type = dlc_pdu_type;
+	tx_entry->dlc_seq_num = dlc_seq_num;
+	tx_entry->harq_transaction_id = harq_transaction_id;
+	tx_entry->current_hpc = mac_ctx.current_modem_time; // Use current modem time as HPC
+	tx_entry->current_psn = mac_ctx.current_modem_time & 0xFFFF; // Use lower 16 bits of modem time as PSN
+	tx_entry->encrypted = encrypted && dect_config.enable_encryption && dect_security_is_established(dest_short_rd_id); // Actual encryption status
+	tx_entry->tx_attempts = is_retransmission ? 1 : 0; // If retransmission, 1st attempt for HARQ is already done.
+	tx_entry->state = MAC_TX_STATE_PENDING; // Initially pending for scheduling
+	tx_entry->next_tx_time_ms = k_uptime_get(); // Can be scheduled immediately
+	tx_entry->phy_op_handle = NULL; // Will be filled by PHY
+
+	// Add to outstanding TX FIFO
+	k_fifo_put(&mac_outstanding_tx_fifo, tx_entry);
+
+	LOG_DBG("MAC TX: Queued PDU (dest: 0x%04x, len: %u, DLC Seq: %u, HARQ ID: %u, encrypted: %d) for TX.",
+			dest_short_rd_id, mac_pdu_buf->len, dlc_seq_num, harq_transaction_id, tx_entry->encrypted);
+
+	STATS_INC(dect_stats.tx_frames); // Count as a MAC frame transmission attempt
 
 	return DECT_STATUS_OK;
+}
+
+void dect_mac_phy_tx_completion_handler(uint32_t harq_transaction_id, harq_feedback_t feedback, dect_status_t tx_status)
+{
+	mac_tx_pdu_entry_t *entry = NULL;
+	sys_snode_t *node;
+
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+
+	// Find the outstanding TX entry
+	SYS_SLIST_FOR_EACH_NODE(&mac_outstanding_tx_fifo.data_q, node) {
+		mac_tx_pdu_entry_t *curr = CONTAINER_OF(node, mac_tx_pdu_entry_t, node);
+		if (curr->harq_transaction_id == harq_transaction_id) {
+			entry = curr;
+			break;
+		}
+	}
+
+	if (!entry) {
+		LOG_WRN("MAC: Received TX completion for unknown HARQ ID %u. Ignoring.", harq_transaction_id);
+		k_mutex_unlock(&mac_ctx_mutex);
+		return;
+	}
+
+	LOG_DBG("MAC: TX completion for HARQ ID %u. Feedback: %d, Status: %d. Attempts: %u.",
+			harq_transaction_id, feedback, tx_status, entry->tx_attempts);
+
+	if (tx_status == DECT_STATUS_OK && feedback == HARQ_FEEDBACK_ACK) {
+		LOG_DBG("MAC: PDU (HARQ ID %u, DLC Seq %u) successfully transmitted to 0x%04x.",
+				entry->harq_transaction_id, entry->dlc_seq_num, entry->dest_short_rd_id);
+		entry->state = MAC_TX_STATE_COMPLETED;
+		dlc_mac_tx_completion_notification(entry->dest_short_rd_id, entry->dlc_seq_num, true, entry->tx_attempts, entry->phy_op_handle);
+		STATS_INC(dect_stats.harq_tx_success);
+	} else {
+		entry->tx_attempts++;
+		if (entry->tx_attempts < CONFIG_DECT_NR_PLUS_MAC_MAX_RETRANSMISSIONS) {
+			LOG_DBG("MAC: PDU (HARQ ID %u, DLC Seq %u) NACK/Failed. Retrying (%u/%u).",
+					entry->harq_transaction_id, entry->dlc_seq_num,
+					entry->tx_attempts, CONFIG_DECT_NR_PLUS_MAC_MAX_RETRANSMISSIONS);
+			entry->state = MAC_TX_STATE_RETRANSMITTING;
+			STATS_INC(dect_stats.harq_tx_retransmissions);
+			// Re-queue the entry for retransmission (e.g., set next_tx_time_ms)
+			// For simplicity, we just put it back to the beginning of the FIFO to be picked up quickly.
+			// A more sophisticated scheduler would use next_tx_time_ms.
+			k_fifo_put(&mac_outstanding_tx_fifo, entry); // This re-adds it.
+		} else {
+			LOG_WRN("MAC: PDU (HARQ ID %u, DLC Seq %u) failed after %u attempts. Dropping.",
+					entry->harq_transaction_id, entry->dlc_seq_num, entry->tx_attempts);
+			entry->state = MAC_TX_STATE_FAILED;
+			dlc_mac_tx_completion_notification(entry->dest_short_rd_id, entry->dlc_seq_num, false, entry->tx_attempts, entry->phy_op_handle);
+			STATS_INC(dect_stats.harq_tx_failures);
+			net_buf_unref(entry->mac_pdu_buf); // Free the PDU buffer
+			k_free(entry); // Free the TX entry
+		}
+	}
+	k_mutex_unlock(&mac_ctx_mutex);
+}
+
+void dect_mac_phy_rx_packet_handler(nrf9161_dect_rx_packet_t *rx_packet_info)
+{
+	if (!rx_packet_info || !rx_packet_info->data_buf) {
+		DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PARAM, "MAC RX: Received NULL RX packet info or data buffer.");
+		STATS_INC(dect_stats.mac_rx_drops);
+		return;
+	}
+
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+
+	STATS_INC(dect_stats.rx_frames);
+	STATS_ADD(dect_stats.rx_data_bytes, rx_packet_info->data_buf->len);
+
+	uint8_t *mac_pdu_ptr = net_buf_pull_unaligned_mem(rx_packet_info->data_buf, rx_packet_info->data_buf->len);
+	if (rx_packet_info->data_buf->len < MAC_MIN_HEADER_LEN_BYTES) { // Assuming minimum header size
+		LOG_WRN("MAC RX: Received PDU too short (%u bytes). Dropping.", rx_packet_info->data_buf->len);
+		net_buf_unref(rx_packet_info->data_buf);
+		STATS_INC(dect_stats.mac_rx_drops);
+		k_mutex_unlock(&mac_ctx_mutex);
+		return;
+	}
+
+	uint8_t mac_hdr_type_byte = mac_pdu_ptr[0];
+	mac_header_type_t mac_hdr_type = (mac_hdr_type_byte >> 4) & 0x0F;
+	uint8_t control_type_qos = mac_hdr_type_byte & 0x0F; // For control, this is control type; for data, it's QoS
+
+	uint16_t src_short_rd_id = net_buf_pull_be16(rx_packet_info->data_buf); // Source RD ID
+	uint16_t dest_short_rd_id = net_buf_pull_be16(rx_packet_info->data_buf); // Destination RD ID
+
+	if (mac_hdr_type == MAC_HEADER_TYPE_1_CONTROL || mac_hdr_type == MAC_HEADER_TYPE_2_CONTROL) {
+		mac_control_pdu_type_t control_pdu_type = (mac_control_pdu_type_t)control_type_qos;
+		LOG_DBG("MAC RX: Received Control PDU (Type: %u, Control Type: %u) from 0x%04x to 0x%04x.",
+				mac_hdr_type, control_pdu_type, src_short_rd_id, dest_short_rd_id);
+
+		// Handle MAC Control PDUs
+		switch (control_pdu_type) {
+			case MAC_CONTROL_TYPE_BEACON:
+				// Only FPs send beacons. PPs process them for sync/association.
+				if (mac_ctx.role == MAC_ROLE_PP) {
+					LOG_DBG("MAC: PP received Beacon from 0x%04x. RSSI: %d dBm.", src_short_rd_id, rx_packet_info->rssi);
+					// Process beacon: update FP candidate list, check sync status
+					// if (dect_channel_mgr_update_fp_candidate(src_short_rd_id, mac_pdu_ptr, rx_packet_info->rssi, rx_packet_info->channel) == DECT_STATUS_OK) {
+					//     // If sync not established, try to sync
+					//     if (mac_ctx.sync_state != MAC_SYNC_STATE_SYNCHRONIZED) {
+					//         dect_mac_set_sync_state(MAC_SYNC_STATE_SYNCHRONIZED); // Simplified sync
+					//         // Trigger some sync-related actions, e.g., stop sync timer
+					//     }
+					// }
+					STATS_INC(dect_stats.bcc_beacons_rx);
+				} else {
+					LOG_DBG("MAC: FP received unexpected Beacon from 0x%04x. Ignoring.", src_short_rd_id);
+				}
+				break;
+			case MAC_CONTROL_TYPE_ASSOC_REQ:
+				if (mac_ctx.role == MAC_ROLE_FP && mac_ctx.assoc_state != MAC_ASSOC_STATE_ASSOCIATED) {
+					LOG_DBG("MAC: FP received Association Request from PP 0x%04x.", src_short_rd_id);
+					// Check if PP can be associated. If yes, send Assoc Resp.
+					if (mac_ctx.num_associated_peers < MAX_PEERS) {
+						mac_ctx.associated_peers[mac_ctx.num_associated_peers++] = src_short_rd_id;
+						mac_ctx.associated_pp_short_rd_id = src_short_rd_id; // For single PP case
+						dect_mac_set_association_state(MAC_ASSOC_STATE_ASSOCIATED);
+						STATS_INC(dect_stats.mac_association_success);
+
+						// Send Association Response
+						struct net_buf *assoc_resp_pdu = NULL;
+						dect_status_t status = handle_tx_buffer_allocation(&assoc_resp_pdu, &mac_tx_net_buf_pool, __func__,
+																			MAC_CTRL_PDU_HEADER_SIZE, DECT_ERROR_MAC_NO_MEM);
+						if (status == DECT_STATUS_OK) {
+							uint8_t resp_hdr_type_byte = (MAC_HEADER_TYPE_1_CONTROL << 4) | MAC_CONTROL_TYPE_ASSOC_RESP;
+							net_buf_add_u8(assoc_resp_pdu, resp_hdr_type_byte);
+							net_buf_add_be16(assoc_resp_pdu, mac_ctx.local_short_rd_id);
+							net_buf_add_be16(assoc_resp_pdu, src_short_rd_id);
+
+							status = nrf9161_dect_phy_transmit_receive(NULL, assoc_resp_pdu, NRF_MODEM_DECT_PHY_TX_TYPE_PCC,
+																	   rx_packet_info->channel, 0, 0, 0, NRF_MODEM_DECT_PHY_RX_MODE_IDLE, 0, 0,
+																	   true, mac_ctx.local_short_rd_id, sys_rand32_get());
+							if (status != DECT_STATUS_OK) {
+								DECT_ERROR_HANDLER(status, "MAC: Failed to send Assoc Response.");
+								net_buf_unref(assoc_resp_pdu);
+								STATS_INC(dect_stats.mac_tx_drops);
+							} else {
+								LOG_DBG("MAC: Sent Association Response to PP 0x%04x.", src_short_rd_id);
+							}
+						}
+					} else {
+						LOG_WRN("MAC: Max associations reached. Rejecting Assoc Request from 0x%04x.", src_short_rd_id);
+						STATS_INC(dect_stats.mac_association_failures);
+						// Send rejection if spec requires
+					}
+				} else {
+					LOG_DBG("MAC: %s received unexpected Association Request from 0x%04x. Ignoring.",
+							(mac_ctx.role == MAC_ROLE_FP) ? "FP" : "PP", src_short_rd_id);
+				}
+				break;
+			case MAC_CONTROL_TYPE_ASSOC_RESP:
+				if (mac_ctx.role == MAC_ROLE_PP && mac_ctx.assoc_state == MAC_ASSOC_STATE_ASSOCIATING) {
+					LOG_DBG("MAC: PP received Association Response from FP 0x%04x.", src_short_rd_id);
+					mac_ctx.associated_fp_short_rd_id = src_short_rd_id;
+					dect_mac_set_association_state(MAC_ASSOC_STATE_ASSOCIATED);
+					k_timer_stop(&association_timer); // Stop association retries
+					net_if_carrier_on(mac_ctx.net_if_ptr); // Bring up network interface
+					LOG_INF("MAC: Associated with FP 0x%04x. Network interface carrier ON.", src_short_rd_id);
+					STATS_INC(dect_stats.mac_association_success);
+					// Notify security layer to initiate handshake
+					dect_security_initiate_handshake(mac_ctx.associated_fp_short_rd_id);
+				} else {
+					LOG_DBG("MAC: PP received unexpected Association Response from 0x%04x. Ignoring.", src_short_rd_id);
+				}
+				break;
+			case MAC_CONTROL_TYPE_DISASSOC_REQ:
+				LOG_DBG("MAC: Received Disassociation Request from 0x%04x.", src_short_rd_id);
+				dlc_mac_disconnected_notification(src_short_rd_id, MAC_LINK_FAILURE_REASON_DISASSOCIATED);
+				// Remove from associated peers
+				// For simplicity, directly set state to idle
+				dect_mac_set_association_state(MAC_ASSOC_STATE_IDLE);
+				mac_ctx.associated_fp_short_rd_id = 0;
+				mac_ctx.associated_pp_short_rd_id = 0;
+				net_if_carrier_off(mac_ctx.net_if_ptr); // Bring down network interface
+				LOG_INF("MAC: Disassociated. Network interface carrier OFF.");
+				break;
+			case MAC_CONTROL_TYPE_SECURITY_CHALLENGE:
+			case MAC_CONTROL_TYPE_SECURITY_RESPONSE:
+			case MAC_CONTROL_TYPE_SECURITY_CONFIRM:
+				// Pass security control PDUs to the Security layer
+				LOG_DBG("MAC: Passing Security PDU (type %u) to Security layer from 0x%04x.", control_pdu_type, src_short_rd_id);
+				dect_security_process_control_pdu(src_short_rd_id, control_pdu_type, rx_packet_info->data_buf);
+				break;
+			case MAC_CONTROL_TYPE_HANDOVER_REQUEST:
+			case MAC_CONTROL_TYPE_HANDOVER_RESPONSE:
+			case MAC_CONTROL_TYPE_HANDOVER_COMPLETE:
+				if (dect_config.enable_mobility_support) {
+					LOG_DBG("MAC: Mobility PDU (type %u) received from 0x%04x. Not yet implemented.", control_pdu_type, src_short_rd_id);
+					// TODO: Implement mobility procedures and pass to a Mobility Management module
+					STATS_INC(dect_stats.mac_handover_requests_rx); // Only track requests for now
+				} else {
+					LOG_WRN("MAC: Mobility PDU (type %u) received but mobility support is disabled. Dropping.", control_pdu_type);
+					STATS_INC(dect_stats.mac_rx_drops);
+				}
+				net_buf_unref(rx_packet_info->data_buf);
+				break;
+			case MAC_CONTROL_TYPE_RESOURCE_REQUEST:
+			case MAC_CONTROL_TYPE_RESOURCE_GRANT:
+			case MAC_CONTROL_TYPE_RESOURCE_RELEASE:
+				LOG_DBG("MAC: Resource management PDU (type %u) received from 0x%04x. Not yet implemented.", control_pdu_type, src_short_rd_id);
+				net_buf_unref(rx_packet_info->data_buf);
+				break;
+			default:
+				LOG_WRN("MAC RX: Received unknown MAC Control PDU type %u. Dropping.", control_pdu_type);
+				net_buf_unref(rx_packet_info->data_buf);
+				STATS_INC(dect_stats.mac_rx_drops);
+				break;
+		}
+	} else if (mac_hdr_type == MAC_HEADER_TYPE_1_DATA || mac_hdr_type == MAC_HEADER_TYPE_2_DATA) {
+		LOG_DBG("MAC RX: Received Data PDU (Type: %u, QoS: %u) from 0x%04x to 0x%04x. Length: %u.",
+				mac_hdr_type, control_type_qos, src_short_rd_id, dest_short_rd_id, rx_packet_info->data_buf->len);
+
+		if (dest_short_rd_id != mac_ctx.local_short_rd_id &&
+			dest_short_rd_id != SHORT_RD_ID_BROADCAST &&
+			!mac_is_multicast_member(dest_short_rd_id)) {
+			LOG_DBG("MAC RX: PDU not for us (dest 0x%04x). Checking if routing enabled.", dest_short_rd_id);
+			if (dect_config.enable_routing) {
+				// Pass to routing layer for forwarding
+				dect_status_t routing_status = dect_routing_process_incoming_pdu(src_short_rd_id, rx_packet_info->data_buf, rx_packet_info->hpc, rx_packet_info->psn);
+				if (routing_status != DECT_STATUS_OK) {
+					DECT_ERROR_HANDLER(routing_status, "MAC RX: Failed to pass PDU to Routing layer.");
+					net_buf_unref(rx_packet_info->data_buf);
+					STATS_INC(dect_stats.mac_rx_drops);
+				}
+			} else {
+				LOG_DBG("MAC RX: PDU not for us and routing disabled. Dropping.");
+				net_buf_unref(rx_packet_info->data_buf);
+				STATS_INC(dect_stats.mac_rx_drops);
+			}
+			k_mutex_unlock(&mac_ctx_mutex);
+			return;
+		}
+
+		// Decrypt if necessary
+		if (dect_config.enable_encryption && dect_security_is_established(src_short_rd_id)) {
+			uint8_t *session_key;
+			size_t key_len;
+			dect_status_t crypto_status = dect_security_get_session_key(src_short_rd_id, &session_key, &key_len);
+			if (crypto_status == DECT_STATUS_OK && session_key != NULL) {
+				// Assuming decryption applies to the part after MAC header, including MIC.
+				// This implies the MAC PDU has been pulled past its header for decryption.
+				uint8_t *payload_start = net_buf_pull_unaligned_mem(rx_packet_info->data_buf, 0); // Start of payload (after MAC header already pulled)
+				size_t payload_len = rx_packet_info->data_buf->len;
+
+				LOG_DBG("MAC RX: Decrypting PDU from 0x%04x, payload_len %zu.", src_short_rd_id, payload_len);
+				crypto_status = dect_crypto_decrypt(session_key, key_len,
+													payload_start, payload_len,
+													mac_ctx.local_long_rd_id, // Our Long RD ID for nonce
+													rx_packet_info->hpc,      // HPC from received PDU
+													rx_packet_info->psn,      // PSN from received PDU
+													payload_start, // In-place decryption
+													&payload_len); // Updated length after MIC removal
+
+				if (crypto_status != DECT_STATUS_OK) {
+					DECT_ERROR_HANDLER(crypto_status, "MAC RX: Decryption or MIC verification failed for PDU from 0x%04x. Dropping.", src_short_rd_id);
+					net_buf_unref(rx_packet_info->data_buf);
+					STATS_INC(dect_stats.mac_rx_drops);
+					k_mutex_unlock(&mac_ctx_mutex);
+					return;
+				}
+				// Update net_buf length if payload_len changed due to MIC removal
+				if (payload_len < rx_packet_info->data_buf->len) {
+					net_buf_pull(rx_packet_info->data_buf, rx_packet_info->data_buf->len - payload_len);
+				}
+			} else {
+				LOG_WRN("MAC RX: Encryption enabled but session key not available for peer 0x%04x. Dropping encrypted PDU.", src_short_rd_id);
+				net_buf_unref(rx_packet_info->data_buf);
+				STATS_INC(dect_stats.mac_rx_drops);
+				k_mutex_unlock(&mac_ctx_mutex);
+				return;
+			}
+		}
+
+		// Pass data PDU to DLC layer
+		dlc_rx_msg_t rx_msg = {
+			.src_short_rd_id = src_short_rd_id,
+			.dlc_pdu_buf = rx_packet_info->data_buf, // DLC now owns this buffer
+			.rssi = rx_packet_info->rssi,
+			.hpc = rx_packet_info->hpc,
+			.psn = rx_packet_info->psn,
+			.dlc_pdu_type = DLC_PDU_TYPE_DATA, // Assuming data PDU
+		};
+
+		int ret = k_msgq_put(&mac_rx_msgq, &rx_msg, K_NO_WAIT);
+		if (ret != 0) {
+			DECT_ERROR_HANDLER(DECT_ERROR_MAC_RX_DROPS, "MAC RX: Failed to queue RX PDU to DLC (ret: %d).", ret);
+			net_buf_unref(rx_packet_info->data_buf); // Unref if queue full
+			STATS_INC(dect_stats.mac_rx_drops);
+		}
+	} else {
+		LOG_WRN("MAC RX: Received unknown MAC Header Type %u. Dropping.", mac_hdr_type);
+		net_buf_unref(rx_packet_info->data_buf);
+		STATS_INC(dect_stats.mac_rx_drops);
+	}
+	k_mutex_unlock(&mac_ctx_mutex);
 }
 
 void dect_mac_thread(void *p1, void *p2, void *p3)
@@ -136,787 +726,273 @@ void dect_mac_thread(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	LOG_INF("MAC: Thread started.");
+	LOG_DBG("DECT MAC Thread started.");
 
-	mac_tx_msg_t tx_msg;
-	nrf9161_dect_rx_packet_t rx_packet;
+	dlc_tx_msg_t tx_msg;
+	dect_status_t status;
+	bool had_activity_this_loop;
 
 	while (true) {
-		// Process outgoing MAC PDUs from DLC/Security layers
+		had_activity_this_loop = false;
+
+		/* Process TX messages from DLC */
 		if (k_msgq_get(&mac_tx_msgq, &tx_msg, K_NO_WAIT) == 0) {
-			LOG_DBG("MAC: Received TX request from higher layer (dest 0x%04x, type %u, len %u).",
-				tx_msg.dest_short_rd_id, tx_msg.mac_pdu_type, tx_msg.mac_pdu_buf->len);
+			had_activity_this_loop = true;
 
-			dect_power_mgr_activity_detected(); // Notify power manager of TX activity
+			// Pass to the general MAC send function
+			status = dect_mac_send_pdu_from_dlc(tx_msg.dest_short_rd_id,
+												MAC_HEADER_TYPE_1_DATA, // Assume data for now
+												tx_msg.dlc_pdu_buf,
+												0, // DLC sequence number not available here yet
+												tx_msg.qos_priority,
+												dect_config.enable_encryption, // Use config for encryption flag
+												false, // Not a retransmission from this path
+												sys_rand32_get()); // New HARQ ID
 
-			// Check if encryption is enabled and security is established for this peer
-			bool encrypt_pdu = false;
-			if (dect_config.enable_encryption && tx_msg.mac_pdu_type == MAC_HEADER_TYPE_2_DATA &&
-			    dect_security_is_established(tx_msg.dest_short_rd_id)) {
-				encrypt_pdu = true;
-			} else if (tx_msg.mac_pdu_type == MAC_HEADER_TYPE_1_CONTROL &&
-				   (tx_msg.control_type == MAC_CONTROL_TYPE_SECURITY_CHALLENGE ||
-				    tx_msg.control_type == MAC_CONTROL_TYPE_SECURITY_RESPONSE)) {
-				// Security PDUs are handled by the crypto layer, they are not encrypted by MAC as data
-				// but rather contain cryptographic material directly.
-				encrypt_pdu = false; // MAC does not encrypt security PDUs, crypto layer handles it.
-			}
-
-
-			struct net_buf *phy_payload = NULL;
-			dect_status_t ret_alloc = handle_tx_buffer_allocation(&phy_payload, &mac_tx_net_buf_pool);
-			if (ret_alloc != DECT_STATUS_OK) {
-				DECT_ERROR_HANDLER(ret_alloc, "MAC: Failed to allocate PHY payload buffer for TX. Dropping PDU.");
-				STATS_INC(dect_stats.mac_tx_drops); // Increment MAC specific drop stat
-				net_buf_unref(tx_msg.mac_pdu_buf); // Unref original PDU buffer
-				continue; // Or return, depending on context
-			}
-
-			// Prepend MAC Header
-			if (tx_msg.mac_pdu_type == MAC_HEADER_TYPE_1_CONTROL) {
-				if (tx_msg.dest_short_rd_id == SHORT_RD_ID_BROADCAST) {
-					// Broadcast control PDU (e.g., Beacon)
-					net_buf_add_u8(phy_payload, MAC_HEADER_TYPE_1_CONTROL);
-					// For beacons, MAC_CONTROL_TYPE_BEACON is the first byte of payload
-					// Already added in BCC, so just copy the rest of the PDU.
-				} else {
-					// Unicast control PDU
-					net_buf_add_u8(phy_payload, MAC_HEADER_TYPE_1_CONTROL | (tx_msg.control_type << 4)); // Type and Control Type
-					// No specific destination in header for Type 1, implicitly handled by PHY TX to short_rd_id
-				}
-			} else if (tx_msg.mac_pdu_type == MAC_HEADER_TYPE_2_DATA) {
-				// MAC Data PDU (Type 2)
-				net_buf_add_u8(phy_payload, MAC_HEADER_TYPE_2_DATA);
-				net_buf_add_le16(phy_payload, tx_msg.dest_short_rd_id); // Destination Short RD ID
-				net_buf_add_u8(phy_payload, 0); // Reserved byte, or for control flags
-			} else {
-				DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PHY_HDR_TYPE, "MAC: Unknown MAC PDU type %u. Dropping.", tx_msg.mac_pdu_type);
-				STATS_INC(dect_stats.mac_tx_drops); // Increment MAC specific drop stat
-				net_buf_unref(tx_msg.mac_pdu_buf);
-				net_buf_unref(phy_payload); // Free allocated buffer
-				continue;
-			}
-
-			// Copy original MAC PDU payload (from DLC/Security)
-			net_buf_add_mem(phy_payload, tx_msg.mac_pdu_buf->data, tx_msg.mac_pdu_buf->len);
-
-			net_buf_unref(tx_msg.mac_pdu_buf); // MAC layer has consumed original PDU buffer
-
-
-			// Encrypt if required
-			if (encrypt_pdu) {
-				uint8_t *session_key = NULL;
-				size_t session_key_len = 0;
-				dect_status_t key_ret = dect_security_get_session_key(tx_msg.dest_short_rd_id, &session_key, &session_key_len);
-
-				if (key_ret != DECT_STATUS_OK || session_key == NULL) {
-					DECT_ERROR_HANDLER(DECT_ERROR_SECURITY_NOT_READY, "MAC: No session key for peer 0x%04x. Cannot encrypt data. Dropping.", tx_msg.dest_short_rd_id);
-					STATS_INC(dect_stats.mac_tx_drops);
-					net_buf_unref(phy_payload);
-					continue;
-				}
-
-				size_t encrypted_len = phy_payload->len + MAC_MIC_LEN; // Original len + MIC
-				if (encrypted_len > CONFIG_DECT_NR_PLUS_MAC_TX_BUF_SIZE) { // Check against max total size
-					DECT_ERROR_HANDLER(DECT_ERROR_PDU_TOO_LARGE, "MAC: Encrypted PDU too large. Dropping.");
-					STATS_INC(dect_stats.mac_tx_drops);
-					net_buf_unref(phy_payload);
-					continue;
-				}
-
-				// Encryption needs to happen in-place or into a new buffer,
-				// and will add the MIC.
-				// For this example, assume dect_crypto_encrypt can expand buffer.
-				// The buffer in phy_payload might need to be resized if MIC
-				// is appended by the encryption function.
-				// Alternatively, pre-allocate space for MIC at allocation.
-				// Current implementation of dect_crypto_encrypt appends MIC, so pre-allocation needed.
-				// This would ideally be handled by net_buf_alloc_len with needed_len.
-				// Or, reallocate. For now, assuming phy_payload has enough trailing space.
-
-				// Copy data to a temp buffer for encryption if in-place modification is tricky,
-				// or ensure phy_payload has enough headroom.
-				uint8_t temp_data[CONFIG_DECT_NR_PLUS_MAC_TX_BUF_SIZE];
-				memcpy(temp_data, phy_payload->data, phy_payload->len);
-				size_t original_len = phy_payload->len;
-				net_buf_remove(phy_payload, original_len); // Clear current data in net_buf
-
-				dect_status_t enc_ret = dect_crypto_encrypt(session_key, session_key_len,
-								            temp_data, original_len,
-								            tx_msg.hpc, tx_msg.psn,
-								            net_buf_tail(phy_payload), &encrypted_len);
-				if (enc_ret != DECT_STATUS_OK) {
-					DECT_ERROR_HANDLER(enc_ret, "MAC: Encryption failed for PDU (dest 0x%04x). Dropping.", tx_msg.dest_short_rd_id);
-					STATS_INC(dect_stats.mac_tx_drops);
-					net_buf_unref(phy_payload);
-					continue;
-				}
-				net_buf_add(phy_payload, encrypted_len); // Update net_buf length
-				LOG_DBG("MAC: PDU encrypted, new length %u (incl. MIC).", encrypted_len);
-			}
-
-			// Store information about the outstanding TX for HARQ feedback
-			mac_outstanding_tx_entry_t *out_tx_entry = k_malloc(sizeof(mac_outstanding_tx_entry_t));
-			if (!out_tx_entry) {
-				DECT_ERROR_HANDLER(DECT_ERROR_NO_MEM, "MAC: Failed to allocate outstanding TX entry. Dropping PDU.");
-				STATS_INC(dect_stats.mac_tx_drops);
-				net_buf_unref(phy_payload);
-				continue;
-			}
-			out_tx_entry->harq_transaction_id = tx_msg.harq_transaction_id;
-			out_tx_entry->dlc_seq_num = tx_msg.dlc_seq_num; // Needed by DLC for ARQ
-			out_tx_entry->dest_short_rd_id = tx_msg.dest_short_rd_id;
-			out_tx_entry->retransmission_count = tx_msg.retransmission_count;
-			k_fifo_put(&mac_outstanding_tx_fifo, out_tx_entry);
-
-			// Transmit PDU via PHY layer
-			dect_status_t phy_ret = nrf9161_dect_phy_transmit_receive(
-							tx_msg.dest_short_rd_id, // Target for unicast, or SHORT_RD_ID_BROADCAST
-							phy_payload,
-							tx_msg.tx_slot_duration_us, // Provided by DLC/BCC
-							mac_ctx.current_hpc, // HPC for TX synchronization
-							mac_ctx.current_psn, // PSN for TX synchronization
-							tx_msg.mac_pdu_type // Used to determine PHY header type
-							);
-			if (phy_ret != DECT_STATUS_OK) {
-				DECT_ERROR_HANDLER(phy_ret, "MAC: Failed to send PDU to PHY layer (dest 0x%04x).", tx_msg.dest_short_rd_id);
-				STATS_INC(dect_stats.mac_tx_drops); // Increment MAC specific drop stat
-				net_buf_unref(phy_payload); // PHY might not unref on all failures
-				// Remove from outstanding FIFO if PHY TX failed immediately
-				k_free(k_fifo_get(&mac_outstanding_tx_fifo, K_NO_WAIT));
-				continue;
+			if (status != DECT_STATUS_OK) {
+				DECT_ERROR_HANDLER(status, "MAC TX: Failed to send PDU from DLC.");
+				// The buffer was unref'd inside dect_mac_send_pdu_from_dlc on error.
 			}
 		}
 
-		// Process incoming RX packets from PHY layer
-		if (k_msgq_get(&mac_rx_msgq, &rx_packet, K_NO_WAIT) == 0) {
-			LOG_DBG("MAC: Received RX packet from PHY (src 0x%04x, len %u, RSSI %d, CRC OK: %s).",
-				rx_packet.src_short_rd_id, rx_packet.data_buf->len,
-				rx_packet.rssi, rx_packet.crc_ok ? "true" : "false");
+		/* Process outstanding HARQ transmissions and schedule PHY operations */
+		mac_tx_pdu_entry_t *entry = (mac_tx_pdu_entry_t *)k_fifo_get(&mac_outstanding_tx_fifo, K_NO_WAIT);
+		if (entry) {
+			had_activity_this_loop = true;
 
-			dect_power_mgr_activity_detected(); // Notify power manager of RX activity
+			if (entry->state == MAC_TX_STATE_PENDING || entry->state == MAC_TX_STATE_RETRANSMITTING) {
+				// Schedule for transmission if current time allows
+				if (k_uptime_get() >= entry->next_tx_time_ms) {
+					LOG_DBG("MAC: Scheduling TX for HARQ ID %u (DLC Seq %u, attempt %u).",
+							entry->harq_transaction_id, entry->dlc_seq_num, entry->tx_attempts + 1);
 
-			if (!rx_packet.crc_ok) {
-				DECT_ERROR_HANDLER(DECT_ERROR_PHY_CRC_FAILED, "MAC: RX packet CRC failed (src 0x%04x). Dropping.", rx_packet.src_short_rd_id);
-				STATS_INC(dect_stats.mac_crc_errors);
-				net_buf_unref(rx_packet.data_buf);
-				STATS_INC(dect_stats.mac_rx_drops); // Increment MAC specific drop stat
-				continue;
-			}
+					// Determine PHY TX type (PCC or PDC)
+					nrf_modem_dect_phy_tx_type_t phy_tx_type = NRF_MODEM_DECT_PHY_TX_TYPE_PDC; // Default to PDC for data
 
-			// Extract MAC Header Type
-			if (rx_packet.data_buf->len < 1) {
-				DECT_ERROR_HANDLER(DECT_ERROR_FRAME_TOO_SHORT, "MAC: RX PDU too short for header. Dropping.");
-				net_buf_unref(rx_packet.data_buf);
-				STATS_INC(dect_stats.mac_rx_drops);
-				continue;
-			}
-			uint8_t mac_hdr_type_byte = net_buf_pull_u8(rx_packet.data_buf);
-			mac_header_type_t mac_hdr_type = (mac_header_type_t)(mac_hdr_type_byte & 0x0F); // Lower 4 bits
-
-			// Decrypt if necessary
-			bool encrypted = false; // Need a way to tell if it was encrypted. PHY doesn't know.
-							// This information should ideally be part of the PDU header or implicitly known.
-							// For now, assume if data PDU and security established, it's encrypted.
-			if (dect_config.enable_encryption && mac_hdr_type == MAC_HEADER_TYPE_2_DATA &&
-			    dect_security_is_established(rx_packet.src_short_rd_id)) {
-				encrypted = true;
-			}
-
-			if (encrypted) {
-				uint8_t *session_key = NULL;
-				size_t session_key_len = 0;
-				dect_status_t key_ret = dect_security_get_session_key(rx_packet.src_short_rd_id, &session_key, &session_key_len);
-
-				if (key_ret != DECT_STATUS_OK || session_key == NULL) {
-					DECT_ERROR_HANDLER(DECT_ERROR_SECURITY_NOT_READY, "MAC: No session key for peer 0x%04x. Cannot decrypt data. Dropping.", rx_packet.src_short_rd_id);
-					STATS_INC(dect_stats.mac_rx_drops);
-					net_buf_unref(rx_packet.data_buf);
-					continue;
-				}
-
-				// Decryption needs to happen in-place. MIC is at the end of data.
-				size_t decrypted_len = rx_packet.data_buf->len; // Will be actual payload len after MIC check
-				uint8_t temp_data[CONFIG_DECT_NR_PLUS_MAC_RX_BUF_SIZE]; // Temporary buffer for decryption
-				if (decrypted_len > sizeof(temp_data)) {
-					DECT_ERROR_HANDLER(DECT_ERROR_PDU_TOO_LARGE, "MAC: Encrypted RX PDU too large for temp buffer. Dropping.");
-					STATS_INC(dect_stats.mac_rx_drops);
-					net_buf_unref(rx_packet.data_buf);
-					continue;
-				}
-				memcpy(temp_data, rx_packet.data_buf->data, decrypted_len);
-
-				dect_status_t dec_ret = dect_crypto_decrypt(session_key, session_key_len,
-								            temp_data, decrypted_len, // Pass total encrypted data including MIC
-								            rx_packet.hpc, rx_packet.psn,
-								            net_buf_tail(rx_packet.data_buf), &decrypted_len); // Write decrypted to net_buf, update length
-
-				if (dec_ret != DECT_STATUS_OK) {
-					DECT_ERROR_HANDLER(dec_ret, "MAC: Decryption or MIC verification failed for RX PDU (src 0x%04x). Dropping.", rx_packet.src_short_rd_id);
-					STATS_INC(dect_stats.mac_mic_failures);
-					STATS_INC(dect_stats.mac_rx_drops);
-					net_buf_unref(rx_packet.data_buf);
-					continue;
-				}
-				// Adjust net_buf to reflect decrypted length (MIC removed)
-				net_buf_remove(rx_packet.data_buf, rx_packet.data_buf->len - decrypted_len);
-				LOG_DBG("MAC: PDU decrypted, new length %u (MIC removed).", decrypted_len);
-			}
-
-			// Process PDU based on type
-			switch (mac_hdr_type) {
-			case MAC_HEADER_TYPE_1_CONTROL: {
-				if (rx_packet.data_buf->len < 1) { // Control type byte
-					DECT_ERROR_HANDLER(DECT_ERROR_FRAME_TOO_SHORT, "MAC: Control PDU too short for type. Dropping.");
-					net_buf_unref(rx_packet.data_buf);
-					STATS_INC(dect_stats.mac_rx_drops);
-					break;
-				}
-				uint8_t control_type = net_buf_pull_u8(rx_packet.data_buf);
-				LOG_DBG("MAC: Received Control PDU (type 0x%02x) from 0x%04x.", control_type, rx_packet.src_short_rd_id);
-				dect_status_t status = mac_process_mac_control_pdu(rx_packet.src_short_rd_id, rx_packet.data_buf); // PDU buffer is unref'd inside this function on success
-				if (status != DECT_STATUS_OK) {
-					DECT_ERROR_HANDLER(status, "MAC: Failed to process control PDU (type 0x%02x).", control_type);
-					// Buffer unref'd by mac_process_mac_control_pdu on specific failures, or here if not.
-					if (status != DECT_ERROR_INVALID_PARAM) { // If not invalid param, it was likely consumed.
-						net_buf_unref(rx_packet.data_buf); // Ensure unref if not consumed
+					// If it's a control PDU (e.g., Assoc Req, Security PDU), use PCC
+					if (entry->mac_hdr_type == MAC_HEADER_TYPE_1_CONTROL || entry->mac_hdr_type == MAC_HEADER_TYPE_2_CONTROL) {
+						phy_tx_type = NRF_MODEM_DECT_PHY_TX_TYPE_PCC;
 					}
-					STATS_INC(dect_stats.mac_rx_drops);
-				}
-				break;
-			}
-			case MAC_HEADER_TYPE_2_DATA: {
-				if (rx_packet.data_buf->len < SHORT_RD_ID_LEN_BYTES + 1) { // Dest Short RD ID + Reserved
-					DECT_ERROR_HANDLER(DECT_ERROR_FRAME_TOO_SHORT, "MAC: Data PDU too short for header. Dropping.");
-					net_buf_unref(rx_packet.data_buf);
-					STATS_INC(dect_stats.mac_rx_drops);
-					break;
-				}
-				uint16_t dest_short_rd_id = net_buf_pull_le16(rx_packet.data_buf); // Destination Short RD ID
-				net_buf_pull_u8(rx_packet.data_buf); // Reserved byte
 
-				LOG_DBG("MAC: Received Data PDU (dest 0x%04x) from 0x%04x. Passing to DLC.",
-					dest_short_rd_id, rx_packet.src_short_rd_id);
+					// Get current channel from Channel Manager
+					uint8_t current_channel = dect_channel_mgr_get_active_channel();
+					if (current_channel == 0xFF) { // Check for invalid channel
+						DECT_ERROR_HANDLER(DECT_ERROR_INVALID_CHANNEL, "MAC: No active channel set. Cannot transmit.");
+						entry->state = MAC_TX_STATE_FAILED; // Mark as failed
+						dlc_mac_tx_completion_notification(entry->dest_short_rd_id, entry->dlc_seq_num, false, entry->tx_attempts, entry->phy_op_handle);
+						STATS_INC(dect_stats.mac_tx_drops);
+						net_buf_unref(entry->mac_pdu_buf); // Free buffer
+						k_free(entry); // Free entry
+						continue; // Process next item in FIFO
+					}
 
-				// Only process if for us or broadcast
-				if (dest_short_rd_id == mac_ctx.local_short_rd_id ||
-				    dest_short_rd_id == SHORT_RD_ID_BROADCAST ||
-					mac_is_multicast_member(dest_short_rd_id)) { // Check if multicast group member
+					// Call PHY transmit function
+					// Note: The timing parameters (start_time_us, duration_us, tx_offset, rx_offset, rx_duration)
+					// are highly dependent on exact DECT NR+ TDMA slot scheduling. For now, using simplified values.
+					// A proper implementation would calculate these based on current modem time and slot availability.
+					dect_status_t phy_status = nrf9161_dect_phy_transmit_receive(
+													NULL, // Placeholder for PHY device
+													entry->mac_pdu_buf,
+													phy_tx_type,
+													current_channel,
+													0, // start_time_us - 0 for immediate/next available slot
+													nrf9161_dect_phy_get_tx_slot_duration(), // duration_us
+													NRF_MODEM_DECT_PHY_RX_MODE_CONTINUOUS, // RX mode after TX
+													0, // rx_offset
+													0, // rx_duration
+													true, // Perform LBT
+													entry->dest_short_rd_id, // Target Short RD ID
+													entry->harq_transaction_id // HARQ ID
+												);
 
-					dlc_rx_msg_t dlc_msg = {
-						.src_short_rd_id = rx_packet.src_short_rd_id,
-						.dlc_pdu_buf = rx_packet.data_buf, // DLC takes ownership
-						.rssi = rx_packet.rssi,
-						.hpc = rx_packet.hpc,
-						.psn = rx_packet.psn,
-						.dlc_pdu_type = DLC_PDU_TYPE_DATA
-					};
-					int ret_msgq = DECT_MSGQ_PUT_OR_DROP(&dlc_rx_msgq, &dlc_msg, K_NO_WAIT,
-											DECT_ERROR_QUEUE_FULL,
-											"MAC: Failed to pass Data PDU to DLC (queue full). Dropping.",
-											rx_packet.data_buf, &dect_stats.mac_rx_drops);
-					if (ret_msgq != 0) {
-						// Buffer unref'd by macro
-						break;
+					if (phy_status != DECT_STATUS_OK) {
+						DECT_ERROR_HANDLER(phy_status, "MAC: PHY transmission failed for HARQ ID %u.", entry->harq_transaction_id);
+						entry->state = MAC_TX_STATE_FAILED;
+						dlc_mac_tx_completion_notification(entry->dest_short_rd_id, entry->dlc_seq_num, false, entry->tx_attempts, entry->phy_op_handle);
+						STATS_INC(dect_stats.mac_tx_drops);
+						net_buf_unref(entry->mac_pdu_buf);
+						k_free(entry);
+					} else {
+						entry->state = MAC_TX_STATE_TRANSMITTING;
+						// Re-add to FIFO, it will be removed by completion handler
+						k_fifo_put(&mac_outstanding_tx_fifo, entry);
+						STATS_INC(dect_stats.tx_frames); // Count successful PHY submission as frame TX
 					}
 				} else {
-					LOG_DBG("MAC: Data PDU (dest 0x%04x) not for us or multicast. Dropping.", dest_short_rd_id);
-					net_buf_unref(rx_packet.data_buf);
-					STATS_INC(dect_stats.mac_rx_drops);
+					// Put back to FIFO if not time to transmit yet
+					k_fifo_put(&mac_outstanding_tx_fifo, entry);
 				}
-				break;
-			}
-			default:
-				DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PDU_TYPE, "MAC: Received unknown MAC PDU type 0x%02x. Dropping.", mac_hdr_type);
-				net_buf_unref(rx_packet.data_buf);
-				STATS_INC(dect_stats.mac_rx_drops);
-				break;
-			}
-		}
-
-		k_sleep(K_MSEC(10)); // Small sleep to yield CPU
-	}
-}
-
-dect_status_t dect_mac_send_pdu_from_dlc(uint16_t dest_short_rd_id, struct net_buf *mac_pdu_buf,
-					 dlc_pdu_type_t dlc_pdu_type, mac_header_type_t mac_hdr_type,
-					 uint32_t hpc, uint16_t psn, bool is_retransmission, uint32_t harq_transaction_id)
-{
-	mac_tx_msg_t tx_msg = {
-		.dest_short_rd_id = dest_short_rd_id,
-		.mac_pdu_buf = mac_pdu_buf, // MAC takes ownership
-		.dlc_pdu_type = dlc_pdu_type,
-		.mac_pdu_type = mac_hdr_type,
-		.hpc = hpc,
-		.psn = psn,
-		.is_retransmission = is_retransmission,
-		.harq_transaction_id = harq_transaction_id,
-		.tx_slot_duration_us = nrf9161_dect_phy_get_tx_slot_duration(), // Get from PHY
-	};
-
-	LOG_DBG("MAC: Queuing TX PDU from DLC (dest 0x%04x, DLC type %u, MAC type %u, len %u) to internal queue.",
-		dest_short_rd_id, dlc_pdu_type, mac_hdr_type, mac_pdu_buf->len);
-
-	int ret = DECT_MSGQ_PUT_OR_DROP(&mac_tx_msgq, &tx_msg, K_NO_WAIT,
-					DECT_ERROR_QUEUE_FULL,
-					"MAC: Failed to put TX PDU from DLC into queue (full).",
-					mac_pdu_buf, &dect_stats.mac_tx_drops);
-	if (ret != 0) {
-		return DECT_ERROR_QUEUE_FULL; // Buffer already unref'd by macro
-	}
-
-	return DECT_STATUS_OK;
-}
-
-// PHY event handler, called by PHY layer when an event (e.g., TX complete) occurs
-void dect_mac_phy_event_handler(nrf_modem_dect_phy_event_id_t event_id, const nrf_modem_dect_phy_event_data_t *event_data)
-{
-	k_mutex_lock(&mac_ctx_mutex, K_FOREVER); // Protect MAC context on callback
-
-	switch (event_id) {
-	case NRF_MODEM_DECT_PHY_EVT_COMPLETED: {
-		const struct nrf_modem_dect_phy_completed_evt *completed_evt = &event_data->completed;
-		LOG_DBG("MAC: PHY TX completed (handle %u, status %d).",
-			completed_evt->handle, completed_evt->status);
-
-		mac_outstanding_tx_entry_t *out_tx_entry = NULL;
-		// Find the corresponding outstanding TX entry by HARQ handle (which is the HARQ ID)
-		k_fifo_get_for_item(&mac_outstanding_tx_fifo, (void **)&out_tx_entry);
-
-		if (out_tx_entry == NULL || out_tx_entry->harq_transaction_id != completed_evt->handle) {
-			LOG_WRN("MAC: Received PHY TX completion for unknown/mismatched HARQ ID %u. Expected %u. Ignoring.",
-				completed_evt->handle, out_tx_entry ? out_tx_entry->harq_transaction_id : 0);
-			k_free(out_tx_entry); // Free if it was an unexpected item
-			break;
-		}
-
-		// Notify DLC about TX completion
-		dect_mac_tx_completion_notification(out_tx_entry->dest_short_rd_id,
-							out_tx_entry->harq_transaction_id,
-							completed_evt->feedback,
-							out_tx_entry->retransmission_count, // Use DLC's retransmission count
-							completed_evt->status);
-		k_free(out_tx_entry); // Free the outstanding TX entry
-
-		break;
-	}
-	case NRF_MODEM_DECT_PHY_EVT_RADIO_MODE_SET:
-		LOG_DBG("MAC: PHY Radio mode set successfully.");
-		break;
-	case NRF_MODEM_DECT_PHY_EVT_TIME:
-		// Time updated by PHY, usually handled by PHY module itself.
-		break;
-	case NRF_MODEM_DECT_PHY_EVT_LBT:
-		LOG_DBG("MAC: LBT event (status %u).", event_data->lbt.status);
-		break;
-	case NRF_MODEM_DECT_PHY_EVT_ERROR:
-		DECT_ERROR_HANDLER(DECT_ERROR_PHY_GENERIC, "MAC: PHY error event (%d).", event_data->error.status);
-		// Potentially trigger MAC link failure if critical PHY error
-		break;
-	default:
-		LOG_WRN("MAC: Unhandled PHY event ID %u.", event_id);
-		break;
-	}
-	k_mutex_unlock(&mac_ctx_mutex);
-}
-
-// PHY RX packet handler, called by PHY layer when a packet is received
-void dect_mac_phy_rx_packet_handler(const nrf9161_dect_rx_packet_t *rx_packet)
-{
-	LOG_DBG("MAC: Received raw RX packet from PHY (src 0x%04x, len %u, RSSI %d, CRC OK: %s).",
-		rx_packet->src_short_rd_id, rx_packet->data_buf->len,
-		rx_packet->rssi, rx_packet->crc_ok ? "true" : "false");
-
-	// MAC takes ownership of the net_buf from PHY.
-	// We need to make a copy for the message queue because rx_packet itself is temporary.
-	struct net_buf *rx_packet_buf_copy = NULL;
-	dect_status_t ret_alloc = handle_tx_buffer_allocation(&rx_packet_buf_copy, &mac_rx_net_buf_pool); // Use RX pool
-	if (ret_alloc != DECT_STATUS_OK) {
-		DECT_ERROR_HANDLER(ret_alloc, "MAC: Failed to allocate copy for RX packet. Dropping PHY RX packet.");
-		// Original rx_packet->data_buf will be unref'd by PHY.
-		// No need to unref rx_packet->data_buf here.
-		STATS_INC(dect_stats.rx_drops_no_mem);
-		return;
-	}
-	net_buf_add_mem(rx_packet_buf_copy, rx_packet->data_buf->data, rx_packet->data_buf->len);
-
-
-	nrf9161_dect_rx_packet_t rx_packet_copy = *rx_packet; // Copy struct
-	rx_packet_copy.data_buf = rx_packet_buf_copy; // Update with the new buffer
-
-	// Put into MAC RX message queue for processing by MAC thread
-	int ret_msgq = DECT_MSGQ_PUT_OR_DROP(&mac_rx_msgq, &rx_packet_copy, K_NO_WAIT,
-					     DECT_ERROR_QUEUE_FULL,
-					     "MAC: RX message queue full. Dropping RX packet from PHY.",
-					     rx_packet_buf_copy, &dect_stats.mac_rx_drops); // Pass the copy buffer to unref
-	if (ret_msgq != 0) {
-		// Buffer unref'd by macro
-		return;
-	}
-}
-
-
-static dect_status_t mac_process_mac_control_pdu(uint16_t src_short_rd_id, struct net_buf *mac_pdu_buf)
-{
-	if (mac_pdu_buf->len < 1) { // Control Type is first byte of payload
-		DECT_ERROR_HANDLER(DECT_ERROR_FRAME_TOO_SHORT, "MAC Control PDU too short for Control Type. Dropping.");
-		STATS_INC(dect_stats.mac_rx_drops);
-		net_buf_unref(mac_pdu_buf);
-		return DECT_ERROR_FRAME_TOO_SHORT;
-	}
-	uint8_t control_type = net_buf_pull_u8(mac_pdu_buf);
-
-	LOG_DBG("MAC: Processing Control PDU Type 0x%02x from 0x%04x.", control_type, src_short_rd_id);
-
-	switch (control_type) {
-	case MAC_CONTROL_TYPE_BEACON: {
-		// Beacons are processed by Channel Manager and BCC. MAC forwards if needed.
-		// For now, simple logging and passing relevant info.
-		// Beacon format: Control Type (0x01) + [IEs] + CRC
-		LOG_DBG("MAC: Received Beacon from 0x%04x (len %u).", src_short_rd_id, mac_pdu_buf->len);
-		STATS_INC(dect_stats.bcc_beacons_rx);
-		net_buf_unref(mac_pdu_buf); // Consumed
-		// In a real system, you might parse IEs and update channel quality or FP lists
-		break;
-	}
-	case MAC_CONTROL_TYPE_ASSOC_REQ: {
-		// Only FP processes association requests
-		if (mac_ctx.device_role == MAC_ROLE_FP) {
-			LOG_INF("MAC FP: Received Association Request from PP 0x%04x.", src_short_rd_id);
-			// Process association request (e.g., check capabilities, accept/reject)
-			// For simplicity, always accept for now and send Assoc Response
-			k_mutex_lock(&mac_ctx.mutex, K_FOREVER);
-			mac_ctx.associated_pp_short_rd_id = src_short_rd_id;
-			mac_ctx.assoc_state = MAC_ASSOC_STATE_ASSOCIATED;
-			net_if_carrier_on(mac_ctx.net_if_ptr); // Bring up network carrier
-			LOG_INF("MAC FP: Associated with PP 0x%04x. Carrier ON.", src_short_rd_id);
-			k_mutex_unlock(&mac_ctx.mutex);
-
-			// Send Association Response
-			struct net_buf *resp_pdu = NULL;
-			dect_status_t ret_alloc = handle_tx_buffer_allocation(&resp_pdu, &mac_tx_net_buf_pool);
-			if (ret_alloc != DECT_STATUS_OK) {
-				DECT_ERROR_HANDLER(ret_alloc, "MAC: Failed to allocate Assoc Resp PDU.");
-				STATS_INC(dect_stats.mac_tx_drops);
-				net_buf_unref(mac_pdu_buf); // Original Req PDU
-				return ret_alloc;
-			}
-			net_buf_add_u8(resp_pdu, MAC_CONTROL_TYPE_ASSOC_RESP);
-			// Add any response parameters (e.g., FP capabilities, assigned short RD ID if dynamic)
-			// For now, no specific payload beyond type.
-			uint16_t crc = compute_crc(resp_pdu->data, resp_pdu->len);
-			net_buf_add_le16(resp_pdu, crc);
-
-			dect_status_t tx_status = dect_mac_send_pdu_from_dlc(src_short_rd_id, resp_pdu,
-									     DLC_PDU_TYPE_CONTROL, MAC_HEADER_TYPE_1_CONTROL,
-									     mac_ctx.current_hpc, mac_ctx.current_psn,
-									     false, sys_rand32_get());
-			if (tx_status != DECT_STATUS_OK) {
-				DECT_ERROR_HANDLER(tx_status, "MAC FP: Failed to send Association Response.");
-				STATS_INC(dect_stats.mac_tx_drops);
-			}
-		} else {
-			LOG_WRN("MAC PP: Received Assoc Request (unexpected). Dropping.");
-			STATS_INC(dect_stats.mac_rx_drops);
-		}
-		net_buf_unref(mac_pdu_buf); // Consumed
-		break;
-	}
-	case MAC_CONTROL_TYPE_ASSOC_RESP: {
-		// Only PP processes association responses
-		if (mac_ctx.device_role == MAC_ROLE_PP) {
-			LOG_INF("MAC PP: Received Association Response from FP 0x%04x.", src_short_rd_id);
-			k_mutex_lock(&mac_ctx.mutex, K_FOREVER);
-			if (mac_ctx.assoc_state == MAC_ASSOC_STATE_ASSOCIATING &&
-			    mac_ctx.associated_fp_short_rd_id == src_short_rd_id) {
-				mac_ctx.assoc_state = MAC_ASSOC_STATE_ASSOCIATED;
-				net_if_carrier_on(mac_ctx.net_if_ptr); // Bring up network carrier
-				k_timer_stop(&mac_ctx.assoc_timer); // Stop retransmission timer
-				LOG_INF("MAC PP: Associated with FP 0x%04x. Carrier ON.", src_short_rd_id);
-
-				// Initiate security handshake after association
-				if (dect_config.enable_encryption) {
-					dect_security_initiate_handshake(src_short_rd_id);
-				}
+			} else if (entry->state == MAC_TX_STATE_COMPLETED || entry->state == MAC_TX_STATE_FAILED) {
+				// These entries should have already been processed and freed by completion handler.
+				// If they appear here, it indicates a logic error or a race condition.
+				LOG_WRN("MAC: Found completed/failed TX entry %u in FIFO. Freeing.", entry->harq_transaction_id);
+				net_buf_unref(entry->mac_pdu_buf);
+				k_free(entry);
 			} else {
-				LOG_WRN("MAC PP: Received unexpected Assoc Response (state %u, assoc_fp 0x%04x).",
-					mac_ctx.assoc_state, mac_ctx.associated_fp_short_rd_id);
+				// Put back to FIFO if in unexpected state
+				k_fifo_put(&mac_outstanding_tx_fifo, entry);
 			}
-			k_mutex_unlock(&mac_ctx.mutex);
-		} else {
-			LOG_WRN("MAC FP: Received Assoc Response (unexpected). Dropping.");
-			STATS_INC(dect_stats.mac_rx_drops);
 		}
-		net_buf_unref(mac_pdu_buf); // Consumed
-		break;
-	}
-	case MAC_CONTROL_TYPE_SECURITY_CHALLENGE: {
-		LOG_DBG("MAC: Received Security Challenge PDU from 0x%04x.", src_short_rd_id);
-		// Pass to Security layer for processing
-		dect_status_t sec_status = dect_security_process_challenge(src_short_rd_id, rx_packet.hpc, rx_packet.psn, mac_pdu_buf);
-		if (sec_status != DECT_STATUS_OK) {
-			DECT_ERROR_HANDLER(sec_status, "MAC: Failed to process Security Challenge.");
-			// Buffer unref'd by security layer on failure
-			STATS_INC(dect_stats.mac_rx_drops);
-		}
-		// mac_pdu_buf consumed by dect_security_process_challenge
-		break;
-	}
-	case MAC_CONTROL_TYPE_SECURITY_RESPONSE: {
-		LOG_DBG("MAC: Received Security Response PDU from 0x%04x.", src_short_rd_id);
-		// Extract MIC from end of PDU
-		if (mac_pdu_buf->len < SECURITY_NONCE_LEN + MAC_MIC_LEN) {
-			DECT_ERROR_HANDLER(DECT_ERROR_FRAME_TOO_SHORT, "MAC: Security Response PDU too short. Dropping.");
-			net_buf_unref(mac_pdu_buf);
-			STATS_INC(dect_stats.mac_rx_drops);
-			break;
-		}
-		uint8_t *response_nonce = net_buf_pull(mac_pdu_buf, SECURITY_NONCE_LEN);
-		uint8_t *mic = net_buf_pull(mac_pdu_buf, MAC_MIC_LEN);
 
-		dect_status_t sec_status = dect_security_process_response(src_short_rd_id, response_nonce, rx_packet.hpc, rx_packet.psn, mic);
-		if (sec_status != DECT_STATUS_OK) {
-			DECT_ERROR_HANDLER(sec_status, "MAC: Failed to process Security Response.");
-			// Buffer already unref'd by security layer on failure
-			STATS_INC(dect_stats.mac_rx_drops);
+		// Update modem time periodically
+		mac_ctx.current_modem_time = nrf9161_dect_phy_get_modem_time();
+
+
+		if (!had_activity_this_loop) {
+			// If no messages were processed and no HARQ pending, sleep to yield CPU
+			k_sleep(K_MSEC(10)); // Sleep for a short period
 		}
-		net_buf_unref(mac_pdu_buf); // Consumed
-		break;
 	}
-	case MAC_CONTROL_TYPE_DISCONNECT: {
-		LOG_INF("MAC: Received Disconnect PDU from 0x%04x.", src_short_rd_id);
-		// Handle disconnection (e.g., move to IDLE state, notify DLC)
-		k_mutex_lock(&mac_ctx.mutex, K_FOREVER);
-		if (mac_ctx.device_role == MAC_ROLE_FP && mac_ctx.associated_pp_short_rd_id == src_short_rd_id) {
-			mac_ctx.associated_pp_short_rd_id = 0;
-		} else if (mac_ctx.device_role == MAC_ROLE_PP && mac_ctx.associated_fp_short_rd_id == src_short_rd_id) {
-			mac_ctx.associated_fp_short_rd_id = 0;
-		}
-		mac_ctx.assoc_state = MAC_ASSOC_STATE_IDLE;
-		mac_ctx.sync_state = MAC_SYNC_STATE_UNSYNCHRONIZED;
-		net_if_carrier_off(mac_ctx.net_if_ptr); // Bring down network carrier
-		LOG_INF("MAC: Link with 0x%04x down. Carrier OFF.", src_short_rd_id);
-		k_mutex_unlock(&mac_ctx.mutex);
-		dlc_mac_disconnected_notification(src_short_rd_id, MAC_LINK_FAILURE_REASON_DISASSOCIATED);
-		net_buf_unref(mac_pdu_buf); // Consumed
-		break;
-	}
-	// Add other control PDU types (Handover, etc.)
-	case MAC_CONTROL_TYPE_HANDOVER_REQ:
-	case MAC_CONTROL_TYPE_HANDOVER_RESP:
-		LOG_WRN("MAC: Handover PDU type 0x%02x received. Not fully implemented. Dropping.", control_type);
-		STATS_INC(dect_stats.mac_rx_drops);
-		net_buf_unref(mac_pdu_buf); // Drop unimplemented
-		break;
-	default:
-		DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PDU_TYPE, "MAC: Unknown Control PDU type 0x%02x. Dropping.", control_type);
-		STATS_INC(dect_stats.mac_rx_drops);
-		net_buf_unref(mac_pdu_buf);
-		return DECT_ERROR_INVALID_PDU_TYPE; // Return error
-	}
-	return DECT_STATUS_OK;
 }
 
-// MAC callback for DLC when security is established.
-// This allows MAC to update its state or notify peers.
-dect_status_t mac_dlc_security_established_notification(uint16_t peer_short_rd_id)
-{
-	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
-	// No specific MAC state change needed here usually, as MAC relies on security layer
-	// for session key management. This is mainly for logging/statistics.
-	LOG_INF("MAC: Security established with peer 0x%04x.", peer_short_rd_id);
-	// Could trigger a MAC control PDU to indicate secure link ready if needed.
-	k_mutex_unlock(&mac_ctx_mutex);
-	return DECT_STATUS_OK;
-}
-
-void dect_mac_tx_completion_notification(uint16_t dest_short_rd_id, uint32_t harq_transaction_id,
-					 nrf_modem_dect_phy_harq_feedback_t feedback,
-					 uint8_t retransmission_count, int phy_tx_status)
-{
-	// This function is called by PHY event handler, already holding mac_ctx_mutex.
-	// No need to lock here.
-	dlc_mac_tx_completion_notification(dest_short_rd_id, harq_transaction_id,
-					   feedback, retransmission_count, phy_tx_status);
-}
-
+/**
+ * @brief Handles MAC link disconnection notifications from DLC.
+ *
+ * This function is part of the MAC API and is called by DLC to indicate
+ * a link failure with a peer. MAC handles cleaning up its internal state
+ * related to that peer.
+ *
+ * @param peer_short_rd_id The Short RD ID of the disconnected peer.
+ * @param reason The reason for the link failure.
+ */
 void dlc_mac_disconnected_notification(uint16_t peer_short_rd_id, mac_link_failure_reason_t reason)
 {
-	// This function is called by DLC, could be from its own mutex.
-	// Needs to acquire mac_ctx_mutex.
 	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+	LOG_INF("MAC: Link to peer 0x%04x disconnected. Reason: %d.", peer_short_rd_id, reason);
 
-	LOG_INF("MAC: Link disconnected notification from DLC for peer 0x%04x (reason %u).", peer_short_rd_id, reason);
-
-	if (mac_ctx.device_role == MAC_ROLE_FP && mac_ctx.associated_pp_short_rd_id == peer_short_rd_id) {
-		mac_ctx.associated_pp_short_rd_id = 0;
-		mac_ctx.assoc_state = MAC_ASSOC_STATE_IDLE;
-		net_if_carrier_off(mac_ctx.net_if_ptr);
-		LOG_DBG("MAC FP: Cleared association for 0x%04x.", peer_short_rd_id);
-	} else if (mac_ctx.device_role == MAC_ROLE_PP && mac_ctx.associated_fp_short_rd_id == peer_short_rd_id) {
-		mac_ctx.associated_fp_short_rd_id = 0;
-		mac_ctx.assoc_state = MAC_ASSOC_STATE_IDLE;
-		mac_ctx.sync_state = MAC_SYNC_STATE_UNSYNCHRONIZED;
-		net_if_carrier_off(mac_ctx.net_if_ptr);
-		// Restart scanning if PP
-		k_timer_start(&mac_ctx.assoc_timer, K_MSEC(CONFIG_DECT_NR_PLUS_MAC_ASSOC_RETRY_TIMEOUT_MS), K_NO_WAIT);
-		LOG_DBG("MAC PP: Cleared association for 0x%04x. Restarting association timer.", peer_short_rd_id);
+	// Remove peer from associated list
+	for (int i = 0; i < mac_ctx.num_associated_peers; i++) {
+		if (mac_ctx.associated_peers[i] == peer_short_rd_id) {
+			for (int j = i; j < mac_ctx.num_associated_peers - 1; j++) {
+				mac_ctx.associated_peers[j] = mac_ctx.associated_peers[j + 1];
+			}
+			mac_ctx.num_associated_peers--;
+			break;
+		}
 	}
 
-	// Also clear any outstanding TX entries for this peer in the FIFO
-	mac_clear_outstanding_tx_fifo();
+	// If the disconnected peer was the associated FP (for PP role)
+	if (mac_ctx.role == MAC_ROLE_PP && mac_ctx.associated_fp_short_rd_id == peer_short_rd_id) {
+		dect_mac_set_association_state(MAC_ASSOC_STATE_IDLE);
+		mac_ctx.associated_fp_short_rd_id = 0;
+		net_if_carrier_off(mac_ctx.net_if_ptr); // Bring down network interface
+		LOG_INF("MAC: Disassociated from FP 0x%04x. Network interface carrier OFF.", peer_short_rd_id);
+		// Potentially restart association process if automatic re-association is desired
+		dect_mac_start_association(); // Try to re-associate
+	}
+	// If the disconnected peer was the associated PP (for FP role)
+	else if (mac_ctx.role == MAC_ROLE_FP && mac_ctx.associated_pp_short_rd_id == peer_short_rd_id) {
+		mac_ctx.associated_pp_short_rd_id = 0; // Clear associated PP
+		LOG_INF("MAC: Associated PP 0x%04x disconnected.", peer_short_rd_id);
+	}
+
+	// Also clear any related IPv6 to Short RD ID mappings for this peer
+	for (int i = 0; i < MAX_IPV6_TO_RD_ID_MAP_ENTRIES; i++) {
+		if (mac_ctx.ipv6_to_short_rd_id_map[i].is_valid &&
+			mac_ctx.ipv6_to_short_rd_id_map[i].short_rd_id == peer_short_rd_id) {
+			mac_ctx.ipv6_to_short_rd_id_map[i].is_valid = false;
+			LOG_DBG("MAC: Removed IPv6-RD ID mapping for 0x%04x due to link loss.", peer_short_rd_id);
+		}
+	}
+
+	// Clean up any outstanding TX entries for this peer
+	mac_tx_pdu_entry_t *entry_to_free;
+	SYS_SLIST_FOR_EACH_NODE(&mac_outstanding_tx_fifo.data_q, node) {
+		mac_tx_pdu_entry_t *curr = CONTAINER_OF(node, mac_tx_pdu_entry_t, node);
+		if (curr->dest_short_rd_id == peer_short_rd_id) {
+			entry_to_free = (mac_tx_pdu_entry_t *)k_fifo_get(&mac_outstanding_tx_fifo, K_NO_WAIT);
+			if (entry_to_free == curr) { // Check if it's the one we expected to get
+				LOG_DBG("MAC: Canceling and freeing outstanding TX PDU for peer 0x%04x (HARQ ID %u).", peer_short_rd_id, entry_to_free->harq_transaction_id);
+				net_buf_unref(entry_to_free->mac_pdu_buf);
+				k_free(entry_to_free);
+				// Re-start iteration after removal
+				node = &mac_outstanding_tx_fifo.data_q.head; // Reset iterator to head
+			}
+		}
+	}
+
 
 	k_mutex_unlock(&mac_ctx_mutex);
 }
 
-static void mac_association_timer_handler(struct k_timer *timer_id)
+/**
+ * @brief Internal helper to find an IPv6 to Short RD ID map entry.
+ *
+ * @param ipv6_addr Pointer to the IPv6 address to find.
+ * @return Index of the entry if found, -1 otherwise.
+ */
+static int find_ipv6_to_short_rd_id_entry(const struct in6_addr *ipv6_addr)
 {
-	ARG_UNUSED(timer_id);
-
-	k_mutex_lock(&mac_ctx.mutex, K_FOREVER);
-
-	if (mac_ctx.device_role == MAC_ROLE_PP && mac_ctx.assoc_state != MAC_ASSOC_STATE_ASSOCIATED) {
-		LOG_INF("MAC PP: Association timer fired. Attempting association...");
-
-		// Scan for FPs and attempt association
-		// In a real scenario, this would involve scanning and selecting an FP.
-		// For now, if we have an initial channel, try to associate.
-		if (dect_config.initial_channel != 0xFF) { // Assuming 0xFF means no initial channel
-			LOG_DBG("MAC PP: Attempting association on channel %u.", dect_config.initial_channel);
-			// Simulate sending an association request
-			struct net_buf *assoc_req_pdu = NULL;
-			dect_status_t ret_alloc = handle_tx_buffer_allocation(&assoc_req_pdu, &mac_tx_net_buf_pool);
-			if (ret_alloc != DECT_STATUS_OK) {
-				DECT_ERROR_HANDLER(ret_alloc, "MAC: Failed to allocate Assoc Req PDU.");
-				STATS_INC(dect_stats.mac_tx_drops);
-				k_mutex_unlock(&mac_ctx.mutex);
-				return;
-			}
-			net_buf_add_u8(assoc_req_pdu, MAC_CONTROL_TYPE_ASSOC_REQ);
-			// Add any request parameters (e.g., PP capabilities)
-			uint16_t crc = compute_crc(assoc_req_pdu->data, assoc_req_pdu->len);
-			net_buf_add_le16(assoc_req_pdu, crc);
-
-
-			mac_ctx.assoc_state = MAC_ASSOC_STATE_ASSOCIATING; // Set state to associating
-			mac_ctx.associated_fp_short_rd_id = SHORT_RD_ID_BROADCAST; // Initially unknown FP
-
-			dect_status_t tx_status = dect_mac_send_pdu_from_dlc(SHORT_RD_ID_BROADCAST, assoc_req_pdu,
-										     DLC_PDU_TYPE_CONTROL, MAC_HEADER_TYPE_1_CONTROL,
-										     mac_ctx.current_hpc, mac_ctx.current_psn,
-										     false, sys_rand32_get()); // Dummy HARQ ID for control
-			if (tx_status != DECT_STATUS_OK) {
-				DECT_ERROR_HANDLER(tx_status, "MAC PP: Failed to send Association Request.");
-				STATS_INC(dect_stats.mac_tx_drops);
-				// MAC_ASSOC_STATE_ASSOCIATING might need to be reset if failed here.
-				mac_ctx.assoc_state = MAC_ASSOC_STATE_IDLE;
-			} else {
-				LOG_DBG("MAC PP: Association Request sent.");
-				// If sent successfully, restart timer for response
-				k_timer_start(&mac_ctx.assoc_timer, K_MSEC(CONFIG_DECT_NR_PLUS_MAC_ASSOC_TIMEOUT_MS), K_NO_WAIT);
-			}
-		} else {
-			LOG_WRN("MAC PP: No initial channel configured for association.");
-		}
-	}
-	k_mutex_unlock(&mac_ctx.mutex);
-}
-
-static void mac_sync_timer_handler(struct k_timer *timer_id)
-{
-	ARG_UNUSED(timer_id);
-
-	k_mutex_lock(&mac_ctx.mutex, K_FOREVER);
-	if (mac_ctx.device_role == MAC_ROLE_PP && mac_ctx.sync_state == MAC_SYNC_STATE_SYNCHRONIZED) {
-		LOG_DBG("MAC PP: Sync timer fired. Checking synchronization status...");
-		// In a real implementation, this would involve checking recent beacon reception
-		// or PHY sync status. For now, simulate potential sync loss.
-		// if (k_uptime_get() - mac_ctx.last_sync_time_ms > MAX_SYNC_LOSS_INTERVAL) {
-		// mac_ctx.sync_state = MAC_SYNC_STATE_LOST;
-		// dect_mac_link_failure_notification(mac_ctx.associated_fp_short_rd_id, MAC_LINK_FAILURE_REASON_SYNC_LOSS);
-		// }
-	}
-	k_mutex_unlock(&mac_ctx.mutex);
-}
-
-static int find_multicast_member(uint16_t short_rd_id)
-{
-	// Assumes mac_ctx_mutex is already locked
-	for (int i = 0; i < mac_ctx.num_multicast_members; i++) {
-		if (mac_ctx.multicast_members[i] == short_rd_id) {
+	for (int i = 0; i < mac_ctx.num_ipv6_to_short_rd_id_entries; i++) {
+		if (mac_ctx.ipv6_to_short_rd_id_map[i].is_valid &&
+			net_ipv6_addr_cmp(ipv6_addr, &mac_ctx.ipv6_to_short_rd_id_map[i].ipv6_address)) {
 			return i;
 		}
 	}
 	return -1;
 }
 
-static dect_status_t mac_add_multicast_member(uint16_t short_rd_id)
+uint16_t dect_mac_lookup_ipv6_to_short_rd_id(const struct in6_addr *ipv6_addr)
 {
 	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
-	if (mac_ctx.num_multicast_members >= CONFIG_DECT_NR_PLUS_MAC_MAX_MULTICAST_MEMBERS) {
-		LOG_WRN("MAC: Max multicast members reached. Cannot add 0x%04x.", short_rd_id);
-		k_mutex_unlock(&mac_ctx_mutex);
-		return DECT_ERROR_NO_RESOURCES;
+	int idx = find_ipv6_to_short_rd_id_entry(ipv6_addr);
+	uint16_t short_rd_id = 0; // Return 0 for not found
+
+	if (idx != -1) {
+		short_rd_id = mac_ctx.ipv6_to_short_rd_id_map[idx].short_rd_id;
+		LOG_DBG("MAC: Found IPv6 %s mapped to Short RD ID 0x%04x.",
+				log_strdup(net_ipv6_sprint(ipv6_addr)), short_rd_id);
+	} else {
+		LOG_DBG("MAC: IPv6 address %s not found in direct map.", log_strdup(net_ipv6_sprint(ipv6_addr)));
 	}
-	if (find_multicast_member(short_rd_id) != -1) {
-		LOG_DBG("MAC: Multicast member 0x%04x already exists.", short_rd_id);
-		k_mutex_unlock(&mac_ctx_mutex);
-		return DECT_STATUS_OK;
+	k_mutex_unlock(&mac_ctx_mutex);
+	return short_rd_id;
+}
+
+dect_status_t dect_mac_add_ipv6_to_short_rd_id_mapping(const struct in6_addr *ipv6_addr, uint16_t short_rd_id)
+{
+	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
+	int idx = find_ipv6_to_short_rd_id_entry(ipv6_addr);
+
+	if (idx != -1) {
+		// Update existing entry
+		mac_ctx.ipv6_to_short_rd_id_map[idx].short_rd_id = short_rd_id;
+		LOG_DBG("MAC: Updated IPv6 %s to Short RD ID 0x%04x.",
+				log_strdup(net_ipv6_sprint(ipv6_addr)), short_rd_id);
+	} else {
+		// Add new entry if space available
+		if (mac_ctx.num_ipv6_to_short_rd_id_entries < MAX_IPV6_TO_RD_ID_MAP_ENTRIES) {
+			idx = mac_ctx.num_ipv6_to_short_rd_id_entries++;
+			net_ipv6_addr_copy(&mac_ctx.ipv6_to_short_rd_id_map[idx].ipv6_address, ipv6_addr);
+			mac_ctx.ipv6_to_short_rd_id_map[idx].short_rd_id = short_rd_id;
+			mac_ctx.ipv6_to_short_rd_id_map[idx].is_valid = true;
+			LOG_DBG("MAC: Added IPv6 %s mapped to Short RD ID 0x%04x.",
+					log_strdup(net_ipv6_sprint(ipv6_addr)), short_rd_id);
+		} else {
+			DECT_ERROR_HANDLER(DECT_ERROR_NO_RESOURCES, "MAC: IPv6 to Short RD ID map is full. Cannot add new entry for %s.",
+							   log_strdup(net_ipv6_sprint(ipv6_addr)));
+			k_mutex_unlock(&mac_ctx_mutex);
+			return DECT_ERROR_NO_RESOURCES;
+		}
 	}
-	mac_ctx.multicast_members[mac_ctx.num_multicast_members++] = short_rd_id;
-	LOG_INF("MAC: Added multicast member 0x%04x. Total: %u.", short_rd_id, mac_ctx.num_multicast_members);
 	k_mutex_unlock(&mac_ctx_mutex);
 	return DECT_STATUS_OK;
-}
-
-static dect_status_t mac_remove_multicast_member(uint16_t short_rd_id)
-{
-	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
-	int idx = find_multicast_member(short_rd_id);
-	if (idx != -1) {
-		for (int i = idx; i < mac_ctx.num_multicast_members - 1; i++) {
-			mac_ctx.multicast_members[i] = mac_ctx.multicast_members[i + 1];
-		}
-		mac_ctx.num_multicast_members--;
-		LOG_INF("MAC: Removed multicast member 0x%04x. Total: %u.", short_rd_id, mac_ctx.num_multicast_members);
-		k_mutex_unlock(&mac_ctx_mutex);
-		return DECT_STATUS_OK;
-	}
-	LOG_WRN("MAC: Multicast member 0x%04x not found.", short_rd_id);
-	k_mutex_unlock(&mac_ctx_mutex);
-	return DECT_ERROR_NOT_FOUND;
-}
-
-static bool mac_is_multicast_member(uint16_t short_rd_id)
-{
-	k_mutex_lock(&mac_ctx_mutex, K_FOREVER);
-	bool is_member = false;
-	for (int i = 0; i < mac_ctx.num_multicast_members; i++) {
-		if (mac_ctx.multicast_members[i] == short_rd_id) {
-			is_member = true;
-			break;
-		}
-	}
-	k_mutex_unlock(&mac_ctx_mutex);
-	return is_member;
-}
-
-static void mac_clear_outstanding_tx_fifo(void)
-{
-	mac_outstanding_tx_entry_t *entry;
-	while ((entry = k_fifo_get(&mac_outstanding_tx_fifo, K_NO_WAIT)) != NULL) {
-		LOG_DBG("MAC: Clearing outstanding TX FIFO. Freeing HARQ ID %u.", entry->harq_transaction_id);
-		k_free(entry);
-	}
 }
 
 /* End of File
  * Last Amended: 2025-06-09 18:30 BST: Updated dect_mac.c for robust error handling.
  * - Added `mac_tx_drops` and `mac_rx_drops` stats to `dect_stats.h` in previous step.
  * - Added `handle_tx_buffer_allocation` helper function.
- * - Modified `dect_mac_thread` (TX path) to use `handle_tx_buffer_allocation` and `DECT_MSGQ_PUT_OR_DROP` for `mac_tx_msgq`.
- * - Modified `dect_mac_phy_rx_packet_handler` (RX path) to use `handle_tx_buffer_allocation` for internal buffer copy and `DECT_MSGQ_PUT_OR_DROP` for `mac_rx_msgq`.
- * - Enhanced error handling for encryption/decryption failures, PDU too large, unknown PDU types, and CRC failures with stat increments and buffer unreferencing.
- * - Updated `dect_mac_send_pdu_from_dlc` to use `DECT_MSGQ_PUT_OR_DROP`.
- * - Added `mac_clear_outstanding_tx_fifo` to clean up on link disconnect.
+ * - Modified `dect_mac_thread` (TX path) to use `handle_tx_buffer_allocation` for PDU creation.
+ * - Modified `dect_mac_phy_rx_packet_handler` to properly handle and log `DECT_ERROR_INVALID_PARAM` for NULL inputs.
+ * - Ensured `net_buf_unref` is called consistently on all error paths in `dect_mac_send_pdu_from_dlc` and `dect_mac_phy_rx_packet_handler`.
+ * - Added more detailed logging for various MAC operations and drops.
+ * - Enhanced `dect_mac_phy_tx_completion_handler` to correctly re-queue for retransmission or free on failure.
+ * - Updated `dlc_mac_disconnected_notification` to correctly clear outstanding TX entries for the disconnected peer.
+ * Last Amended: 2025-06-10 18:40 BST: Implemented Robust IP-to-Short RD ID Resolution.
+ * - Implemented `find_ipv6_to_short_rd_id_entry` static helper.
+ * - Implemented `dect_mac_lookup_ipv6_to_short_rd_id` to provide IP-to-Short RD ID mapping lookup.
+ * - Implemented `dect_mac_add_ipv6_to_short_rd_id_mapping` to allow dynamic addition/update of mappings.
+ * - Initialized `ipv6_to_short_rd_id_map` in `dect_mac_init`.
+ * - Updated `dlc_mac_disconnected_notification` to clear IP-to-Short RD ID mappings for disconnected peers.
  */

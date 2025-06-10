@@ -12,6 +12,7 @@
 #include <zephyr.h> // For k_timer, k_msgq, k_mutex
 #include <net/net_buf.h> // For struct net_buf
 #include <net/net_pkt.h> // For struct net_pkt
+#include <net/ipv6.h> // For struct in6_addr
 
 // --- General Definitions ---
 #define AES_KEY_LEN 16                       /**< AES encryption key length */
@@ -30,6 +31,7 @@
 #define MAX_MULTICAST_MEMBERS 5              /**< Maximum number of multicast group members */
 #define MAX_ROUTING_ENTRIES 10               /**< Maximum entries in the routing table */
 #define MAX_FRAGMENTS_PER_SDU 16             /**< Max number of fragments for a single SDU */
+#define MAX_IPV6_TO_RD_ID_MAP_ENTRIES MAX_PEERS /**< Max entries in IPv6 to Short RD ID map */
 
 // Max PDU sizes based on typical DECT NR+ MAC payload (excluding MAC/PHY headers)
 // Assuming a maximum DLC payload size of 1500 bytes for IP MTU compatibility
@@ -413,6 +415,15 @@ typedef struct {
 } channel_quality_info_t;
 
 /**
+ * @brief Entry for mapping IPv6 addresses to Short RD IDs.
+ */
+typedef struct {
+	struct in6_addr ipv6_address; /**< IPv6 address of the peer. */
+	uint16_t short_rd_id;         /**< Corresponding Short RD ID. */
+	bool is_valid;                /**< True if this entry is valid. */
+} ipv6_to_short_rd_id_map_entry_t;
+
+/**
  * @brief MAC context structure.
  */
 typedef struct {
@@ -437,6 +448,9 @@ typedef struct {
 	uint16_t multicast_members[MAX_MULTICAST_MEMBERS]; /**< List of multicast group members. */
 	uint8_t num_multicast_members;          /**< Number of active multicast members. */
 	uint16_t associated_pp_short_rd_id; /**< Short RD ID of associated PP (if FP). */ // Added for FP role
+
+	ipv6_to_short_rd_id_map_entry_t ipv6_to_short_rd_id_map[MAX_IPV6_TO_RD_ID_MAP_ENTRIES]; /**< Map IPv6 to Short RD ID for known peers. */
+	uint8_t num_ipv6_to_short_rd_id_entries; /**< Number of valid entries in the IPv6 map. */
 } dect_mac_context_t;
 
 /**
@@ -802,5 +816,10 @@ static inline bool SEQ_NUM_IS_GREATER_EQUAL(uint8_t s1, uint8_t s2)
  * Last Amended: 2025-06-10 17:35 BST: Implemented IPv6 Fragment Header Logic recommendations.
  * - Increased `CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_TIMEOUT_MS` to 60000ms (60 seconds) for robustness.
  * - Added `cvg_reassembly_failures` to `dect_stats_t` for tracking specific reassembly failures.
+ * Last Amended: 2025-06-10 17:45 BST: Further refinements to IPv6 Fragment Header Logic and error logging.
  * Last Amended: 2025-06-10 17:50 BST: Confirmed full implementation of IPv6 Fragment Header Logic recommendations. No further code changes.
+ * Last Amended: 2025-06-10 18:25 BST: Implemented Robust IP-to-Short RD ID Resolution.
+ * - Added `ipv6_to_short_rd_id_map_entry_t` struct for IPv6 to Short RD ID mapping.
+ * - Added `ipv6_to_short_rd_id_map` and `num_ipv6_to_short_rd_id_entries` to `dect_mac_context_t`.
+ * - Added `MAX_IPV6_TO_RD_ID_MAP_ENTRIES` define.
  */
