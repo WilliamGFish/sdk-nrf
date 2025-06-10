@@ -1,0 +1,9 @@
+/ {
+    nrf_modem_dect_phy {
+        compatible = "nordic,nrf-modem-dect-phy";
+        status = "okay";
+        // Add any specific properties if the driver requires them, e.g.,
+        // pinctrl-0 = <&modem_default>;
+        // pinctrl-names = "default";
+    };
+}
