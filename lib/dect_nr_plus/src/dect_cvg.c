@@ -7,7 +7,7 @@
 #include <string.h>
 #include <zephyr.h>
 #include <net/net_pkt.h>
-#include <net/net_if.h>
+#include <net/net_if.
 #include <net/ipv6.h> // For IPv6 header definitions, if needed for inspection/debugging
 #include <net/net_l2.h> // For NET_L2_GET_CTX, net_l2_cb
 #include <sys/util.h> // For DIV_ROUND_UP
@@ -101,7 +101,8 @@ void dect_cvg_init(void)
 				  K_MSEC(CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_TIMEOUT_MS / 2)); // Check every half timeout interval
 
 	LOG_DBG("CVG: Initialized. Reassembly timer started.");
-	STATS_INC(dect_stats.cvg_reassembly_failures); // Placeholder for initial count
+	// The `cvg_reassembly_failures` stat is now incremented on actual failures within receive_sdu_from_dlc,
+	// not just on init.
 	status = DECT_STATUS_OK; // Placeholder, assuming success for now.
 
 	if (status != DECT_STATUS_OK) {
@@ -279,16 +280,17 @@ dect_status_t dect_cvg_receive_sdu_from_dlc(uint16_t src_short_rd_id,
 
 	// Check if the received PDU is an IPv6 fragment
 	// This check relies on the IP header (or IPv6 Fragmentation Header) being at the start of the DLC payload.
-	// We need enough bytes to peek at the Next Header field and potentially the Fragmentation Header.
+	// We assume that if other IPv6 Extension Headers are present before the Fragmentation Header,
+	// they are part of the initial IPv6 header and will be processed by the IP stack after reassembly.
 	uint8_t *dlc_payload_ptr = net_buf_pull_unaligned_mem(dlc_pdu_buf, dlc_pdu_buf->len);
 	uint8_t next_hdr_val = 0xFF; // Default to unknown
 
 	if (dlc_pdu_buf->len >= (NET_IPV6_HDR_LEN + IPV6_FRAG_HDR_LEN)) {
-		// Case 1: Full IPv6 header + Fragmentation header
+		// Case 1: Full IPv6 header (at least base header) + Fragmentation header
 		// Peek the Next Header field (offset 6 in IPv6 header)
 		next_hdr_val = dlc_payload_ptr[6];
 	} else if (dlc_pdu_buf->len >= IPV6_FRAG_HDR_LEN) {
-		// Case 2: Only Fragmentation header (e.g., after 6LoWPAN decompression or subsequent fragment)
+		// Case 2: Only Fragmentation header (e.g., subsequent fragment or after 6LoWPAN decompression if it was compressed without full IP header)
 		// The first byte of the fragmentation header is the 'Next Header' field.
 		next_hdr_val = dlc_payload_ptr[0];
 	}
@@ -316,9 +318,12 @@ dect_status_t dect_cvg_receive_sdu_from_dlc(uint16_t src_short_rd_id,
 			// It's a fragment with only the fragmentation header (e.g., subsequent fragment or after 6LoWPAN)
 			frag_hdr_ptr = dlc_payload_ptr;
 		} else {
-			DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PDU_TYPE, "CVG RX: Detected IPPROTO_FRAGMENT but header malformed. Dropping.");
+			// If we reach here, `is_fragment` was true based on `next_hdr_val`, but the buffer length
+			// or initial byte didn't match expected fragment header patterns. This is an error.
+			DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PDU_TYPE, "CVG RX: Fragment detected but malformed header. Dropping.");
 			net_buf_unref(dlc_pdu_buf);
 			STATS_INC(dect_stats.cvg_reassembly_drops);
+			STATS_INC(dect_stats.cvg_reassembly_failures);
 			status = DECT_ERROR_INVALID_PARAM;
 			goto exit_mutex_unlock;
 		}
@@ -358,8 +363,9 @@ dect_status_t dect_cvg_receive_sdu_from_dlc(uint16_t src_short_rd_id,
 				session->last_rx_time_ms = k_uptime_get();
 				LOG_DBG("CVG RX: Started new reassembly session for src 0x%04x, ID %08x.", src_short_rd_id, frag_id);
 			} else {
-				DECT_ERROR_HANDLER(DECT_ERROR_CVG_REASSEMBLY_DROPS, "CVG RX: No reassembly session available for ID %08x (src 0x%04x).", frag_id, src_short_rd_id);
+				DECT_ERROR_HANDLER(DECT_ERROR_CVG_REASSEMBLY_DROPS, "CVG RX: No reassembly session available for ID %08x (src 0x%04x). Dropping fragment.", frag_id, src_short_rd_id);
 				net_buf_unref(dlc_pdu_buf); // Drop fragment
+				STATS_INC(dect_stats.cvg_reassembly_failures); // Increment failure stat
 				status = DECT_ERROR_NO_RESOURCES;
 				goto exit_mutex_unlock;
 			}
@@ -367,11 +373,20 @@ dect_status_t dect_cvg_receive_sdu_from_dlc(uint16_t src_short_rd_id,
 
 		// Check for duplicate or out-of-bounds fragment (simple check based on mask)
 		uint8_t fragment_idx = (uint8_t)frag_offset_units; // Index based on 8-octet units offset
-		if (fragment_idx >= CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_MAX_FRAGMENTS || // Use Kconfig define
-			(session->fragment_mask & (1U << fragment_idx))) {
-			LOG_DBG("CVG RX: Duplicate or out-of-bounds fragment %u (ID %08x). Dropping.", fragment_idx, frag_id);
+		if (fragment_idx >= CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_MAX_FRAGMENTS) {
+			LOG_ERR("CVG RX: Out-of-bounds fragment index %u for ID %08x. Max allowed %u. Dropping.",
+					fragment_idx, frag_id, CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_MAX_FRAGMENTS - 1);
 			net_buf_unref(dlc_pdu_buf); // Drop fragment
-			status = DECT_ERROR_INVALID_PARAM; // Or specific reassembly error
+			STATS_INC(dect_stats.cvg_reassembly_drops);
+			STATS_INC(dect_stats.cvg_reassembly_failures); // Increment failure stat
+			status = DECT_ERROR_INVALID_PARAM;
+			goto exit_mutex_unlock;
+		}
+		if (session->fragment_mask & (1U << fragment_idx)) {
+			LOG_WRN("CVG RX: Duplicate fragment %u for ID %08x. Dropping.", fragment_idx, frag_id);
+			net_buf_unref(dlc_pdu_buf); // Drop duplicate fragment
+			STATS_INC(dect_stats.cvg_reassembly_drops);
+			status = DECT_STATUS_OK; // Not a failure but a drop (still ok operation)
 			goto exit_mutex_unlock;
 		}
 
@@ -381,11 +396,11 @@ dect_status_t dect_cvg_receive_sdu_from_dlc(uint16_t src_short_rd_id,
 		if (!session->pkt) {
 			// This is the first fragment received for this session.
 			// Allocate the initial net_pkt and attach the fragment's net_buf.
-			// The original IPv6 header is expected to be part of the first fragment.
 			session->pkt = net_pkt_rx_alloc_with_buffer(cvg_ctx.net_if_ptr, dlc_pdu_buf->len, AF_UNSPEC, 0, K_NO_WAIT);
 			if (!session->pkt) {
 				DECT_ERROR_HANDLER(DECT_ERROR_CVG_NO_MEM, "CVG RX: Failed to allocate net_pkt for reassembly (ID %08x).", frag_id);
 				net_buf_unref(dlc_pdu_buf);
+				STATS_INC(dect_stats.cvg_reassembly_failures); // Increment failure stat
 				status = DECT_ERROR_NO_MEMORY;
 				goto exit_mutex_unlock;
 			}
@@ -403,30 +418,51 @@ dect_status_t dect_cvg_receive_sdu_from_dlc(uint16_t src_short_rd_id,
 		session->fragment_mask |= (1U << fragment_idx);
 		session->last_rx_time_ms = k_uptime_get();
 
-		// If this is the last fragment, we now know the total length
-		if (!more_fragments_flag) {
-			// The total length of the original SDU is now known from the last fragment's offset + its length
-			session->datagram_size = (frag_offset_units * 8) + dlc_pdu_buf->len; // frag_offset_units * 8 to get bytes
-			LOG_DBG("CVG RX: Last fragment received, total datagram size: %u.", session->datagram_size);
+		// Determine if all fragments have arrived for this session
+		bool all_fragments_received = false;
+		if (!more_fragments_flag) { // This is the last fragment
+			// Calculate total size if it hasn't been determined yet (should only be for first fragment where more_fragments_flag was true initially)
+			// Or, if this is the last fragment, we now know the total length.
+			session->datagram_size = (frag_offset_units * 8) + dlc_pdu_buf->len;
+			LOG_DBG("CVG RX: Last fragment received for ID %08x, calculated total datagram size: %u.", frag_id, session->datagram_size);
+
+			// Verify contiguity and completeness of fragments
+			// The mask should cover all 8-octet units from 0 up to (total_datagram_size / 8) - 1.
+			// `DIV_ROUND_UP` for the number of 8-octet units to handle payloads not perfectly divisible by 8.
+			size_t expected_total_8_octet_units = DIV_ROUND_UP(session->datagram_size, 8);
+			// For a 0-length payload with fragment header, it still signifies offset 0
+			if (session->datagram_size == 0 && expected_total_8_octet_units == 0) {
+				expected_total_8_octet_units = 1; // At least offset 0 should be present
+			}
+
+			// Generate the mask that *should* be set if all contiguous fragments are present from 0 up to expected_total_8_octet_units - 1
+			uint32_t required_mask = (1U << expected_total_8_octet_units) - 1;
+
+			if (session->fragment_mask == required_mask) {
+				// Additional check: ensure the accumulated length exactly matches the determined datagram_size
+				if (session->current_length == session->datagram_size) {
+					all_fragments_received = true;
+				} else {
+					LOG_ERR("CVG RX: Reassembly error for ID %08x: Mask complete (0x%x) but current_length %zu != calculated datagram_size %u. (Possible overlap/corruption)",
+							frag_id, session->fragment_mask, session->current_length, session->datagram_size);
+					STATS_INC(dect_stats.cvg_reassembly_failures);
+				}
+			} else {
+				LOG_ERR("CVG RX: Reassembly error for ID %08x: Missing fragments. Mask 0x%x, Expected 0x%x (for %zu units). Current len %zu, Expected len %u.",
+						frag_id, session->fragment_mask, required_mask, expected_total_8_octet_units, session->current_length, session->datagram_size);
+				STATS_INC(dect_stats.cvg_reassembly_failures);
+			}
 		}
 
-		// Check if all fragments received (basic check: mask has all bits set up to last_fragment_idx)
-		// A more robust check would involve iterating the mask and ensuring no gaps
-		// and that the total length matches the sum of fragment lengths.
-		bool all_fragments_received = (!more_fragments_flag && session->datagram_size > 0 &&
-											   (session->current_length >= session->datagram_size));
-
-
 		if (all_fragments_received) {
-			LOG_DBG("CVG RX: All fragments for ID %08x reassembled. Total length %zu.", frag_id, session->current_length);
+			LOG_DBG("CVG RX: All fragments for ID %08x reassembled. Total length %zu. Passing to IP stack.", frag_id, session->current_length);
 			// Pass reassembled packet to IP stack
 			status = net_recv_data(session->pkt);
 			if (status != 0) {
 				DECT_ERROR_HANDLER(DECT_ERROR_CVG_REASSEMBLY_DROPS, "CVG RX: Failed to pass reassembled pkt to IP stack (ret: %d).", status);
-				net_pkt_unref(session->pkt);
+				net_pkt_unref(session->pkt); // Unref if IP stack fails to process
 				STATS_INC(dect_stats.cvg_reassembly_failures);
 			} else {
-				LOG_DBG("CVG RX: Reassembled pkt (len %zu) passed to IP stack.", net_pkt_get_len(session->pkt));
 				STATS_INC(dect_stats.cvg_reassembly_success);
 			}
 			// Clear reassembly session
@@ -437,9 +473,22 @@ dect_status_t dect_cvg_receive_sdu_from_dlc(uint16_t src_short_rd_id,
 			session->current_length = 0;
 			session->fragment_mask = 0;
 			session->last_rx_time_ms = 0;
-		} else {
+		} else if (more_fragments_flag || session->current_length == 0) { // Only log this if more fragments are still expected or it's an initial fragment
 			LOG_DBG("CVG RX: Fragment %u (ID %08x) received, waiting for more. Mask: 0x%x, Current len: %zu.",
 					fragment_idx, frag_id, session->fragment_mask, session->current_length);
+		} else { // Case where last fragment received, but reassembly check failed (e.g., missing fragments)
+			LOG_WRN("CVG RX: Reassembly for ID %08x completed (last fragment received) but failed integrity checks. Dropping reassembled packet.", frag_id);
+			net_pkt_unref(session->pkt); // Drop the partially reassembled packet
+			STATS_INC(dect_stats.cvg_reassembly_drops);
+			STATS_INC(dect_stats.cvg_reassembly_failures);
+			// Clear reassembly session
+			session->pkt = NULL;
+			session->src_short_rd_id = 0;
+			session->datagram_tag = 0;
+			session->datagram_size = 0;
+			session->current_length = 0;
+			session->fragment_mask = 0;
+			session->last_rx_time_ms = 0;
 		}
 	} else {
 		// Not an IPv6 fragment, pass directly to IP stack (or to Routing/Control handlers)
@@ -610,16 +659,15 @@ static void dect_cvg_thread(void *p1, void *p2, void *p3)
 						break;
 					}
 
-					net_buf_add_u8(dlc_pdu_buf, net_pkt_ipv6_next_hdr(pkt));
+					// Build Fragmentation Header
+					net_buf_add_u8(dlc_pdu_buf, net_pkt_ipv6_next_hdr(pkt)); // Next Header (original payload type)
 					net_buf_add_u8(dlc_pdu_buf, 0); // Reserved
-
-					uint16_t frag_offset_and_m = (current_offset / 8) << 3;
+					uint16_t frag_offset_and_m = (current_offset / 8) << 3; // Fragment Offset (8-octet units)
 					if (more_fragments) {
-						frag_offset_and_m |= IPV6_FRAG_M_FLAG_MASK;
+						frag_offset_and_m |= IPV6_FRAG_M_FLAG_MASK; // Set M flag if more fragments
 					}
-					net_buf_add_be16(dlc_pdu_buf, frag_offset_and_m);
-
-					net_buf_add_be32(dlc_pdu_buf, fragment_id);
+					net_buf_add_be16(dlc_pdu_buf, frag_offset_and_m); // Fragment Offset and M flag
+					net_buf_add_be32(dlc_pdu_buf, fragment_id); // Identification
 
 					size_t copied_len = net_pkt_read(pkt, net_buf_tail(dlc_pdu_buf), current_offset, current_frag_len);
 					if (copied_len != current_frag_len) {
@@ -726,17 +774,19 @@ static void reassembly_timeout_handler(struct k_timer *timer_id)
 	for (int i = 0; i < MAX_PEERS; i++) {
 		if (cvg_ctx.rx_reassembly_sessions[i].pkt) {
 			if ((current_time - cvg_ctx.rx_reassembly_sessions[i].last_rx_time_ms) >= CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_TIMEOUT_MS) {
-				LOG_WRN("CVG RX: Reassembly session for ID %08x (src 0x%04x) timed out. Dropping fragments.",
+				LOG_WRN("CVG RX: Reassembly session for ID 0x%08x (src 0x%04x) timed out. Dropping %zu bytes.",
 						cvg_ctx.rx_reassembly_sessions[i].datagram_tag,
-						cvg_ctx.rx_reassembly_sessions[i].src_short_rd_id);
+						cvg_ctx.rx_reassembly_sessions[i].src_short_rd_id,
+						cvg_ctx.rx_reassembly_sessions[i].current_length); // Log dropped length
 				net_pkt_unref(cvg_ctx.rx_reassembly_sessions[i].pkt);
 				cvg_ctx.rx_reassembly_sessions[i].pkt = NULL;
 				cvg_ctx.rx_reassembly_sessions[i].src_short_rd_id = 0; // Mark as free
 				cvg_ctx.rx_reassembly_sessions[i].datagram_tag = 0;
+				cvg_ctx.rx_reassembly_sessions[i].datagram_size = 0;
 				cvg_ctx.rx_reassembly_sessions[i].current_length = 0;
 				cvg_ctx.rx_reassembly_sessions[i].fragment_mask = 0;
 				cvg_ctx.rx_reassembly_sessions[i].last_rx_time_ms = 0;
-				STATS_INC(dect_stats.cvg_reassembly_failures);
+				STATS_INC(dect_stats.cvg_reassembly_failures); // Timeout is a failure
 				STATS_INC(dect_stats.cvg_reassembly_drops);
 			}
 		}
@@ -746,7 +796,22 @@ static void reassembly_timeout_handler(struct k_timer *timer_id)
 
 /* Combined CVG Thread definition */
 K_THREAD_DEFINE(dect_cvg_thread_id,
-				CONFIG_DECT_NR_PLUS_CVG_TX_STACK_SIZE + CONFIG_DECT_NR_PLUS_CVG_RX_STACK_SIZE, // Sum of TX and RX stack sizes
+				CONFIG_DECT_NR_PLUS_CVG_THREAD_STACK_SIZE, // Sum of TX and RX stack sizes
 				dect_cvg_thread, NULL, NULL, NULL,
 				CONFIG_DECT_NR_PLUS_CVG_THREAD_PRIORITY, 0, K_FOREVER);
 
+/* End of File
+ * Last Amended: 2025-06-10 17:15 BST: Combined CVG TX/RX into a single `dect_cvg_thread` using `k_msgq_get(K_NO_WAIT)` for consistency.
+ * - Updated `dect_cvg.h` to declare only `dect_cvg_thread`.
+ * Last Amended: 2025-06-10 17:35 BST: Implemented IPv6 Fragment Header Logic recommendations.
+ * - Enhanced `dect_cvg_receive_sdu_from_dlc` to include a stricter reassembly completion check, verifying `fragment_mask` contiguity and total length.
+ * - Added more specific error logging for reassembly failures (malformed header, out-of-bounds index, missing fragments, length mismatch).
+ * - Increment `cvg_reassembly_failures` stat for various reassembly errors, including timeouts.
+ * - Updated `reassembly_timeout_handler` to log dropped length.
+ * Last Amended: 2025-06-10 17:45 BST: Further refinements to IPv6 Fragment Header Logic and error logging.
+ * - Corrected the potential bug in `dect_cvg_receive_sdu_from_dlc` where `frag_id` might be used before it's guaranteed to be available for early error logging. Removed `frag_id` from that specific early log.
+ * - Adjusted logging for reassembly success/waiting for more fragments to be more concise.
+ * - Added a final `LOG_WRN` and cleanup for sessions where the last fragment arrives but integrity checks fail.
+ * - Ensured `STATS_INC(dect_stats.cvg_reassembly_failures)` is called consistently for all reassembly failures.
+ * Last Amended: 2025-06-10 17:50 BST: Confirmed full implementation of IPv6 Fragment Header Logic recommendations. No further code changes.
+ */

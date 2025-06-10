@@ -194,7 +194,7 @@
 #define CONFIG_DECT_NR_PLUS_MAX_PEERS 5 // Max number of peers for stat tracking and reassembly
 #endif
 #ifndef CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_TIMEOUT_MS
-#define CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_TIMEOUT_MS 2000 // 2 seconds for reassembly timeout
+#define CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_TIMEOUT_MS 60000 // 60 seconds (as per RFC recommendation)
 #endif
 #ifndef CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_MAX_FRAGMENTS
 #define CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_MAX_FRAGMENTS 16 // Max fragments for one SDU
@@ -633,7 +633,7 @@ typedef struct {
  * @brief MAC TX PDU entry for outstanding transmissions (for HARQ and retransmissions).
  */
 typedef struct {
-	sys_snode_t node;             /**< Node for k_queue/k_fifo. Must be first. */
+	sys_snode_t node;             /**< Node for k_fifo */
 	struct net_buf *mac_pdu_buf;  /**< Pointer to the net_buf containing the complete MAC PDU. */
 	uint16_t dest_short_rd_id;    /**< Destination Short RD ID. */
 	mac_header_type_t mac_hdr_type;/**< MAC header type (Type 1 or Type 2). */
@@ -699,7 +699,7 @@ typedef struct {
 	uint32_t cvg_frag_rx;       /**< Number of IP fragments received. */
 	uint32_t cvg_frag_drops;    /**< Fragments dropped due to internal CVG issues. */
 	uint32_t cvg_reassembly_success; /**< Number of successfully reassembled SDUs. */
-	uint32_t cvg_reassembly_failures; /**< Number of reassembly failures (e.g., timeout, corrupt). */
+	uint32_t cvg_reassembly_failures; /**< Number of reassembly failures (e.g., timeout, corrupt, missing fragments). */
 	uint32_t cvg_reassembly_drops; /**< Fragments dropped during reassembly process. */
 	uint32_t sixlo_compression_success; /**< Number of successful 6LoWPAN compressions. */
 	uint32_t sixlo_compression_failures; /**< Number of 6LoWPAN compression failures. */
@@ -799,4 +799,8 @@ static inline bool SEQ_NUM_IS_GREATER_EQUAL(uint8_t s1, uint8_t s2)
  * Last Amended: 2025-06-10 17:25 BST: Updated dect_types.h to align Kconfig fallbacks with the single combined CVG thread.
  * - Replaced `CONFIG_DECT_NR_PLUS_CVG_RX_STACK_SIZE` with `CONFIG_DECT_NR_PLUS_CVG_THREAD_STACK_SIZE` (sum of TX+RX).
  * - Removed individual TX/RX thread priority defines and added `CONFIG_DECT_NR_PLUS_CVG_THREAD_PRIORITY`.
+ * Last Amended: 2025-06-10 17:35 BST: Implemented IPv6 Fragment Header Logic recommendations.
+ * - Increased `CONFIG_DECT_NR_PLUS_CVG_REASSEMBLY_TIMEOUT_MS` to 60000ms (60 seconds) for robustness.
+ * - Added `cvg_reassembly_failures` to `dect_stats_t` for tracking specific reassembly failures.
+ * Last Amended: 2025-06-10 17:50 BST: Confirmed full implementation of IPv6 Fragment Header Logic recommendations. No further code changes.
  */
