@@ -1,10 +1,8 @@
-# CMakeLists.txt
+# modules/lib/dect_nr_plus/CMakeLists.txt
+zephyr_library() # Declares this as a Zephyr library/module
 
-cmake_minimum_required(VERSION 3.20.0)
-
-# Specify your application source files
-# Removed src/dect_phy_mock.c
-target_sources(app PRIVATE
+# List all source files in the module
+zephyr_library_sources(
     src/dect_bcc.c
     src/dect_channel_mgr.c
     src/dect_config.c
@@ -13,24 +11,28 @@ target_sources(app PRIVATE
     src/dect_cvg.c
     src/dect_dlc.c
     src/dect_mac.c
+    src/dect_nr_plus_subsystem.c
+    src/dect_phy_nrf9161.c
     src/dect_power_mgr.c
     src/dect_routing.c
     src/dect_security.c
     src/dect_stats.c
 )
 
-# Specify include directories for your driver headers
-target_include_directories(app PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+# Specify public include directories.
+# Headers here will be available to other modules/applications via their path relative to 'include'.
+# E.g., #include <dect_nr_plus/dect_mac.h>
+target_include_directories(${ZEPHYR_LIBRARY_NAME} PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/dect_nr_plus
 )
 
-# Link to nRF Connect SDK libraries for the modem and DECT PHY
-# This will pull in the actual nRF modem DECT PHY driver implementation
-zephyr_library_link_libraries(app
-    zephyr_nrf_modem_lib # Core nRF modem library
-    zephyr_drivers       # Generic drivers (might be needed for various peripherals)
-    # If using mbed TLS for crypto, ensure it's linked
-    # zephyr_mbedtls
-    # zephyr_crypto
-    # zephyr_random
+# Specify private include directories (for headers used only within this module)
+target_include_directories(${ZEPHYR_LIBRARY_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include # For headers like nrf_modem_dect_phy.h if copied here (though generally not recommended)
 )
+
+# Explicitly declare dependencies for this module.
+# These are usually implicitly handled by Kconfig dependencies, but can be good for clarity.
+# This module will depend on net_l2, nrf_modem_dect_phy, mbedtls, entropy, etc.
+# target_link_libraries(${ZEPHYR_LIBRARY_NAME} PRIVATE net_l2 nrf_modem_lib mbedtls entropy settings crc)
+
