@@ -140,7 +140,7 @@ static void sync_notif_handler(const struct hid_notification_event *event)
 	broadcast_subscription_change(report_id, enabled);
 }
 
-static void async_notif_handler(uint8_t report_id, enum bt_hids_notify_evt evt)
+static void notification_change_handler_async(uint8_t report_id, enum bt_hids_notify_evt evt)
 {
 	struct hid_notification_event *event = new_hid_notification_event();
 
@@ -169,7 +169,7 @@ static void boot_mouse_report_sent_cb(struct bt_conn *conn, void *user_data)
 static void boot_mouse_notif_handler(enum bt_hids_notify_evt evt)
 {
 	__ASSERT_NO_MSG(IS_ENABLED(CONFIG_DESKTOP_HID_BOOT_INTERFACE_MOUSE));
-	async_notif_handler(REPORT_ID_BOOT_MOUSE, evt);
+	notification_change_handler_async(REPORT_ID_BOOT_MOUSE, evt);
 }
 
 static void boot_keyboard_report_sent_cb(struct bt_conn *conn, void *user_data)
@@ -180,7 +180,7 @@ static void boot_keyboard_report_sent_cb(struct bt_conn *conn, void *user_data)
 static void boot_keyboard_notif_handler(enum bt_hids_notify_evt evt)
 {
 	__ASSERT_NO_MSG(IS_ENABLED(CONFIG_DESKTOP_HID_BOOT_INTERFACE_KEYBOARD));
-	async_notif_handler(REPORT_ID_BOOT_KEYBOARD, evt);
+	notification_change_handler_async(REPORT_ID_BOOT_KEYBOARD, evt);
 }
 
 static void report_sent_cb(struct bt_conn *conn, void *user_data)
@@ -191,67 +191,92 @@ static void report_sent_cb(struct bt_conn *conn, void *user_data)
 
 	hid_report_sent(conn, report_id, false);
 }
-static void mouse_notif_handler(enum bt_hids_notify_evt evt)
-{
-	async_notif_handler(REPORT_ID_MOUSE, evt);
-}
 
-static void keyboard_keys_notif_handler(enum bt_hids_notify_evt evt)
+static void output_report_handler_async(struct bt_hids_rep *rep, struct bt_conn *conn, bool write)
 {
-	async_notif_handler(REPORT_ID_KEYBOARD_KEYS, evt);
-}
-
-static void system_ctrl_notif_handler(enum bt_hids_notify_evt evt)
-{
-	async_notif_handler(REPORT_ID_SYSTEM_CTRL, evt);
-}
-
-static void consumer_ctrl_notif_handler(enum bt_hids_notify_evt evt)
-{
-	async_notif_handler(REPORT_ID_CONSUMER_CTRL, evt);
-}
-
-static void broadcast_kbd_leds_report(struct bt_hids_rep *rep, struct bt_conn *conn, bool write)
-{
-	/* Ignore HID keyboard LEDs report read. */
 	if (!write) {
+		/* Ignore reads on output reports. */
 		return;
 	}
 
-	struct hid_report_event *event = new_hid_report_event(rep->size + 1);
+	/* Check if report is supported. */
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(output_reports); i++) {
+		if (rep->id == output_reports[i]) {
+			break;
+		}
+	}
+
+	if (i == ARRAY_SIZE(output_reports)) {
+		LOG_ERR("Unsupported output report ID: 0x%" PRIx8, rep->id);
+		return;
+	}
+
+	if (rep->size > REPORT_BUFFER_SIZE_OUTPUT_REPORT) {
+		LOG_ERR("Unsupported output report size %" PRIu8, rep->size);
+		return;
+	}
+
+	size_t dyndata_len = sizeof(rep->id) + rep->size;
+	struct hid_report_event *event = new_hid_report_event(dyndata_len);
 
 	event->source = conn;
 	/* Subscriber is not specified for HID output report. */
 	event->subscriber = NULL;
-	event->dyndata.data[0] = REPORT_ID_KEYBOARD_LEDS;
-	memcpy(&event->dyndata.data[1], rep->data, rep->size);
 
+	uint8_t *evt_buf = event->dyndata.data;
+
+	/* Explicitly add report ID. */
+	evt_buf[0] = rep->id;
+	evt_buf++;
+
+	memcpy(evt_buf, rep->data, rep->size);
 	APP_EVENT_SUBMIT(event);
 }
 
-static void feature_report_handler(struct bt_hids_rep *rep,
-				   struct bt_conn *conn,
-				   bool write)
+static bool is_supported_config_channel_report_id(uint8_t rep_id)
 {
-	if (IS_ENABLED(CONFIG_DESKTOP_CONFIG_CHANNEL_ENABLE)) {
-		if (!write) {
-			int err = config_channel_transport_get(&cfg_chan_transport,
-							       rep->data,
-							       rep->size);
+	return ((IS_ENABLED(CONFIG_DESKTOP_CONFIG_CHANNEL_ENABLE) &&
+		 (rep_id == REPORT_ID_USER_CONFIG)) ||
+		(IS_ENABLED(CONFIG_DESKTOP_CONFIG_CHANNEL_OUT_REPORT) &&
+		 (rep_id == REPORT_ID_USER_CONFIG_OUT)));
+}
 
-			if (err) {
-				LOG_WRN("Failed to process report get");
-			}
-		} else {
-			int err = config_channel_transport_set(&cfg_chan_transport,
-							       rep->data,
-							       rep->size);
+static void config_channel_report_handler_async(struct bt_hids_rep *rep, struct bt_conn *conn,
+						bool write)
+{
+	if (!is_supported_config_channel_report_id(rep->id)) {
+		LOG_ERR("Not a supported config channel report ID: 0x%" PRIx8, rep->id);
+		return;
+	}
 
-			if (err) {
-				LOG_WRN("Failed to process report set");
-			}
+	if (!write) {
+		int err = config_channel_transport_get(&cfg_chan_transport,
+						       rep->data,
+						       rep->size);
+		if (err) {
+			LOG_WRN("config_channel_transport_get failed (err: %d)", err);
+		}
+	} else {
+		int err = config_channel_transport_set(&cfg_chan_transport,
+						       rep->data,
+						       rep->size);
+		if (err) {
+			LOG_WRN("config_channel_transport_set failed (err: %d)", err);
 		}
 	}
+}
+
+static void boot_keyboard_output_report_handler(struct bt_hids_rep *rep,
+						struct bt_conn *conn,
+						bool write)
+{
+	/* Update the passed report ID. */
+	struct bt_hids_rep updated_rep = *rep;
+
+	updated_rep.id = REPORT_ID_KEYBOARD_LEDS;
+	return output_report_handler_async(&updated_rep, conn, write);
 }
 
 static int module_init(void)
@@ -286,10 +311,10 @@ static int module_init(void)
 			     (sizeof(mask) == DIV_ROUND_UP(REPORT_SIZE_MOUSE, 8)));
 		BUILD_ASSERT(REPORT_ID_MOUSE < ARRAY_SIZE(report_index));
 
-		input_report[ir_pos].id       = REPORT_ID_MOUSE;
-		input_report[ir_pos].size     = REPORT_SIZE_MOUSE;
-		input_report[ir_pos].handler  = mouse_notif_handler;
-		input_report[ir_pos].rep_mask = (sizeof(mask) == 0)?(NULL):(mask);
+		input_report[ir_pos].id          = REPORT_ID_MOUSE;
+		input_report[ir_pos].size        = REPORT_SIZE_MOUSE;
+		input_report[ir_pos].handler_ext = notification_change_handler_async;
+		input_report[ir_pos].rep_mask    = (sizeof(mask) == 0)?(NULL):(mask);
 
 		report_index[input_report[ir_pos].id] = ir_pos;
 		ir_pos++;
@@ -301,10 +326,10 @@ static int module_init(void)
 			     (sizeof(mask) == DIV_ROUND_UP(REPORT_SIZE_KEYBOARD_KEYS, 8)));
 		BUILD_ASSERT(REPORT_ID_KEYBOARD_KEYS < ARRAY_SIZE(report_index));
 
-		input_report[ir_pos].id       = REPORT_ID_KEYBOARD_KEYS;
-		input_report[ir_pos].size     = REPORT_SIZE_KEYBOARD_KEYS;
-		input_report[ir_pos].handler  = keyboard_keys_notif_handler;
-		input_report[ir_pos].rep_mask = (sizeof(mask) == 0)?(NULL):(mask);
+		input_report[ir_pos].id          = REPORT_ID_KEYBOARD_KEYS;
+		input_report[ir_pos].size        = REPORT_SIZE_KEYBOARD_KEYS;
+		input_report[ir_pos].handler_ext = notification_change_handler_async;
+		input_report[ir_pos].rep_mask    = (sizeof(mask) == 0)?(NULL):(mask);
 
 		report_index[input_report[ir_pos].id] = ir_pos;
 		ir_pos++;
@@ -316,10 +341,10 @@ static int module_init(void)
 			     (sizeof(mask) == DIV_ROUND_UP(REPORT_SIZE_SYSTEM_CTRL, 8)));
 		BUILD_ASSERT(REPORT_ID_SYSTEM_CTRL < ARRAY_SIZE(report_index));
 
-		input_report[ir_pos].id       = REPORT_ID_SYSTEM_CTRL;
-		input_report[ir_pos].size     = REPORT_SIZE_SYSTEM_CTRL;
-		input_report[ir_pos].handler  = system_ctrl_notif_handler;
-		input_report[ir_pos].rep_mask = (sizeof(mask) == 0)?(NULL):(mask);
+		input_report[ir_pos].id          = REPORT_ID_SYSTEM_CTRL;
+		input_report[ir_pos].size        = REPORT_SIZE_SYSTEM_CTRL;
+		input_report[ir_pos].handler_ext = notification_change_handler_async;
+		input_report[ir_pos].rep_mask    = (sizeof(mask) == 0)?(NULL):(mask);
 
 		report_index[input_report[ir_pos].id] = ir_pos;
 		ir_pos++;
@@ -331,10 +356,10 @@ static int module_init(void)
 			     (sizeof(mask) == DIV_ROUND_UP(REPORT_SIZE_CONSUMER_CTRL, 8)));
 		BUILD_ASSERT(REPORT_ID_CONSUMER_CTRL < ARRAY_SIZE(report_index));
 
-		input_report[ir_pos].id       = REPORT_ID_CONSUMER_CTRL;
-		input_report[ir_pos].size     = REPORT_SIZE_CONSUMER_CTRL;
-		input_report[ir_pos].handler  = consumer_ctrl_notif_handler;
-		input_report[ir_pos].rep_mask = (sizeof(mask) == 0)?(NULL):(mask);
+		input_report[ir_pos].id          = REPORT_ID_CONSUMER_CTRL;
+		input_report[ir_pos].size        = REPORT_SIZE_CONSUMER_CTRL;
+		input_report[ir_pos].handler_ext = notification_change_handler_async;
+		input_report[ir_pos].rep_mask    = (sizeof(mask) == 0)?(NULL):(mask);
 
 		report_index[input_report[ir_pos].id] = ir_pos;
 		ir_pos++;
@@ -343,9 +368,9 @@ static int module_init(void)
 	hids_init_param.inp_rep_group_init.cnt = ir_pos;
 
 	if (IS_ENABLED(CONFIG_DESKTOP_CONFIG_CHANNEL_ENABLE)) {
-		feature_report[feat_pos].id      = REPORT_ID_USER_CONFIG;
-		feature_report[feat_pos].size    = REPORT_SIZE_USER_CONFIG;
-		feature_report[feat_pos].handler = feature_report_handler;
+		feature_report[feat_pos].id          = REPORT_ID_USER_CONFIG;
+		feature_report[feat_pos].size        = REPORT_SIZE_USER_CONFIG;
+		feature_report[feat_pos].handler     = config_channel_report_handler_async;
 
 		report_index[feature_report[feat_pos].id] = feat_pos;
 		feat_pos++;
@@ -354,19 +379,20 @@ static int module_init(void)
 	hids_init_param.feat_rep_group_init.cnt = feat_pos;
 
 	if (IS_ENABLED(CONFIG_DESKTOP_HID_REPORT_KEYBOARD_SUPPORT)) {
-		output_report[or_pos].id      = REPORT_ID_KEYBOARD_LEDS;
-		output_report[or_pos].size    = REPORT_SIZE_KEYBOARD_LEDS;
-		output_report[or_pos].handler = broadcast_kbd_leds_report;
+		output_report[or_pos].id          = REPORT_ID_KEYBOARD_LEDS;
+		output_report[or_pos].size        = REPORT_SIZE_KEYBOARD_LEDS;
+		output_report[or_pos].handler     = output_report_handler_async;
 
 		report_index[output_report[or_pos].id] = or_pos;
 		or_pos++;
 	}
 
 	if (IS_ENABLED(CONFIG_DESKTOP_CONFIG_CHANNEL_OUT_REPORT)) {
-		__ASSERT_NO_MSG(IS_ENABLED(CONFIG_DESKTOP_CONFIG_CHANNEL_ENABLE));
-		output_report[or_pos].id      = REPORT_ID_USER_CONFIG_OUT;
-		output_report[or_pos].size    = REPORT_SIZE_USER_CONFIG;
-		output_report[or_pos].handler = feature_report_handler;
+		BUILD_ASSERT(!IS_ENABLED(CONFIG_DESKTOP_CONFIG_CHANNEL_OUT_REPORT) ||
+			     IS_ENABLED(CONFIG_DESKTOP_CONFIG_CHANNEL_ENABLE));
+		output_report[or_pos].id          = REPORT_ID_USER_CONFIG_OUT;
+		output_report[or_pos].size        = REPORT_SIZE_USER_CONFIG;
+		output_report[or_pos].handler     = config_channel_report_handler_async;
 
 		report_index[output_report[or_pos].id] = or_pos;
 		or_pos++;
@@ -384,7 +410,7 @@ static int module_init(void)
 	if (IS_ENABLED(CONFIG_DESKTOP_HID_BOOT_INTERFACE_KEYBOARD)) {
 		hids_init_param.is_kb = true;
 		hids_init_param.boot_kb_notif_handler = boot_keyboard_notif_handler;
-		hids_init_param.boot_kb_outp_rep_handler = broadcast_kbd_leds_report;
+		hids_init_param.boot_kb_outp_rep_handler = boot_keyboard_output_report_handler;
 	}
 
 	if (IS_ENABLED(CONFIG_DESKTOP_CONFIG_CHANNEL_ENABLE)) {
