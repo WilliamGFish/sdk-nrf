@@ -1,7 +1,7 @@
 /*
- * Copyright (c) 2022 Nordic Semiconductor ASA
+ * Copyright (c) 2025 - Manulyitca Ltd (William Fish)
  *
- * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 /**

@@ -1,6 +1,5 @@
 /*
- * Copyright (c) 2025 Google LLC
- * Manulytica
+ * Copyright (c) 2025 - Manulyitca Ltd (William Fish)
  *
  * SPDX-License-Identifier: Apache-2.0
  */
