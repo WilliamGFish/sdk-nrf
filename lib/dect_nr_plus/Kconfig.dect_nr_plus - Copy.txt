@@ -1,0 +1,630 @@
+menu "DECT NR+ Stack Configuration"
+
+config DECT_NR_PLUS
+	bool "Enable DECT NR+ Protocol Stack"
+	default y
+	help
+	  Enable this option to include the DECT NR+ protocol stack
+	  (MAC, DLC, CVG, Security, Routing, etc.) in the build.
+
+if DECT_NR_PLUS
+
+choice DECT_NR_PLUS_DEVICE_ROLE
+	prompt "DECT NR+ Device Role"
+	default DECT_NR_PLUS_DEVICE_ROLE_PP
+	help
+	  Select the role of this DECT NR+ device in the network.
+	  - Fixed Part (FP): Acts as the base station, transmitting beacons
+	    and managing Portable Part connections.
+	  - Portable Part (PP): Acts as a client, scanning for FPs and
+	    initiating connection requests.
+
+config DECT_NR_PLUS_DEVICE_ROLE_FP
+	bool "Fixed Part (FP)"
+	depends on DECT_NR_PLUS
+
+config DECT_NR_PLUS_DEVICE_ROLE_PP
+	bool "Portable Part (PP)"
+	depends on DECT_NR_PLUS
+
+endchoice # DECT_NR_PLUS_DEVICE_ROLE
+
+config DECT_NR_PLUS_MAC_ADDRESS_0
+	hex "MAC Address Byte 0 (Long RD ID)"
+	default 0x00
+	depends on DECT_NR_PLUS
+	help
+	  First byte of the 4-byte Long RD ID (MAC address).
+
+config DECT_NR_PLUS_MAC_ADDRESS_1
+	hex "MAC Address Byte 1 (Long RD ID)"
+	default 0x11
+	depends on DECT_NR_PLUS
+
+config DECT_NR_PLUS_MAC_ADDRESS_2
+	hex "MAC Address Byte 2 (Long RD ID)"
+	default 0x22
+	depends on DECT_NR_PLUS
+
+config DECT_NR_PLUS_MAC_ADDRESS_3
+	hex "MAC Address Byte 3 (Long RD ID)"
+	default 0x33
+	depends on DECT_NR_PLUS
+
+config DECT_NR_PLUS_SHORT_RD_ID
+	hex "Short RD ID"
+	default 0x0001
+	depends on DECT_NR_PLUS
+	help
+	  The 2-byte Short RD ID for the device.
+
+config DECT_NR_PLUS_INITIAL_CHANNEL
+	int "Initial Operating Channel"
+	range 0 9 # Assuming channels 0-9 for DECT NR+
+	default 0
+	depends on DECT_NR_PLUS
+	help
+	  The initial channel (0-9) the device will attempt to operate on.
+
+config DECT_NR_PLUS_MAX_DECT_CHANNELS
+	int "Max DECT Channels"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Maximum number of DECT channels supported (0-9).
+
+menu "Logging Configuration"
+
+config DECT_NR_PLUS_LOG_LEVEL_DBG
+	bool "Enable DECT NR+ Debug Logging"
+	default y
+	depends on DECT_NR_PLUS
+	help
+	  Enable detailed debug logging for the DECT NR+ modules.
+	  This produces extensive log output and should typically be
+	  disabled for release builds.
+
+config DECT_NR_PLUS_LOG_LEVEL
+	int "DECT NR+ Default Log Level"
+	default 4 # INFO
+	depends on DECT_NR_PLUS_LOG_LEVEL_DBG || LOG
+	help
+	  Set the default log level for DECT NR+ modules.
+	  0: None, 1: Error, 2: Warning, 3: Info, 4: Debug, 5: Call trace
+
+endmenu # Logging Configuration
+
+
+menu "MAC Layer Configuration"
+
+config DECT_NR_PLUS_MAC_THREAD_SLEEP_MS
+	int "MAC Thread Sleep Interval (ms)"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Sleep interval for the MAC layer thread in milliseconds.
+
+config DECT_NR_PLUS_MAC_TX_BUF_COUNT
+	int "MAC TX Buffer Count"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Number of network buffers available for MAC layer transmissions.
+
+config DECT_NR_PLUS_MAC_TX_BUF_SIZE
+	int "MAC TX Buffer Size"
+	default 256
+	depends on DECT_NR_PLUS
+	help
+	  Maximum size (in bytes) of a network buffer for MAC layer transmissions.
+
+config DECT_NR_PLUS_MAC_RX_MSG_QUEUE_SIZE
+	int "MAC RX Message Queue Size"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Number of messages in the queue for received PHY packets to MAC.
+
+config DECT_NR_PLUS_MAC_TX_MSG_QUEUE_SIZE
+	int "MAC TX Message Queue Size"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Number of messages in the queue for DLC PDUs to MAC.
+
+config DECT_NR_PLUS_MAC_SCHEDULING_INTERVAL_MS
+	int "MAC Scheduling Interval (ms)"
+	default 100
+	depends on DECT_NR_PLUS
+	help
+	  Interval at which the MAC layer's internal scheduler runs to process
+	  pending transmissions/receptions.
+
+config DECT_NR_PLUS_T_MAC_ASSOC_TIMEOUT_MS
+	int "MAC Association Timeout (ms)"
+	default 5000
+	depends on DECT_NR_PLUS
+	help
+	  Timeout for MAC layer association attempts in milliseconds.
+
+config DECT_NR_PLUS_MAC_MAX_ASSOC_RETRIES
+	int "MAC Max Association Retries"
+	default 3
+	depends on DECT_NR_PLUS
+	help
+	  Maximum number of retries for MAC association.
+
+config DECT_NR_PLUS_MAC_ENABLE_AUTOMATIC_ASSOCIATION
+	bool "Enable Automatic Association for PP"
+	default y
+	depends on DECT_NR_PLUS_DEVICE_ROLE_PP
+	help
+	  If enabled, a Portable Part (PP) will automatically initiate association
+	  with a Fixed Part (FP) after synchronization.
+
+config DECT_NR_PLUS_T_MAC_INACTIVITY_TIMEOUT_MS
+	int "MAC Inactivity Timeout (ms)"
+	default 10000
+	depends on DECT_NR_PLUS
+	help
+	  Timeout in milliseconds after which the MAC layer considers itself inactive,
+	  potentially triggering power management modes.
+
+config DECT_NR_PLUS_T_MAC_SYNC_TIMEOUT_MS
+	int "MAC Synchronization Timeout (ms)"
+	default 2000
+	depends on DECT_NR_PLUS_DEVICE_ROLE_PP
+	help
+	  Timeout for MAC layer synchronization attempts in milliseconds (for PP).
+
+config DECT_NR_PLUS_MAC_MAX_SYNC_RETRIES
+	int "MAC Max Synchronization Retries"
+	default 5
+	depends on DECT_NR_PLUS_DEVICE_ROLE_PP
+	help
+	  Maximum number of retries for MAC synchronization.
+
+config DECT_NR_PLUS_T_MAC_RESOURCE_REQ_TIMEOUT_MS
+	int "MAC Resource Request Timeout (ms)"
+	default 2000
+	depends on DECT_NR_PLUS_ENABLE_QOS
+	help
+	  Timeout for MAC resource request messages in milliseconds.
+
+config DECT_NR_PLUS_MAC_MAX_RESOURCE_REQ_RETRIES
+	int "MAC Max Resource Request Retries"
+	default 3
+	depends on DECT_NR_PLUS_ENABLE_QOS
+	help
+	  Maximum number of retries for MAC resource requests.
+
+config DECT_NR_PLUS_T_MAC_BEACON_INTERVAL_MS
+	int "MAC Beacon Interval (ms)"
+	default 5000
+	depends on DECT_NR_PLUS_DEVICE_ROLE_FP
+	help
+	  Interval in milliseconds for Fixed Part (FP) beacon transmissions.
+
+config DECT_NR_PLUS_MAC_MAX_FP_CANDIDATES
+	int "MAC Max FP Candidates"
+	default 5
+	depends on DECT_NR_PLUS_DEVICE_ROLE_PP
+	help
+	  Maximum number of Fixed Part candidates a Portable Part can track
+	  for potential association or handover.
+
+config DECT_NR_PLUS_MAC_MAX_MULTICAST_MEMBERS
+	int "MAC Max Multicast Members"
+	default 4
+	depends on DECT_NR_PLUS
+	help
+	  Maximum number of Short RD IDs that can be part of a MAC-level multicast group.
+
+config DECT_NR_PLUS_ENABLE_MOBILITY_SUPPORT
+	bool "Enable MAC Mobility (Handover) Support"
+	default y
+	depends on DECT_NR_PLUS
+	help
+	  Enable or disable support for MAC layer mobility, including handover procedures.
+
+config DECT_NR_PLUS_T_MAC_HANDOVER_TIMEOUT_MS
+	int "MAC Handover Timeout (ms)"
+	default 5000
+	depends on DECT_NR_PLUS_ENABLE_MOBILITY_SUPPORT
+	help
+	  Timeout for MAC layer handover request/response messages in milliseconds.
+
+config DECT_NR_PLUS_MAC_MAX_HANDOVER_RETRIES
+	int "MAC Max Handover Retries"
+	default 3
+	depends on DECT_NR_PLUS_ENABLE_MOBILITY_SUPPORT
+	help
+	  Maximum number of retries for MAC handover attempts.
+
+endmenu # MAC Layer Configuration
+
+menu "DLC Layer Configuration"
+
+config DECT_NR_PLUS_DLC_THREAD_SLEEP_MS
+	int "DLC Thread Sleep Interval (ms)"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Sleep interval for the DLC layer thread in milliseconds.
+
+config DECT_NR_PLUS_DLC_TX_BUF_COUNT
+	int "DLC TX Buffer Count"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Number of network buffers available for DLC layer transmissions.
+
+config DECT_NR_PLUS_DLC_TX_BUF_SIZE
+	int "DLC TX Buffer Size"
+	default 200 # Max DLC payload for PDU after MAC header, etc.
+	depends on DECT_NR_PLUS
+	help
+	  Maximum size (in bytes) of a network buffer for DLC layer transmissions.
+
+config DECT_NR_PLUS_DLC_RX_BUF_COUNT
+	int "DLC RX Buffer Count"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Number of network buffers available for DLC layer reception.
+
+config DECT_NR_PLUS_DLC_RX_BUF_SIZE
+	int "DLC RX Buffer Size"
+	default 200
+	depends on DECT_NR_PLUS
+	help
+	  Maximum size (in bytes) of a network buffer for DLC layer reception.
+
+config DECT_NR_PLUS_DLC_RX_MSG_QUEUE_SIZE
+	int "DLC RX Message Queue Size"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Number of messages in the queue for received MAC PDUs to DLC.
+
+config DECT_NR_PLUS_DLC_TX_MSG_QUEUE_SIZE
+	int "DLC TX Message Queue Size"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Number of messages in the queue for CVG SDUs to DLC.
+
+config DECT_NR_PLUS_DLC_TX_WINDOW_SIZE
+	int "DLC Transmit Window Size"
+	default 4
+	range 1 127 # Assuming 7-bit sequence numbers for window
+	depends on DECT_NR_PLUS
+	help
+	  Number of unacknowledged PDUs the DLC layer can have in flight.
+
+config DECT_NR_PLUS_DLC_RX_WINDOW_SIZE
+	int "DLC Receive Window Size"
+	default 4
+	range 1 127 # Assuming 7-bit sequence numbers for window
+	depends on DECT_NR_PLUS
+	help
+	  Number of out-of-order PDUs the DLC layer can buffer.
+
+config DECT_NR_PLUS_T_DLC_CONN_TIMEOUT_MS
+	int "DLC Connection Timeout (ms)"
+	default 5000
+	depends on DECT_NR_PLUS
+	help
+	  Timeout for DLC connection establishment.
+
+config DECT_NR_PLUS_T_DLC_RELEASE_TIMEOUT_MS
+	int "DLC Release Timeout (ms)"
+	default 2000
+	depends on DECT_NR_PLUS
+	help
+	  Timeout for DLC connection release.
+
+config DECT_NR_PLUS_T_DLC_RETRANSMISSION_TIMEOUT_MS
+	int "DLC Retransmission Timeout (ms)"
+	default 1000
+	depends on DECT_NR_PLUS
+	help
+	  Initial Retransmission Timeout (RTO) for DLC ARQ.
+
+config DECT_NR_PLUS_DLC_MAX_RETRANSMISSIONS
+	int "DLC Max Retransmissions"
+	default 5
+	depends on DECT_NR_PLUS
+	help
+	  Maximum number of ARQ retransmissions for a DLC PDU.
+
+config DECT_NR_PLUS_T_DLC_DELAYED_ACK_MS
+	int "DLC Delayed ACK Timeout (ms)"
+	default 50
+	depends on DECT_NR_PLUS
+	help
+	  Delay before sending a cumulative ACK for received DLC PDUs.
+
+config DECT_NR_PLUS_DLC_RTT_ALPHA_FACTOR
+	float "DLC RTT Alpha Factor (0.0-1.0)"
+	default 0.125
+	range 0.0 1.0
+	depends on DECT_NR_PLUS
+	help
+	  Alpha factor for Round Trip Time (RTT) estimation (similar to TCP).
+
+config DECT_NR_PLUS_DLC_RTT_BETA_FACTOR
+	float "DLC RTT Beta Factor (0.0-1.0)"
+	default 0.25
+	range 0.0 1.0
+	depends on DECT_NR_PLUS
+	help
+	  Beta factor for RTT Deviation (RTTVAR) estimation (similar to TCP).
+
+config DECT_NR_PLUS_DLC_RTT_K_FACTOR
+	int "DLC RTT K Factor"
+	default 4
+	depends on DECT_NR_PLUS
+	help
+	  K factor for calculating Retransmission Timeout (RTO) from RTT and RTTVAR.
+
+endmenu # DLC Layer Configuration
+
+menu "Convergence Layer Configuration"
+
+config DECT_NR_PLUS_CVG_THREAD_SLEEP_MS
+	int "CVG Thread Sleep Interval (ms)"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Sleep interval for the Convergence layer thread in milliseconds.
+
+config DECT_NR_PLUS_CVG_TX_BUF_COUNT
+	int "CVG TX Buffer Count"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Number of network buffers available for CVG layer transmissions (fragments to DLC).
+
+config DECT_NR_PLUS_CVG_TX_BUF_SIZE
+	int "CVG TX Buffer Size"
+	default 150 # Enough for a fragment + CVG header
+	depends on DECT_NR_PLUS
+	help
+	  Maximum size (in bytes) of a network buffer for CVG layer transmissions.
+
+config DECT_NR_PLUS_CVG_RX_MSG_QUEUE_SIZE
+	int "CVG RX Message Queue Size"
+	default 10
+	depends on DECT_NR_PLUS
+	help
+	  Number of messages in the queue for received DLC PDUs to CVG.
+
+config DECT_NR_PLUS_CVG_TX_NET_PKT_QUEUE_SIZE
+	int "CVG TX Net Pkt Queue Size"
+	default 5
+	depends on DECT_NR_PLUS
+	help
+	  Number of network packets in the queue for IP packets from network stack to CVG.
+
+config DECT_NR_PLUS_T_CVG_REASSEMBLY_TIMEOUT_MS
+	int "CVG Reassembly Timeout (ms)"
+	default 1000
+	depends on DECT_NR_PLUS
+	help
+	  Timeout for Convergence layer SDU reassembly.
+
+config DECT_NR_PLUS_CVG_MAX_TX_SDUS
+	int "CVG Max Pending TX SDUs"
+	default 5
+	depends on DECT_NR_PLUS
+	help
+	  Maximum number of concurrent outgoing SDUs (IPv6 packets) for which
+	  the Convergence layer tracks fragmentation.
+
+config DECT_NR_PLUS_CVG_MAX_RX_SDUS
+	int "CVG Max Active Reassembly Sessions"
+	default 5
+	depends on DECT_NR_PLUS
+	help
+	  Maximum number of concurrent incoming SDUs (IPv6 packets) for which
+	  the Convergence layer maintains reassembly state.
+
+config DECT_NR_PLUS_ENABLE_6LOWPAN
+	bool "Enable 6LoWPAN Compression/Decompression"
+	default y
+	depends on DECT_NR_PLUS && NET_6LO # Requires Zephyr's NET_6LO
+	help
+	  Enable 6LoWPAN header compression and fragmentation on top of the
+	  DECT NR+ Convergence layer. This requires Zephyr's NET_6LO to be enabled.
+
+endmenu # Convergence Layer Configuration
+
+menu "Security Layer Configuration"
+
+config DECT_NR_PLUS_ENABLE_ENCRYPTION
+	bool "Enable AES-128 Encryption"
+	default y
+	depends on DECT_NR_PLUS
+	help
+	  Enable or disable AES-128 encryption for data communication.
+
+config DECT_NR_PLUS_T_MAC_SECURITY_TIMEOUT_MS
+	int "Security Handshake Timeout (ms)"
+	default 5000
+	depends on DECT_NR_PLUS_ENABLE_ENCRYPTION
+	help
+	  Timeout for security handshake messages in milliseconds.
+
+config DECT_NR_PLUS_MAC_MAX_SECURITY_RETRIES
+	int "Max Security Handshake Retries"
+	default 3
+	depends on DECT_NR_PLUS_ENABLE_ENCRYPTION
+	help
+	  Maximum number of retries for security handshake.
+
+config DECT_NR_PLUS_SECURITY_MASTER_KEY_LEN_BITS
+	int "Master Key Length (bits)"
+	default 128
+	depends on DECT_NR_PLUS_ENABLE_ENCRYPTION
+	help
+	  Length of the AES master key in bits. (e.g., 128 for AES-128).
+
+config DECT_NR_PLUS_SECURITY_NONCE_LEN_BYTES
+	int "Nonce Length (bytes)"
+	default 16
+	depends on DECT_NR_PLUS_ENABLE_ENCRYPTION
+	help
+	  Length of the cryptographic nonce used in AES modes.
+
+config DECT_NR_PLUS_SECURITY_MIC_LEN_BYTES
+	int "MIC Length (bytes)"
+	default 4 # For AES-CMAC, typically 4, 8, or 16 bytes
+	depends on DECT_NR_PLUS_ENABLE_ENCRYPTION
+	help
+	  Length of the Message Integrity Code (MIC) in bytes.
+
+config DECT_NR_PLUS_SECURITY_HKDF_SALT_LEN_BYTES
+	int "HKDF Salt Length (bytes)"
+	default 32
+	depends on DECT_NR_PLUS_ENABLE_ENCRYPTION
+	help
+	  Length of the salt used in HKDF for session key derivation.
+
+endmenu # Security Layer Configuration
+
+menu "Routing Layer Configuration"
+
+config DECT_NR_PLUS_ENABLE_ROUTING
+	bool "Enable Routing Layer"
+	default y
+	depends on DECT_NR_PLUS
+	help
+	  Enable or disable the Routing layer (e.g., AODV).
+
+config DECT_NR_PLUS_T_ROUTING_ROUTE_DISCOVERY_TIMEOUT_MS
+	int "Routing Route Discovery Timeout (ms)"
+	default 5000
+	depends on DECT_NR_PLUS_ENABLE_ROUTING
+	help
+	  Timeout for a route discovery process initiated by the Routing layer.
+
+config DECT_NR_PLUS_ROUTING_ROUTE_EXPIRY_TIMEOUT_S
+	int "Routing Route Expiry Timeout (s)"
+	default 300
+	depends on DECT_NR_PLUS_ENABLE_ROUTING
+	help
+	  Time in seconds after which a discovered route expires in the routing table.
+
+config DECT_NR_PLUS_ROUTING_MAX_HOPS
+	int "Routing Max Hops"
+	default 10
+	depends on DECT_NR_PLUS_ENABLE_ROUTING
+	help
+	  Maximum number of hops allowed for a routed packet.
+
+config DECT_NR_PLUS_ROUTING_MAX_ROUTE_RETRIES
+	int "Routing Max Route Retries"
+	default 3
+	depends on DECT_NR_PLUS_ENABLE_ROUTING
+	help
+	  Maximum number of retries for route discovery.
+
+config DECT_NR_PLUS_ROUTING_MAX_ROUTES
+	int "Routing Max Routes"
+	default 10
+	depends on DECT_NR_PLUS_ENABLE_ROUTING
+	help
+	  Maximum number of entries in the routing table.
+
+config DECT_NR_PLUS_ROUTING_THREAD_SLEEP_MS
+	int "Routing Thread Sleep Interval (ms)"
+	default 100
+	depends on DECT_NR_PLUS_ENABLE_ROUTING
+	help
+	  Sleep interval for the Routing layer thread in milliseconds.
+
+endmenu # Routing Layer Configuration
+
+menu "Channel Management Configuration"
+
+config DECT_NR_PLUS_ENABLE_CHANNEL_RESELECTION
+	bool "Enable Automatic Channel Reselection"
+	default y
+	depends on DECT_NR_PLUS
+	help
+	  Enable or disable automatic channel reselection based on quality metrics.
+
+config DECT_NR_PLUS_CHANNEL_RESELECTION_RSSI_THRESHOLD_DBM
+	int "Channel Reselection RSSI Threshold (dBm)"
+	range -120 0
+	default -85
+	depends on DECT_NR_PLUS_ENABLE_CHANNEL_RESELECTION
+	help
+	  RSSI threshold (in dBm) below which channel reselection is triggered.
+
+config DECT_NR_PLUS_CHANNEL_MGR_THREAD_SLEEP_MS
+	int "Channel Manager Thread Sleep Interval (ms)"
+	default 1000
+	depends on DECT_NR_PLUS
+	help
+	  Sleep interval for the Channel Manager thread in milliseconds.
+
+endmenu # Channel Management Configuration
+
+menu "Power Management Configuration"
+
+config DECT_NR_PLUS_POWER_MGR_THREAD_SLEEP_MS
+	int "Power Manager Thread Sleep Interval (ms)"
+	default 100
+	depends on DECT_NR_PLUS
+	help
+	  Sleep interval for the Power Manager thread in milliseconds.
+
+config DECT_NR_PLUS_POWER_MGR_INACTIVITY_THRESHOLD_MS
+	int "Power Manager Inactivity Threshold (ms)"
+	default 30000
+	depends on DECT_NR_PLUS
+	help
+	  Time in milliseconds after which the device enters a lower power state
+	  if no activity is detected.
+
+endmenu # Power Management Configuration
+
+menu "Physical Layer (PHY) Configuration"
+
+config DECT_NR_PLUS_ENABLE_LBT
+	bool "Enable Listen Before Talk (LBT)"
+	default y
+	depends on DECT_NR_PLUS
+	help
+	  Enable or disable Listen Before Talk (LBT) mechanism for channel access.
+
+config DECT_NR_PLUS_LBT_RSSI_THRESHOLD_DBM
+	int "LBT RSSI Threshold (dBm)"
+	range -120 0
+	default -75
+	depends on DECT_NR_PLUS_ENABLE_LBT
+	help
+	  Listen Before Talk (LBT) RSSI threshold in dBm for determining channel busy.
+
+config DECT_NR_PLUS_LBT_PERIOD_MODEM_UNITS
+	int "LBT Period (Modem Units)"
+	default 1000
+	depends on DECT_NR_PLUS_ENABLE_LBT
+	help
+	  Listen Before Talk (LBT) period in modem time units.
+
+config DECT_NR_PLUS_TX_POWER_DBM_DEFAULT
+	int "Default TX Power (dBm)"
+	range -30 20 # Example range, adjust based on nRF9161 capabilities
+	default 0
+	depends on DECT_NR_PLUS
+	help
+	  Default transmit power in dBm for PHY operations.
+
+endmenu # Physical Layer (PHY) Configuration
+
+endif # DECT_NR_PLUS
+
+endmenu # DECT NR+ Stack Configuration

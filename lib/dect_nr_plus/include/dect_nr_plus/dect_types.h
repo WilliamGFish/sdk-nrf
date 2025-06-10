@@ -14,7 +14,7 @@
 #include <net/net_pkt.h> // For struct net_pkt
 #include <net/ipv6.h> // For struct in6_addr
 
-// --- General Definitions ---
+// --- General Definitions ---\
 #define AES_KEY_LEN 16                       /**< AES encryption key length */
 #define DLC_MAX_SEQ_NUM 256                  /**< Max sequence number for DLC (0-255, 8-bit) */
 #define RTT_ALPHA_SHIFT 3                    /**< Alpha factor for SRTT (1/2^3 = 1/8) */
@@ -42,7 +42,6 @@
 #define DLC_CONTROL_HDR_LEN_BYTES 2          /**< Example DLC Control PDU header length */
 #define DLC_CRC_LEN_BYTES 2                  /**< DLC CRC length */
 #define DLC_ACK_HDR_LEN_BYTES 2              /**< DLC ACK PDU header length (seq + window) */
-
 
 // Service Type definitions
 #define CVG_SERVICE_TYPE_DATA 0x01           /**< CVG service type for data */
@@ -362,13 +361,26 @@ typedef enum {
 } channel_status_t;
 
 /**
- * @brief Routing PDU Types for AODV.
+ * @brief DECT NR+ Native Routing Modes.
  */
 typedef enum {
-	ROUTING_PDU_TYPE_RREQ, /**< Route Request */
-	ROUTING_PDU_TYPE_RREP, /**< Route Reply */
-	ROUTING_PDU_TYPE_RERR, /**< Route Error */
-	ROUTING_PDU_TYPE_DATA_FORWARD, /**< Data packet being forwarded by routing */
+	DECT_ROUTING_MODE_NONE = 0,         /**< No specific routing mode */
+	DECT_ROUTING_MODE_UPLINK = 1,       /**< Routing towards the Fixed Part (sink) */
+	DECT_ROUTING_MODE_DOWNLINK = 2,     /**< Routing from the Fixed Part (sink) */
+	DECT_ROUTING_MODE_HORIZONTAL = 3,   /**< Direct device-to-device routing (e.g., hop-limited flooding) */
+} dect_routing_mode_t;
+
+/**
+ * @brief Routing PDU Types for DECT NR+ Native Routing.
+ * Adapting previous AODV-like names to DECT NR+ context.
+ */
+typedef enum {
+	ROUTING_PDU_TYPE_ROUTE_REQUEST,     /**< Route Request for path discovery (e.g., Horizontal) */
+	ROUTING_PDU_TYPE_ROUTE_REPLY,       /**< Route Reply for path discovery (e.g., Horizontal) */
+	ROUTING_PDU_TYPE_ROUTE_ERROR,       /**< Route Error for broken paths */
+	ROUTING_PDU_TYPE_DATA_FORWARD,      /**< Data packet being forwarded by routing */
+	// Add specific PDU types for Uplink/Downlink control if needed,
+	// beyond implicitly handling data based on routing mode.
 } routing_pdu_type_t;
 
 /**
@@ -560,20 +572,23 @@ typedef struct {
 	struct net_pkt *pkt;          /**< Pointer to the net_pkt to be sent. */
 	uint16_t dest_short_rd_id;    /**< Destination Short RD ID (resolved by application/routing). */
 	qos_priority_t qos_priority;  /**< QoS priority for this packet. */
+	dect_routing_mode_t routing_mode; /**< Desired routing mode for this packet. */
 } cvg_tx_queue_entry_t;
 
 
 /**
  * @brief Routing table entry.
+ * Now includes the DECT NR+ native routing mode.
  */
 typedef struct {
 	bool is_valid;                   /**< True if the route entry is valid. */
 	uint16_t dest_short_rd_id;       /**< Destination Short RD ID. */
 	uint16_t next_hop_short_rd_id;   /**< Next hop Short RD ID for this destination. */
 	uint8_t hop_count;               /**< Number of hops to the destination. */
-	uint32_t route_sequence_number;  /**< Destination sequence number (for AODV). */
+	uint32_t route_sequence_number;  /**< Destination sequence number (for route freshness). */
 	uint64_t last_active_time_ms;    /**< Timestamp of last activity for this route. */
 	uint32_t route_lifetime_ms;      /**< Lifetime of this route entry. */
+	dect_routing_mode_t mode;        /**< The routing mode for this specific route. */
 } routing_entry_t;
 
 /**
@@ -583,7 +598,7 @@ typedef struct {
 	routing_entry_t routing_table[MAX_ROUTING_ENTRIES]; /**< Array of routing table entries. */
 	uint8_t num_routing_entries;                        /**< Current number of valid routing entries. */
 	uint32_t route_sequence_number;                    /**< Our own route sequence number. */
-	uint32_t rreq_id_counter;                          /**< Counter for Route Request IDs. */
+	uint32_t rreq_id_counter;                          /**< Counter for Route Request IDs (for horizontal routing). */
 	K_MUTEX_DEFINE(mutex);                              /**< Mutex to protect context access. */
 	struct k_timer route_cleanup_timer;                 /**< Timer for periodically cleaning up expired routes. */
 	struct k_timer rreq_timeout_timer;                  /**< Timer for RREQ timeouts. */
@@ -726,6 +741,11 @@ typedef struct {
 	uint32_t routing_route_discoveries; /**< Number of route discovery initiated. */
 	uint32_t routing_route_success; /**< Number of successful route discoveries. */
 	uint32_t routing_route_failures; /**< Number of failed route discoveries. */
+	uint32_t routing_uplink_tx; /**< Number of packets routed via uplink. */
+	uint32_t routing_downlink_tx; /**< Number of packets routed via downlink. */
+	uint32_t routing_horizontal_tx; /**< Number of packets routed via horizontal. */
+	uint32_t routing_flood_tx; /**< Number of packets sent via hop-limited flooding. */
+
 
 	// Security layer specific
 	uint32_t security_handshakes_initiated; /**< Number of security handshakes initiated. */
@@ -808,7 +828,6 @@ static inline bool SEQ_NUM_IS_GREATER_EQUAL(uint8_t s1, uint8_t s2)
  * - Added `associated_pp_short_rd_id` to `dect_mac_context_t` for FP role.
  * - Corrected `DLC_PDU_TYPE_ACK_NACK` to `DLC_PDU_TYPE_ACK` and added `DLC_PDU_TYPE_NACK` separately.
  * - Added `DLC_PDU_TYPE_BEACON` to `dlc_pdu_type_t` for completeness.
- * - Added `DLC_ACK_HDR_LEN_BYTES` define.
  * - Added `CONFIG_DECT_NR_PLUS_DLC_MAX_RETRIES`, `CONFIG_DECT_NR_PLUS_DLC_MIN_RTO_MS`, `CONFIG_DECT_NR_PLUS_DLC_MAX_RTO_MS` defines.
  * Last Amended: 2025-06-10 17:25 BST: Updated dect_types.h to align Kconfig fallbacks with the single combined CVG thread.
  * - Replaced `CONFIG_DECT_NR_PLUS_CVG_RX_STACK_SIZE` with `CONFIG_DECT_NR_PLUS_CVG_THREAD_STACK_SIZE` (sum of TX+RX).
@@ -822,4 +841,10 @@ static inline bool SEQ_NUM_IS_GREATER_EQUAL(uint8_t s1, uint8_t s2)
  * - Added `ipv6_to_short_rd_id_map_entry_t` struct for IPv6 to Short RD ID mapping.
  * - Added `ipv6_to_short_rd_id_map` and `num_ipv6_to_short_rd_id_entries` to `dect_mac_context_t`.
  * - Added `MAX_IPV6_TO_RD_ID_MAP_ENTRIES` define.
+ * Last Amended: 2025-06-10 19:40 BST: Implemented Robust DECT NR+ Native Routing.
+ * - Added `dect_routing_mode_t` enum to categorize routing modes (Uplink, Downlink, Horizontal).
+ * - Updated `routing_entry_t` to include `mode` field for the route type.
+ * - Updated `routing_pdu_type_t` to align with native routing: `ROUTE_REQUEST`, `ROUTE_REPLY`, `ROUTE_ERROR` (replaces AODV RREQ/RREP/RERR), `DATA_FORWARD`.
+ * - Updated `cvg_tx_queue_entry_t` to include `routing_mode`.
+ * - Added routing-specific stats to `dect_stats_t`: `routing_uplink_tx`, `routing_downlink_tx`, `routing_horizontal_tx`, `routing_flood_tx`.
  */

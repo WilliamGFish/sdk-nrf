@@ -225,6 +225,7 @@ static int cvg_send_ipv6_pkt(struct net_if *iface, struct net_pkt *pkt)
 		.pkt = pkt,
 		.dest_short_rd_id = SHORT_RD_ID_BROADCAST, // Placeholder, resolve in tx_thread
 		.qos_priority = QOS_PRIORITY_NORMAL,      // Placeholder, resolve in tx_thread
+		.routing_mode = DECT_ROUTING_MODE_NONE,   // Will determine based on destination
 	};
 
 	ret = k_msgq_put(&cvg_tx_net_pkt_msgq, &tx_entry, K_NO_WAIT);
@@ -278,6 +279,11 @@ dect_status_t dect_cvg_receive_sdu_from_dlc(uint16_t src_short_rd_id,
 	STATS_ADD(dect_stats.rx_app_data_bytes, dlc_pdu_buf->len);
 
 	k_mutex_lock(&cvg_ctx.mutex, K_FOREVER);
+
+	// If the service_type is CONTROL, it implies a routing PDU that has already been
+	// processed by the routing layer and potentially stripped of its routing header.
+	// This function (dect_cvg_receive_sdu_from_dlc) now expects the buffer to be a "clean"
+	// IP packet (or fragment) if it's coming from the routing layer's DATA_FORWARD path.
 
 	// Check if the received PDU is an IPv6 fragment
 	// This check relies on the IP header (or IPv6 Fragmentation Header) being at the start of the DLC payload.
@@ -502,15 +508,17 @@ dect_status_t dect_cvg_receive_sdu_from_dlc(uint16_t src_short_rd_id,
 			// Example: if it's a routing PDU, pass to routing layer
 			uint8_t *control_pdu_ptr = net_buf_pull_unaligned_mem(dlc_pdu_buf, dlc_pdu_buf->len);
 			if (dect_config.enable_routing && dlc_pdu_buf->len > 0 &&
-				(control_pdu_ptr[0] == ROUTING_PDU_TYPE_RREQ ||
-				 control_pdu_ptr[0] == ROUTING_PDU_TYPE_RREP ||
-				 control_pdu_ptr[0] == ROUTING_PDU_TYPE_RERR ||
+				(control_pdu_ptr[0] == ROUTING_PDU_TYPE_ROUTE_REQUEST ||
+				 control_pdu_ptr[0] == ROUTING_PDU_TYPE_ROUTE_REPLY ||
+				 control_pdu_ptr[0] == ROUTING_PDU_TYPE_ROUTE_ERROR ||
 				 control_pdu_ptr[0] == ROUTING_PDU_TYPE_DATA_FORWARD)) { // Also pass data_forward to routing
 				LOG_DBG("CVG RX: Identified as Routing PDU. Passing to Routing layer.");
+				// The routing layer handles its own buffer unref, so we don't unref here.
 				dect_status_t routing_status = dect_routing_process_incoming_pdu(src_short_rd_id, dlc_pdu_buf, hpc, psn);
 				if (routing_status != DECT_STATUS_OK) {
 					DECT_ERROR_HANDLER(routing_status, "CVG RX: Failed to pass Routing PDU to Routing layer.");
-					net_buf_unref(dlc_pdu_buf);
+					// routing layer should unref the buffer, but add a fallback here if it didn't
+					net_buf_unref(dlc_pdu_buf); // Fallback unref
 					STATS_INC(dect_stats.cvg_rx_drops);
 				}
 			} else {
@@ -609,6 +617,7 @@ static void dect_cvg_thread(void *p1, void *p2, void *p3)
 			struct net_pkt *pkt = tx_entry.pkt;
 			uint16_t dest_short_rd_id = tx_entry.dest_short_rd_id;
 			qos_priority_t qos_priority = tx_entry.qos_priority;
+			dect_routing_mode_t routing_mode = tx_entry.routing_mode;
 
 			if (!pkt) {
 				DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PARAM, "CVG TX: Received NULL net_pkt from queue.");
@@ -619,50 +628,42 @@ static void dect_cvg_thread(void *p1, void *p2, void *p3)
 			size_t original_pkt_len = net_pkt_get_len(pkt);
 			STATS_ADD(dect_stats.tx_app_data_bytes, original_pkt_len);
 
-			// Resolve destination Short RD ID from IPv6 address if not already set (e.g., from L2 send)
-			// This implements the "Robust IP-to-Short RD ID Resolution for DECT NR+"
-			if (dest_short_rd_id == SHORT_RD_ID_BROADCAST) { // If it's still default, try to resolve
+			// Resolve destination Short RD ID and determine routing mode
+			if (dest_short_rd_id == SHORT_RD_ID_BROADCAST || dest_short_rd_id == 0) { // If it's still default, try to resolve
 				if (net_pkt_family(pkt) == AF_INET6) {
 					const struct in6_addr *dest_ipv6_addr = net_pkt_ipv6_dst(pkt);
 
 					if (net_ipv6_is_addr_multicast(dest_ipv6_addr)) {
 						dest_short_rd_id = SHORT_RD_ID_BROADCAST;
-						LOG_DBG("CVG TX: Identified IPv6 multicast, using DECT broadcast Short RD ID.");
+						routing_mode = DECT_ROUTING_MODE_HORIZONTAL; // Multicast often uses horizontal flooding
+						LOG_DBG("CVG TX: Identified IPv6 multicast, using DECT broadcast Short RD ID and Horizontal routing.");
 					} else {
 						// Try to look up in local MAC table
 						dest_short_rd_id = dect_mac_lookup_ipv6_to_short_rd_id(dest_ipv6_addr);
 						if (dest_short_rd_id == 0) { // If not found in direct map
 							if (dect_config.enable_routing) {
-								LOG_DBG("CVG TX: No direct IP-to-RD ID map for %s. Requesting route discovery via Routing layer.",
+								LOG_DBG("CVG TX: No direct IP-to-RD ID map for %s. Initiating route discovery via Routing layer for potential horizontal routing.",
 										log_strdup(net_ipv6_sprint(dest_ipv6_addr)));
-								// This needs to be more robust. If a route discovery is started,
-								// the packet should be buffered and sent once the route is found.
-								// For now, it will look up a route in the routing table (which is already pre-populated or discovered by AODV)
-								// and if not found, it implicitly drops.
-								// AODV discovery expects a Short RD ID for destination, so we need a way to map IPv6 to potential Short RD ID.
-								// This requires routing to be IPv6-aware or a separate "neighbor discovery" in DECT NR+.
-								// For now, we'll try to find a route to *any* Short RD ID that might be the next hop.
-								// This is a simplification and the "potential bug" mentioned in routing.c applies.
-
-								// Temporarily, if routing is enabled, we'll try to initiate a routing
-								// discovery to a default Short RD ID or if we get the Short RD ID from higher layer
-								// (which would defeat the purpose of "robust IP-to-Short RD ID resolution" here).
-								// For now, this is a placeholder. A full implementation would involve:
-								// 1. Check routing table for dest_ipv6_addr.
-								// 2. If no route, trigger dect_routing_discover_route with a resolved Short RD ID or a temporary mapping.
-								// 3. Buffer the packet and send it once the route is established.
-								// As per AODV, we need a Short RD ID to initiate discovery.
-								// The current dect_routing_discover_route takes a Short RD ID.
-
-								// For now, if routing is enabled and no direct map, we'll assume a direct communication
-								// and assign a dummy short RD ID. This is NOT a proper solution.
-								// Correct solution:
+								// For now, if no direct mapping, assume horizontal routing for discovery.
+								// A full implementation would involve:
 								// 1. MAC/Routing learn IPv6-to-ShortRDID mappings.
 								// 2. CVG queries these mappings.
-								// 3. If missing, CVG can initiate IP-level discovery which translates to AODV/DECT-NR+ specific discovery.
-								// The current implementation uses a dummy Short RD ID if routing enabled.
-								// Let's use a dummy that causes a routing lookup.
-								dest_short_rd_id = 0x0002; // Example: a known peer Short RD ID
+								// 3. If missing, CVG can initiate IP-level discovery which translates to DECT NR+ routing.
+								// Assigning a dummy Short RD ID or forcing a discovery to a specific peer type.
+								// For this robust native routing, we'll try to discover a route for the IP destination
+								// if it's not a direct peer.
+								// In the absence of a direct Short RD ID, we cannot call dect_routing_discover_route directly
+								// with just an IPv6 address. A proper integration would involve
+								// the routing layer knowing how to initiate discovery based on IPv6.
+								// For now, we will drop the packet if no direct mapping is found and routing is enabled but no
+								// specific mechanism to start IP-based routing discovery is defined.
+								// The previous solution of assigning a dummy 0x0002 could lead to packets
+								// being routed to unintended destinations.
+								LOG_WRN("CVG TX: No IP-to-RD ID map for %s and no explicit DECT NR+ routing discovery for IP. Dropping packet.",
+										log_strdup(net_ipv6_sprint(dest_ipv6_addr)));
+								net_pkt_unref(pkt);
+								STATS_INC(dect_stats.cvg_tx_drops);
+								continue;
 							} else {
 								LOG_WRN("CVG TX: No IP-to-RD ID map for %s and routing disabled. Dropping packet.",
 										log_strdup(net_ipv6_sprint(dest_ipv6_addr)));
@@ -670,14 +671,48 @@ static void dect_cvg_thread(void *p1, void *p2, void *p3)
 								STATS_INC(dect_stats.cvg_tx_drops);
 								continue;
 							}
+						} else {
+							// Found a direct mapping, now determine routing mode
+							// If it's a peer we're directly associated with, it's typically direct.
+							// If not, and routing is enabled, it's multi-hop (uplink, downlink, or horizontal)
+							if (dect_config.role == MAC_ROLE_PP && dest_short_rd_id == mac_ctx.associated_fp_short_rd_id) {
+								routing_mode = DECT_ROUTING_MODE_UPLINK;
+							} else if (dect_config.role == MAC_ROLE_FP && dect_mac_is_peer_associated(dest_short_rd_id)) {
+								routing_mode = DECT_ROUTING_MODE_DOWNLINK;
+							} else {
+								// If not directly associated or not uplink/downlink, assume horizontal for now.
+								// A more robust system would involve checking the routing table's mode for `dest_short_rd_id`.
+								routing_mode = DECT_ROUTING_MODE_HORIZONTAL;
+							}
+							LOG_DBG("CVG TX: Resolved dest Short RD ID 0x%04x for %s, determined routing mode: %u.",
+									dest_short_rd_id, log_strdup(net_ipv6_sprint(dest_ipv6_addr)), routing_mode);
 						}
 					}
+				} else {
+					LOG_WRN("CVG TX: Non-IPv6 packet with unknown dest Short RD ID. Dropping.");
+					net_pkt_unref(pkt);
+					STATS_INC(dect_stats.cvg_tx_drops);
+					continue;
+				}
+			}
+			// If dest_short_rd_id was already set (not 0 or broadcast), then routing_mode should also be set by application or higher layer.
+			// If not, we'll try to infer a default.
+			if (routing_mode == DECT_ROUTING_MODE_NONE) {
+				// Fallback or attempt to infer a default mode if not set
+				if (dest_short_rd_id == mac_ctx.associated_fp_short_rd_id && dect_config.role == MAC_ROLE_PP) {
+					routing_mode = DECT_ROUTING_MODE_UPLINK;
+				} else if (dect_mac_is_peer_associated(dest_short_rd_id) && dect_config.role == MAC_ROLE_FP) {
+					routing_mode = DECT_ROUTING_MODE_DOWNLINK;
+				} else {
+					routing_mode = DECT_ROUTING_MODE_HORIZONTAL; // Default to horizontal if uncertain
+					LOG_DBG("CVG TX: Defaulting routing mode to HORIZONTAL for dest 0x%04x.", dest_short_rd_id);
 				}
 			}
 
+
 			// If still no valid dest_short_rd_id (e.g., after lookup, still 0 or broadcast for unicast)
 			if (dest_short_rd_id == 0 || (dest_short_rd_id == SHORT_RD_ID_BROADCAST && !net_ipv6_is_addr_multicast(net_pkt_ipv6_dst(pkt)))) {
-				LOG_WRN("CVG TX: Could not resolve destination Short RD ID for packet. Dropping.");
+				LOG_WRN("CVG TX: Could not resolve final destination Short RD ID for packet. Dropping.");
 				net_pkt_unref(pkt);
 				STATS_INC(dect_stats.cvg_tx_drops);
 				continue;
@@ -768,26 +803,25 @@ static void dect_cvg_thread(void *p1, void *p2, void *p3)
 					LOG_DBG("CVG TX: Sending fragment %u (offset %zu, len %zu, more %d, ID %08x).",
 							fragment_idx, current_offset, current_frag_len, more_fragments, fragment_id);
 
-					// If routing is enabled, pass to routing layer for potential forwarding
-					if (dect_config.enable_routing && dest_short_rd_id != mac_ctx.local_short_rd_id) {
-						status = dect_routing_send_data(dest_short_rd_id, dlc_pdu_buf, qos_priority);
+					// Pass to routing layer if enabled, otherwise directly to DLC
+					if (dect_config.enable_routing) {
+						status = dect_routing_send_data(dest_short_rd_id, dlc_pdu_buf, qos_priority, routing_mode);
 						if (status != DECT_STATUS_OK) {
 							DECT_ERROR_HANDLER(status, "CVG TX: Failed to send fragment to Routing layer.");
-							net_buf_unref(dlc_pdu_buf); // Routing layer would unref if it fails
+							// dlc_pdu_buf is unref'd by dect_routing_send_data on failure
 							STATS_INC(dect_stats.cvg_tx_drops);
 							STATS_INC(dect_stats.cvg_frag_drops);
-							net_pkt_unref(pkt);
+							net_pkt_unref(pkt); // Original pkt unref'd as fragmentation failed
 							break;
 						}
 					} else {
-						// Else, send directly to DLC
 						status = dect_dlc_send_data_from_cvg(dest_short_rd_id, dlc_pdu_buf, CVG_SERVICE_TYPE_DATA, qos_priority);
 						if (status != DECT_STATUS_OK) {
 							DECT_ERROR_HANDLER(status, "CVG TX: Failed to send fragment to DLC.");
 							net_buf_unref(dlc_pdu_buf);
 							STATS_INC(dect_stats.cvg_tx_drops);
 							STATS_INC(dect_stats.cvg_frag_drops);
-							net_pkt_unref(pkt);
+							net_pkt_unref(pkt); // Original pkt unref'd as fragmentation failed
 							break;
 						}
 					}
@@ -795,7 +829,7 @@ static void dect_cvg_thread(void *p1, void *p2, void *p3)
 					current_offset += current_frag_len;
 					fragment_idx++;
 				}
-				net_pkt_unref(pkt);
+				net_pkt_unref(pkt); // Original net_pkt is unref'd after all fragments are processed/dropped
 
 			} else {
 				LOG_DBG("CVG TX: Packet fits in single PDU (len %zu). Sending to DLC.", original_pkt_len);
@@ -818,16 +852,15 @@ static void dect_cvg_thread(void *p1, void *p2, void *p3)
 				}
 				net_buf_add(dlc_pdu_buf, copied_len);
 
-				// If routing is enabled, pass to routing layer for potential forwarding
-				if (dect_config.enable_routing && dest_short_rd_id != mac_ctx.local_short_rd_id) {
-					status = dect_routing_send_data(dest_short_rd_id, dlc_pdu_buf, qos_priority);
+				// Pass to routing layer if enabled, otherwise directly to DLC
+				if (dect_config.enable_routing) {
+					status = dect_routing_send_data(dest_short_rd_id, dlc_pdu_buf, qos_priority, routing_mode);
 					if (status != DECT_STATUS_OK) {
 						DECT_ERROR_HANDLER(status, "CVG TX: Failed to send non-fragmented packet to Routing layer.");
-						net_buf_unref(dlc_pdu_buf); // Routing layer would unref if it fails
+						// dlc_pdu_buf is unref'd by dect_routing_send_data on failure
 						STATS_INC(dect_stats.cvg_tx_drops);
 					}
 				} else {
-					// Else, send directly to DLC
 					status = dect_dlc_send_data_from_cvg(dest_short_rd_id, dlc_pdu_buf, CVG_SERVICE_TYPE_DATA, qos_priority);
 					if (status != DECT_STATUS_OK) {
 						DECT_ERROR_HANDLER(status, "CVG TX: Failed to send non-fragmented packet to DLC.");
@@ -835,7 +868,7 @@ static void dect_cvg_thread(void *p1, void *p2, void *p3)
 						STATS_INC(dect_stats.cvg_tx_drops);
 					}
 				}
-				net_pkt_unref(pkt);
+				net_pkt_unref(pkt); // Original net_pkt is unref'd after the single PDU is processed/dropped
 			}
 			dect_power_mgr_activity_detected();
 		}
@@ -848,6 +881,12 @@ static void dect_cvg_thread(void *p1, void *p2, void *p3)
 					rx_msg.src_short_rd_id, rx_msg.dlc_pdu_buf->len, rx_msg.dlc_pdu_type);
 
 			// Now call the main SDU processing function in CVG
+			// If DLC_PDU_TYPE_ROUTING is passed, it means it's a routing control PDU
+			// (not a data PDU from the routing layer). It will be handled in CVG_SERVICE_TYPE_CONTROL.
+			// Data PDUs from routing are already handled as CVG_SERVICE_TYPE_DATA because
+			// dect_routing_process_incoming_pdu sets that service type when calling this function
+			// for DATA_FORWARD type.
+
 			status = dect_cvg_receive_sdu_from_dlc(
 											rx_msg.src_short_rd_id,
 											rx_msg.dlc_pdu_buf,
@@ -931,4 +970,10 @@ K_THREAD_DEFINE(dect_cvg_thread_id,
  * - Modified `dect_cvg_receive_sdu_from_dlc` (RX path) to update the MAC's IPv6-to-Short RD ID map when a new IP packet is received from a peer.
  * - Updated `dect_cvg_receive_sdu_from_dlc` to pass `ROUTING_PDU_TYPE_DATA_FORWARD` to the routing layer.
  * - Integrated `dect_routing_send_data` into CVG TX path when routing is enabled.
+ * Last Amended: 2025-06-10 20:20 BST: Implemented Robust DECT NR+ Native Routing in CVG.
+ * - Updated `cvg_tx_queue_entry_t` instantiation to include `routing_mode = DECT_ROUTING_MODE_NONE`.
+ * - Modified TX path in `dect_cvg_thread` to determine `routing_mode` based on `dest_short_rd_id` and device role (Uplink/Downlink/Horizontal).
+ * - Removed the previous dummy Short RD ID assignment when no direct IP-to-RD ID map is found; now explicitly logs and drops if no direct map and no IP-based routing discovery mechanism is defined.
+ * - Ensured `dect_routing_send_data` is called with the determined `routing_mode`.
+ * - Confirmed `dect_cvg_receive_sdu_from_dlc` correctly handles `CVG_SERVICE_TYPE_CONTROL` for routing PDUs that have had their routing headers stripped by the routing layer.
  */

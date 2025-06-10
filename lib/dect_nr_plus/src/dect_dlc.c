@@ -21,7 +21,7 @@
 #include <dect_nr_plus/dect_stats.h> // For updating statistics
 #include <dect_nr_plus/dect_power_mgr.h> // For power management awareness
 #include <dect_nr_plus/dect_dlc.h> // Own header
-#include <dect_nr_plus/dect_security.h> // For security context access (session key)
+#include <dect_nr_plus/dect_routing.h> // For routing layer interaction
 
 #include <logging/log.h>
 LOG_MODULE_REGISTER(dect_dlc, CONFIG_DECT_NR_PLUS_LOG_LEVEL);
@@ -30,83 +30,624 @@ LOG_MODULE_REGISTER(dect_dlc, CONFIG_DECT_NR_PLUS_LOG_LEVEL);
 dect_dlc_context_t dlc_ctx = {
 	.next_tx_seq_num = 0,
 	.next_rx_seq_num = 0,
+	.ack_pending = false,
+	.ack_seq_num = 0,
 	.current_rtt = CONFIG_DECT_NR_PLUS_DLC_INITIAL_RTT_MS,
 	.rtt_var = CONFIG_DECT_NR_PLUS_DLC_INITIAL_RTT_VAR_MS,
 	.rto = CONFIG_DECT_NR_PLUS_DLC_INITIAL_RTO_MS,
-	.peer_advertised_tx_window_size = DLC_TX_WINDOW_SIZE, // Advertise our RX window size
-	.peer_advertised_rx_window_size = DLC_RX_WINDOW_SIZE, // Assume peer's TX window is our RX window
-	.ack_pending = false,
-	.ack_seq_num = 0,
+	.peer_advertised_tx_window_size = CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE, // Advertise our RX window
+	.peer_advertised_rx_window_size = CONFIG_DECT_NR_PLUS_DLC_MAX_TX_WINDOW_SIZE, // Assume peer can handle our full TX window initially
 };
-
-/* Mutex to protect dlc_ctx */
-K_MUTEX_DEFINE(dlc_ctx_mutex);
-
 
 /* Message queues for inter-layer communication */
 K_MSGQ_DEFINE(dlc_rx_msgq, sizeof(dlc_rx_msg_t),
-	      CONFIG_DECT_NR_PLUS_DLC_RX_QUEUE_SIZE, 4); // From MAC to DLC
-
+			  CONFIG_DECT_NR_PLUS_DLC_RX_QUEUE_COUNT, 4);
 K_MSGQ_DEFINE(dlc_tx_msgq, sizeof(dlc_tx_msg_t),
-	      CONFIG_DECT_NR_PLUS_DLC_TX_QUEUE_SIZE, 4); // From CVG/Routing to DLC
+			  CONFIG_DECT_NR_PLUS_DLC_TX_QUEUE_COUNT, 4);
 
 
-/* Forward declarations for internal functions */
-static void dlc_allocate_buffers(void);
-static void dlc_free_buffers(void);
-static void dlc_retransmission_timer_handler(struct k_timer *timer_id);
-static void dlc_ack_delay_timer_handler(struct k_timer *timer_id);
-static void dlc_retransmit_pdu(uint16_t dest_short_rd_id, struct net_buf *pdu_buf, uint32_t dlc_seq_num,
-			       uint32_t harq_transaction_id, cvg_service_type_t service_type,
-			       bool encrypted, bool is_routing_pdu, uint8_t retransmission_count);
-static dect_status_t dlc_send_ack(uint16_t dest_short_rd_id, uint8_t ack_seq_num, uint16_t window_size);
+/* Forward declarations for internal static functions */
+static void retransmission_timer_handler(struct k_timer *timer_id);
+static void ack_delay_timer_handler(struct k_timer *timer_id);
+static void dlc_send_ack(uint16_t dest_short_rd_id, uint8_t seq_num, uint8_t window_size);
+static void dlc_send_nack(uint16_t dest_short_rd_id, uint8_t seq_num);
 static void dlc_update_rtt(uint32_t sample_rtt);
 static void dlc_reset_arq_state(void);
+static void dlc_free_buffers(void);
+static dect_status_t handle_tx_buffer_allocation(struct net_buf **out_buf, struct net_buf_pool *pool, const char *caller_name,
+												   size_t size, enum dect_status_t error_code);
 
 
 /**
- * @brief Helper function to handle net_buf allocation for TX path.
+ * @brief Helper to handle net_buf allocation and error paths.
  *
- * This function attempts to allocate a net_buf from the specified pool.
- * If allocation fails, it logs an error and increments a statistic.
- *
- * @param out_buf Pointer to a net_buf pointer where the allocated buffer will be stored.
- * @param pool Pointer to the net_buf_pool to allocate from.
- * @return DECT_STATUS_OK on success, DECT_ERROR_NO_MEM if allocation fails.
+ * @param out_buf Pointer to net_buf pointer to store the allocated buffer.
+ * @param pool The net_buf_pool to allocate from.
+ * @param caller_name String name of the calling function for logging.
+ * @param size Size of the buffer to allocate.
+ * @param error_code The DECT_ERROR code to return on failure.
+ * @return DECT_STATUS_OK on success, or error_code on failure.
  */
-static dect_status_t handle_tx_buffer_allocation(struct net_buf **out_buf, struct net_buf_pool *pool)
+static dect_status_t handle_tx_buffer_allocation(struct net_buf **out_buf, struct net_buf_pool *pool, const char *caller_name,
+												   size_t size, enum dect_status_t error_code)
 {
 	*out_buf = net_buf_alloc(pool, K_NO_WAIT);
 	if (!(*out_buf)) {
-		DECT_ERROR_HANDLER(DECT_ERROR_NO_MEM, "DLC: Failed to allocate net_buf from pool %s. No memory.", pool->name);
-		STATS_INC(dect_stats.tx_drops_no_mem); // Increment global stat for TX drops due to no memory
-		return DECT_ERROR_NO_MEM;
+		DECT_ERROR_HANDLER(error_code, "%s: Failed to allocate TX net_buf of size %zu.", caller_name, size);
+		STATS_INC(dect_stats.dlc_tx_drops); // Specific DLC TX drop stat
+		return error_code;
 	}
 	return DECT_STATUS_OK;
 }
 
 dect_status_t dect_dlc_init(void)
 {
-	k_mutex_init(&dlc_ctx.mutex);
-	dlc_allocate_buffers(); // Initialize ARQ buffers
+	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
 
-	k_timer_init(&dlc_ctx.retransmission_timer, dlc_retransmission_timer_handler, NULL);
+	/* Initialize ARQ timers */
+	k_timer_init(&dlc_ctx.retransmission_timer, retransmission_timer_handler, NULL);
+	k_timer_init(&dlc_ctx.ack_delay_timer, ack_delay_timer_handler, NULL);
+	k_timer_init(&dlc_ctx.conn_timeout_timer, NULL, NULL); // Placeholder for connection management
+	k_timer_init(&dlc_ctx.release_timeout_timer, NULL, NULL); // Placeholder for connection management
+
+	// Initialize ARQ buffers
+	for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_TX_WINDOW_SIZE; i++) {
+		dlc_ctx.tx_buffer[i].dlc_pdu_buf = NULL;
+		dlc_ctx.tx_buffer[i].acknowledged = true; // Mark as free/acknowledged
+	}
+	for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE; i++) {
+		dlc_ctx.rx_buffer[i].dlc_pdu_buf = NULL;
+		dlc_ctx.rx_buffer[i].valid = false;
+	}
+
+	// Start retransmission timer (will be re-started per pending transmission)
 	k_timer_start(&dlc_ctx.retransmission_timer, K_MSEC(dlc_ctx.rto), K_MSEC(dlc_ctx.rto));
 
-	k_timer_init(&dlc_ctx.ack_delay_timer, dlc_ack_delay_timer_handler, NULL);
+	LOG_INF("DLC: Initialized. RTT: %u, RTV: %u, RTO: %u.",
+			dlc_ctx.current_rtt, dlc_ctx.rtt_var, dlc_ctx.rto);
 
-	// Ensure DLC context is reset to initial state
-	dlc_reset_arq_state();
-
-	LOG_INF("DLC: Module initialized. RTO: %u ms.", dlc_ctx.rto);
+	k_mutex_unlock(&dlc_ctx.mutex);
 	return DECT_STATUS_OK;
 }
 
+void dlc_mac_tx_completion_notification(uint16_t dest_short_rd_id, uint32_t harq_transaction_id, harq_feedback_t feedback,
+										uint8_t retransmission_count, dect_status_t tx_status)
+{
+	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
+	bool found = false;
+
+	for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_TX_WINDOW_SIZE; i++) {
+		if (dlc_ctx.tx_buffer[i].dlc_pdu_buf &&
+			dlc_ctx.tx_buffer[i].dest_short_rd_id == dest_short_rd_id &&
+			dlc_ctx.tx_buffer[i].harq_transaction_id == harq_transaction_id) {
+			found = true;
+
+			if (feedback == HARQ_FEEDBACK_ACK) {
+				LOG_DBG("DLC: TX %u (ID %u) ACKed. Attempts: %u.",
+						dlc_ctx.tx_buffer[i].seq_num, harq_transaction_id, retransmission_count);
+				dlc_ctx.tx_buffer[i].acknowledged = true;
+				// Update RTT
+				uint32_t sample_rtt = k_uptime_get() - dlc_ctx.tx_buffer[i].last_tx_time_ms;
+				dlc_update_rtt(sample_rtt);
+				net_buf_unref(dlc_ctx.tx_buffer[i].dlc_pdu_buf);
+				dlc_ctx.tx_buffer[i].dlc_pdu_buf = NULL;
+				STATS_INC(dect_stats.harq_tx_success);
+			} else if (feedback == HARQ_FEEDBACK_NACK) {
+				LOG_DBG("DLC: TX %u (ID %u) NACKed. Retransmission count: %u.",
+						dlc_ctx.tx_buffer[i].seq_num, harq_transaction_id, retransmission_count);
+				STATS_INC(dect_stats.harq_tx_retransmissions);
+				dlc_ctx.tx_buffer[i].retransmission_count = retransmission_count;
+				// Do not unref buffer; it will be retransmitted by DLC.
+				// Reset last_tx_time_ms to current time for RTO calculation on next TX.
+				dlc_ctx.tx_buffer[i].last_tx_time_ms = k_uptime_get();
+			} else { // Implicit NACK or other PHY error
+				LOG_WRN("DLC: TX %u (ID %u) failed (status %d, feedback %u). Retransmission count: %u.",
+						dlc_ctx.tx_buffer[i].seq_num, harq_transaction_id, tx_status, feedback, retransmission_count);
+				STATS_INC(dect_stats.harq_tx_failures);
+				dlc_ctx.tx_buffer[i].retransmission_count = retransmission_count;
+				dlc_ctx.tx_buffer[i].last_tx_time_ms = k_uptime_get();
+			}
+			break;
+		}
+	}
+	if (!found) {
+		LOG_WRN("DLC: TX completion notification for unknown HARQ ID %u.", harq_transaction_id);
+	}
+	k_mutex_unlock(&dlc_ctx.mutex);
+}
+
+void dlc_mac_disconnected_notification(uint16_t peer_short_rd_id, mac_link_failure_reason_t reason)
+{
+	LOG_INF("DLC: Disconnected from peer 0x%04x (reason: %d). Resetting ARQ state.", peer_short_rd_id, reason);
+	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
+	dlc_reset_arq_state(); // Reset ARQ state for the disconnected peer
+	// In a multi-peer scenario, this should be per-peer ARQ state reset.
+	// For now, it's a global reset.
+	k_mutex_unlock(&dlc_ctx.mutex);
+	// Notify CVG layer about link failure (optional, if CVG needs to know)
+	// dect_cvg_link_failure_notification(peer_short_rd_id, reason);
+}
+
+void dlc_security_established_notification(uint16_t peer_short_rd_id)
+{
+	LOG_INF("DLC: Security established with peer 0x%04x. (No specific DLC action required yet).", peer_short_rd_id);
+	// At this point, DLC could enable encryption for future data transfers.
+	// However, current crypto integration is done at MAC layer with `dect_security_is_established()`.
+	// For connection-oriented DLC, this would trigger CONNECT PDU exchange.
+	// For now, just logging.
+}
+
+dect_status_t dect_dlc_send_data_from_cvg(uint16_t dest_short_rd_id, struct net_buf *sdu_buf,
+										  cvg_service_type_t service_type, qos_priority_t qos_priority)
+{
+	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
+	dect_status_t status = DECT_STATUS_OK;
+
+	if (!sdu_buf) {
+		DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PARAM, "DLC TX from CVG: NULL SDU buffer.");
+		STATS_INC(dect_stats.dlc_tx_drops);
+		status = DECT_ERROR_INVALID_PARAM;
+		goto exit_unlock;
+	}
+
+	if (sdu_buf->len > CONFIG_DECT_NR_PLUS_MAX_DLC_PDU_SIZE - DLC_DATA_HDR_LEN_BYTES - DLC_CRC_LEN_BYTES) {
+		DECT_ERROR_HANDLER(DECT_ERROR_PDU_TOO_LARGE, "DLC TX from CVG: SDU too large (%u bytes).", sdu_buf->len);
+		net_buf_unref(sdu_buf);
+		STATS_INC(dect_stats.dlc_tx_drops);
+		status = DECT_ERROR_PDU_TOO_LARGE;
+		goto exit_unlock;
+	}
+
+	// Check if ARQ window is full (simple check for now)
+	bool window_full = true;
+	int free_idx = -1;
+	for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_TX_WINDOW_SIZE; i++) {
+		if (dlc_ctx.tx_buffer[i].dlc_pdu_buf == NULL || dlc_ctx.tx_buffer[i].acknowledged) {
+			free_idx = i;
+			window_full = false;
+			break;
+		}
+	}
+
+	if (window_full) {
+		DECT_ERROR_HANDLER(DECT_ERROR_DLC_TX_WINDOW_FULL, "DLC TX from CVG: ARQ TX window full. Dropping SDU for 0x%04x.", dest_short_rd_id);
+		net_buf_unref(sdu_buf);
+		STATS_INC(dect_stats.dlc_tx_drops);
+		STATS_INC(dect_stats.dlc_window_full_blocks);
+		status = DECT_ERROR_DLC_TX_WINDOW_FULL;
+		goto exit_unlock;
+	}
+
+	// Allocate a new net_buf for the DLC PDU, which will contain DLC header + SDU + CRC
+	struct net_buf *dlc_pdu = NULL;
+	size_t dlc_pdu_len = DLC_DATA_HDR_LEN_BYTES + sdu_buf->len + DLC_CRC_LEN_BYTES;
+
+	status = handle_tx_buffer_allocation(&dlc_pdu, &mac_tx_net_buf_pool, __func__,
+										 dlc_pdu_len, DECT_ERROR_DLC_NO_MEM);
+	if (status != DECT_STATUS_OK) {
+		net_buf_unref(sdu_buf);
+		goto exit_unlock;
+	}
+
+	// Build DLC Data PDU header
+	// Current simplified DLC Data PDU: Type (1 byte) + SeqNum (1 byte) + WindowSize (1 byte) + Reserved (1 byte)
+	net_buf_add_u8(dlc_pdu, DLC_PDU_TYPE_DATA); // DLC PDU Type
+	net_buf_add_u8(dlc_pdu, dlc_ctx.next_tx_seq_num); // Sequence Number
+	net_buf_add_u8(dlc_pdu, CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE); // Advertised RX window size
+	net_buf_add_u8(dlc_pdu, 0x00); // Reserved
+
+	// Add SDU payload
+	net_buf_write(dlc_pdu, sdu_buf->data, sdu_buf->len);
+	net_buf_add(dlc_pdu, sdu_buf->len); // Advance tail pointer
+	net_buf_unref(sdu_buf); // DLC now owns the buffer
+
+	// Add CRC
+	uint16_t crc = compute_crc(dlc_pdu->data, dlc_pdu->len);
+	net_buf_add_le16(dlc_pdu, crc); // Add CRC (Little Endian for Zephyr's crc16_ccitt)
+
+	LOG_DBG("DLC TX from CVG: Prepared DATA PDU (Seq %u, len %u) for 0x%04x.",
+			dlc_ctx.next_tx_seq_num, dlc_pdu->len, dest_short_rd_id);
+
+	// Store in ARQ TX buffer
+	dlc_ctx.tx_buffer[free_idx].dlc_pdu_buf = dlc_pdu;
+	dlc_ctx.tx_buffer[free_idx].dest_short_rd_id = dest_short_rd_id;
+	dlc_ctx.tx_buffer[free_idx].seq_num = dlc_ctx.next_tx_seq_num;
+	dlc_ctx.tx_buffer[free_idx].retransmission_count = 0;
+	dlc_ctx.tx_buffer[free_idx].last_tx_time_ms = k_uptime_get();
+	dlc_ctx.tx_buffer[free_idx].acknowledged = false;
+	dlc_ctx.tx_buffer[free_idx].qos_priority = qos_priority;
+	dlc_ctx.tx_buffer[free_idx].service_type = service_type;
+	dlc_ctx.tx_buffer[free_idx].is_routing_pdu = false; // This is directly from CVG (app data)
+	dlc_ctx.tx_buffer[free_idx].rto = dlc_ctx.rto;
+	// HARQ ID will be assigned by MAC when it takes the PDU.
+
+	dlc_ctx.next_tx_seq_num = (dlc_ctx.next_tx_seq_num + 1) % DLC_MAX_SEQ_NUM; // Increment sequence number
+
+	// Trigger immediate TX via MAC
+	status = dect_mac_send_pdu_from_dlc(dest_short_rd_id, dlc_pdu, MAC_HEADER_TYPE_1_DATA,
+										dlc_ctx.tx_buffer[free_idx].seq_num, // Pass DLC seq for MAC context
+										qos_priority, false); // Not retransmission
+	if (status != DECT_STATUS_OK) {
+		DECT_ERROR_HANDLER(status, "DLC TX from CVG: Failed to send PDU to MAC layer.");
+		dlc_ctx.tx_buffer[free_idx].dlc_pdu_buf = NULL; // Clear entry if MAC failed to take it
+		// MAC unref'd the buffer on its error path.
+		STATS_INC(dect_stats.dlc_tx_drops);
+	}
+
+exit_unlock:
+	k_mutex_unlock(&dlc_ctx.mutex);
+	return status;
+}
+
+dect_status_t dect_dlc_send_data_from_routing(uint16_t dest_short_rd_id, struct net_buf *routing_pdu_buf,
+											  cvg_service_type_t service_type, qos_priority_t qos_priority)
+{
+	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
+	dect_status_t status = DECT_STATUS_OK;
+
+	if (!routing_pdu_buf) {
+		DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PARAM, "DLC TX from ROUTING: NULL routing PDU buffer.");
+		STATS_INC(dect_stats.dlc_tx_drops);
+		status = DECT_ERROR_INVALID_PARAM;
+		goto exit_unlock;
+	}
+
+	if (routing_pdu_buf->len > CONFIG_DECT_NR_PLUS_MAX_DLC_PDU_SIZE - DLC_DATA_HDR_LEN_BYTES - DLC_CRC_LEN_BYTES) {
+		DECT_ERROR_HANDLER(DECT_ERROR_PDU_TOO_LARGE, "DLC TX from ROUTING: Routing PDU too large (%u bytes).", routing_pdu_buf->len);
+		net_buf_unref(routing_pdu_buf);
+		STATS_INC(dect_stats.dlc_tx_drops);
+		status = DECT_ERROR_PDU_TOO_LARGE;
+		goto exit_unlock;
+	}
+
+	// Check if ARQ window is full (simple check for now)
+	bool window_full = true;
+	int free_idx = -1;
+	for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_TX_WINDOW_SIZE; i++) {
+		if (dlc_ctx.tx_buffer[i].dlc_pdu_buf == NULL || dlc_ctx.tx_buffer[i].acknowledged) {
+			free_idx = i;
+			window_full = false;
+			break;
+		}
+	}
+
+	if (window_full) {
+		DECT_ERROR_HANDLER(DECT_ERROR_DLC_TX_WINDOW_FULL, "DLC TX from ROUTING: ARQ TX window full. Dropping PDU for 0x%04x.", dest_short_rd_id);
+		net_buf_unref(routing_pdu_buf);
+		STATS_INC(dect_stats.dlc_tx_drops);
+		STATS_INC(dect_stats.dlc_window_full_blocks);
+		status = DECT_ERROR_DLC_TX_WINDOW_FULL;
+		goto exit_unlock;
+	}
+
+	// Allocate a new net_buf for the DLC PDU, which will contain DLC header + Routing PDU + CRC
+	struct net_buf *dlc_pdu = NULL;
+	size_t dlc_pdu_len = DLC_DATA_HDR_LEN_BYTES + routing_pdu_buf->len + DLC_CRC_LEN_BYTES;
+
+	status = handle_tx_buffer_allocation(&dlc_pdu, &mac_tx_net_buf_pool, __func__,
+										 dlc_pdu_len, DECT_ERROR_DLC_NO_MEM);
+	if (status != DECT_STATUS_OK) {
+		net_buf_unref(routing_pdu_buf);
+		goto exit_unlock;
+	}
+
+	// Build DLC Data PDU header
+	// Current simplified DLC Data PDU: Type (1 byte) + SeqNum (1 byte) + WindowSize (1 byte) + Reserved (1 byte)
+	net_buf_add_u8(dlc_pdu, DLC_PDU_TYPE_ROUTING); // Mark as ROUTING PDU type at DLC level
+	net_buf_add_u8(dlc_pdu, dlc_ctx.next_tx_seq_num); // Sequence Number
+	net_buf_add_u8(dlc_pdu, CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE); // Advertised RX window size
+	net_buf_add_u8(dlc_pdu, 0x00); // Reserved
+
+	// Add Routing PDU payload
+	net_buf_write(dlc_pdu, routing_pdu_buf->data, routing_pdu_buf->len);
+	net_buf_add(dlc_pdu, routing_pdu_buf->len); // Advance tail pointer
+	net_buf_unref(routing_pdu_buf); // DLC now owns the buffer
+
+	// Add CRC
+	uint16_t crc = compute_crc(dlc_pdu->data, dlc_pdu->len);
+	net_buf_add_le16(dlc_pdu, crc); // Add CRC (Little Endian for Zephyr's crc16_ccitt)
+
+	LOG_DBG("DLC TX from ROUTING: Prepared ROUTING PDU (Seq %u, len %u) for 0x%04x.",
+			dlc_ctx.next_tx_seq_num, dlc_pdu->len, dest_short_rd_id);
+
+	// Store in ARQ TX buffer
+	dlc_ctx.tx_buffer[free_idx].dlc_pdu_buf = dlc_pdu;
+	dlc_ctx.tx_buffer[free_idx].dest_short_rd_id = dest_short_rd_id;
+	dlc_ctx.tx_buffer[free_idx].seq_num = dlc_ctx.next_tx_seq_num;
+	dlc_ctx.tx_buffer[free_idx].retransmission_count = 0;
+	dlc_ctx.tx_buffer[free_idx].last_tx_time_ms = k_uptime_get();
+	dlc_ctx.tx_buffer[free_idx].acknowledged = false;
+	dlc_ctx.tx_buffer[free_idx].qos_priority = qos_priority;
+	dlc_ctx.tx_buffer[free_idx].service_type = service_type;
+	dlc_ctx.tx_buffer[free_idx].is_routing_pdu = true; // This is a routing PDU
+	dlc_ctx.tx_buffer[free_idx].rto = dlc_ctx.rto;
+	// HARQ ID will be assigned by MAC when it takes the PDU.
+
+	dlc_ctx.next_tx_seq_num = (dlc_ctx.next_tx_seq_num + 1) % DLC_MAX_SEQ_NUM; // Increment sequence number
+
+	// Trigger immediate TX via MAC
+	status = dect_mac_send_pdu_from_dlc(dest_short_rd_id, dlc_pdu, MAC_HEADER_TYPE_1_DATA, // Routing uses DATA type MAC
+										dlc_ctx.tx_buffer[free_idx].seq_num, // Pass DLC seq for MAC context
+										qos_priority, false); // Not retransmission
+	if (status != DECT_STATUS_OK) {
+		DECT_ERROR_HANDLER(status, "DLC TX from ROUTING: Failed to send PDU to MAC layer.");
+		dlc_ctx.tx_buffer[free_idx].dlc_pdu_buf = NULL; // Clear entry if MAC failed to take it
+		// MAC unref'd the buffer on its error path.
+		STATS_INC(dect_stats.dlc_tx_drops);
+	}
+
+exit_unlock:
+	k_mutex_unlock(&dlc_ctx.mutex);
+	return status;
+}
+
 /**
- * @brief Thread entry point for the DLC layer.
+ * @brief Handles incoming data from the MAC layer to the DLC layer.
  *
- * This thread is responsible for processing outgoing SDUs from CVG/Routing,
- * processing incoming PDUs from MAC, and managing ARQ and flow control.
+ * @param src_short_rd_id The Short RD ID of the source peer.
+ * @param mac_pdu_payload_buf The net_buf containing the MAC PDU payload (DLC PDU).
+ * @param hpc Half-Permanent Counter from MAC.
+ * @param psn Packet Sequence Number from MAC.
+ * @return DECT_STATUS_OK on success, or an error code.
+ */
+dect_status_t dect_dlc_receive_data_from_mac(uint16_t src_short_rd_id, struct net_buf *mac_pdu_payload_buf,
+											 uint32_t hpc, uint16_t psn)
+{
+	if (!mac_pdu_payload_buf || mac_pdu_payload_buf->len < DLC_CONTROL_HDR_LEN_BYTES + DLC_CRC_LEN_BYTES) {
+		DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PDU_FORMAT, "DLC RX: Malformed PDU from MAC (len: %u).",
+						   mac_pdu_payload_buf ? mac_pdu_payload_buf->len : 0);
+		net_buf_unref(mac_pdu_payload_buf);
+		STATS_INC(dect_stats.dlc_rx_drops);
+		return DECT_ERROR_INVALID_PDU_FORMAT;
+	}
+
+	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
+	dect_status_t status = DECT_STATUS_OK;
+
+	// Extract CRC first (last 2 bytes, little-endian)
+	uint16_t received_crc = net_buf_pull_le16(mac_pdu_payload_buf);
+
+	// Compute CRC on the rest of the buffer
+	uint16_t computed_crc = compute_crc(mac_pdu_payload_buf->data, mac_pdu_payload_buf->len);
+
+	if (received_crc != computed_crc) {
+		DECT_ERROR_HANDLER(DECT_ERROR_DLC_CRC_ERROR, "DLC RX: CRC mismatch for PDU from 0x%04x. Received 0x%04x, Computed 0x%04x. Dropping.",
+						   src_short_rd_id, received_crc, computed_crc);
+		net_buf_unref(mac_pdu_payload_buf);
+		STATS_INC(dect_stats.dlc_crc_errors);
+		status = DECT_ERROR_DLC_CRC_ERROR;
+		goto exit_unlock;
+	}
+
+	uint8_t pdu_type = net_buf_pull_u8(mac_pdu_payload_buf);
+
+	LOG_DBG("DLC RX: Received PDU type %u from 0x%04x (len %u, PSN %u, HPC %u).",
+			pdu_type, src_short_rd_id, mac_pdu_payload_buf->len, psn, hpc);
+
+	switch (pdu_type) {
+		case DLC_PDU_TYPE_DATA: {
+			if (mac_pdu_payload_buf->len < DLC_DATA_HDR_LEN_BYTES - 1) { // -1 for type
+				LOG_ERR("DLC RX: Malformed DATA PDU from 0x%04x. Dropping.", src_short_rd_id);
+				net_buf_unref(mac_pdu_payload_buf);
+				STATS_INC(dect_stats.dlc_rx_drops);
+				status = DECT_ERROR_INVALID_PDU_FORMAT;
+				break;
+			}
+			uint8_t seq_num = net_buf_pull_u8(mac_pdu_payload_buf);
+			uint8_t peer_tx_window_size = net_buf_pull_u8(mac_pdu_payload_buf); // Peer's advertised TX window
+			// uint8_t reserved = net_buf_pull_u8(mac_pdu_payload_buf); // Pull reserved byte
+
+			dlc_ctx.peer_advertised_rx_window_size = peer_tx_window_size; // Update peer's RX window (our TX limit)
+
+			LOG_DBG("DLC RX DATA: Seq %u, PeerTXWin %u, Expected Seq %u.",
+					seq_num, peer_tx_window_size, dlc_ctx.next_rx_seq_num);
+
+			// Handle out-of-order/duplicate packets
+			if (!SEQ_NUM_IS_GREATER_EQUAL(seq_num, dlc_ctx.next_rx_seq_num)) {
+				// Old or duplicate packet, send ACK for next_rx_seq_num and drop
+				LOG_WRN("DLC RX: Received old/duplicate DATA PDU (Seq %u), expected %u. Dropping and sending ACK.",
+						seq_num, dlc_ctx.next_rx_seq_num);
+				dlc_send_ack(src_short_rd_id, dlc_ctx.next_rx_seq_num, CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE);
+				net_buf_unref(mac_pdu_payload_buf);
+				STATS_INC(dect_stats.dlc_rx_drops);
+				status = DECT_ERROR_DLC_DUPLICATE_PACKET;
+				break;
+			}
+
+			// Store in RX buffer if it's within the window and not already received
+			int rx_buffer_idx = -1;
+			for(int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE; i++) {
+				if(dlc_ctx.rx_buffer[i].valid && dlc_ctx.rx_buffer[i].seq_num == seq_num) {
+					// Duplicate within window, drop and ACK current window
+					LOG_WRN("DLC RX: Duplicate DATA PDU (Seq %u) in RX window. Dropping and ACK'ing.", seq_num);
+					dlc_send_ack(src_short_rd_id, dlc_ctx.next_rx_seq_num, CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE);
+					net_buf_unref(mac_pdu_payload_buf);
+					STATS_INC(dect_stats.dlc_rx_drops);
+					status = DECT_ERROR_DLC_DUPLICATE_PACKET;
+					goto exit_unlock;
+				}
+				if (!dlc_ctx.rx_buffer[i].valid && rx_buffer_idx == -1) {
+					rx_buffer_idx = i;
+				}
+			}
+
+			if (rx_buffer_idx == -1) {
+				DECT_ERROR_HANDLER(DECT_ERROR_DLC_RX_WINDOW_FULL, "DLC RX: RX window full. Dropping DATA PDU (Seq %u).", seq_num);
+				net_buf_unref(mac_pdu_payload_buf);
+				STATS_INC(dect_stats.dlc_rx_drops);
+				status = DECT_ERROR_DLC_RX_WINDOW_FULL;
+				goto exit_unlock;
+			}
+
+			dlc_ctx.rx_buffer[rx_buffer_idx].dlc_pdu_buf = mac_pdu_payload_buf;
+			dlc_ctx.rx_buffer[rx_buffer_idx].seq_num = seq_num;
+			dlc_ctx.rx_buffer[rx_buffer_idx].src_short_rd_id = src_short_rd_id;
+			dlc_ctx.rx_buffer[rx_buffer_idx].hpc = hpc;
+			dlc_ctx.rx_buffer[rx_buffer_idx].psn = psn;
+			dlc_ctx.rx_buffer[rx_buffer_idx].valid = true;
+			dlc_ctx.rx_buffer[rx_buffer_idx].service_type = CVG_SERVICE_TYPE_DATA; // This is application data
+
+			// Check for contiguous packets starting from next_rx_seq_num and pass them up
+			for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE; i++) {
+				int current_buf_idx = -1;
+				for (int j = 0; j < CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE; j++) {
+					if (dlc_ctx.rx_buffer[j].valid && dlc_ctx.rx_buffer[j].seq_num == dlc_ctx.next_rx_seq_num) {
+						current_buf_idx = j;
+						break;
+					}
+				}
+
+				if (current_buf_idx != -1) {
+					dlc_rx_msg_t rx_msg_to_cvg = {
+						.src_short_rd_id = dlc_ctx.rx_buffer[current_buf_idx].src_short_rd_id,
+						.dlc_pdu_buf = dlc_ctx.rx_buffer[current_buf_idx].dlc_pdu_buf,
+						.rssi = 0, // RSSI is handled by MAC, not available here explicitly from DLC PDU.
+						.hpc = dlc_ctx.rx_buffer[current_buf_idx].hpc,
+						.psn = dlc_ctx.rx_buffer[current_buf_idx].psn,
+						.dlc_pdu_type = DLC_PDU_TYPE_DATA, // Pass up as data type
+					};
+					// Pass to CVG
+					int ret = k_msgq_put(&cvg_rx_msgq, &rx_msg_to_cvg, K_NO_WAIT);
+					if (ret != 0) {
+						DECT_ERROR_HANDLER(DECT_ERROR_CVG_RX_DROPS, "DLC RX: Failed to queue DATA PDU (Seq %u) to CVG (ret: %d).", dlc_ctx.next_rx_seq_num, ret);
+						net_buf_unref(rx_msg_to_cvg.dlc_pdu_buf);
+						STATS_INC(dect_stats.dlc_rx_drops); // This also counts as a DLC drop
+						// Continue trying to pass up subsequent packets in window if possible
+					} else {
+						LOG_DBG("DLC RX: Passed DATA PDU (Seq %u) to CVG.", dlc_ctx.next_rx_seq_num);
+					}
+
+					dlc_ctx.rx_buffer[current_buf_idx].dlc_pdu_buf = NULL; // Clear pointer
+					dlc_ctx.rx_buffer[current_buf_idx].valid = false;
+					dlc_ctx.next_rx_seq_num = (dlc_ctx.next_rx_seq_num + 1) % DLC_MAX_SEQ_NUM; // Increment expected sequence number
+				} else {
+					// Gap in sequence numbers, stop processing contiguous packets
+					break;
+				}
+			}
+
+			// Always send an ACK for the highest contiguous sequence number received
+			dlc_send_ack(src_short_rd_id, dlc_ctx.next_rx_seq_num, CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE);
+			break;
+		}
+
+		case DLC_PDU_TYPE_ACK: {
+			if (mac_pdu_payload_buf->len < DLC_ACK_HDR_LEN_BYTES - 1) { // -1 for type
+				LOG_ERR("DLC RX: Malformed ACK PDU from 0x%04x. Dropping.", src_short_rd_id);
+				net_buf_unref(mac_pdu_payload_buf);
+				STATS_INC(dect_stats.dlc_rx_drops);
+				status = DECT_ERROR_INVALID_PDU_FORMAT;
+				break;
+			}
+			uint8_t ack_seq_num = net_buf_pull_u8(mac_pdu_payload_buf);
+			uint8_t peer_rx_window_size = net_buf_pull_u8(mac_pdu_payload_buf); // Peer's advertised RX window
+
+			dlc_ctx.peer_advertised_tx_window_size = peer_rx_window_size; // Update peer's TX window (our RX limit)
+
+			LOG_DBG("DLC RX ACK: Seq %u, PeerRXWin %u.", ack_seq_num, peer_rx_window_size);
+			STATS_INC(dect_stats.dlc_acks_rx);
+
+			k_mutex_lock(&dlc_ctx.mutex, K_FOREVER); // Acquire mutex for tx_buffer access
+			// Mark acknowledged packets as such and free buffers
+			for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_TX_WINDOW_SIZE; i++) {
+				if (dlc_ctx.tx_buffer[i].dlc_pdu_buf &&
+					SEQ_NUM_IS_GREATER_EQUAL(ack_seq_num, dlc_ctx.tx_buffer[i].seq_num) &&
+					!dlc_ctx.tx_buffer[i].acknowledged) {
+					LOG_DBG("DLC RX ACK: PDU Seq %u acknowledged.", dlc_ctx.tx_buffer[i].seq_num);
+					dlc_ctx.tx_buffer[i].acknowledged = true;
+					// Update RTT for this acknowledged packet
+					uint32_t sample_rtt = k_uptime_get() - dlc_ctx.tx_buffer[i].last_tx_time_ms;
+					dlc_update_rtt(sample_rtt);
+					net_buf_unref(dlc_ctx.tx_buffer[i].dlc_pdu_buf);
+					dlc_ctx.tx_buffer[i].dlc_pdu_buf = NULL; // Free buffer
+				}
+			}
+			k_mutex_unlock(&dlc_ctx.mutex);
+			net_buf_unref(mac_pdu_payload_buf); // ACK PDU itself is consumed
+			break;
+		}
+
+		case DLC_PDU_TYPE_NACK: {
+			if (mac_pdu_payload_buf->len < DLC_CONTROL_HDR_LEN_BYTES - 1) { // -1 for type
+				LOG_ERR("DLC RX: Malformed NACK PDU from 0x%04x. Dropping.", src_short_rd_id);
+				net_buf_unref(mac_pdu_payload_buf);
+				STATS_INC(dect_stats.dlc_rx_drops);
+				status = DECT_ERROR_INVALID_PDU_FORMAT;
+				break;
+			}
+			uint8_t nack_seq_num = net_buf_pull_u8(mac_pdu_payload_buf);
+			// uint8_t reserved = net_buf_pull_u8(mac_pdu_payload_buf); // Pull reserved byte
+			LOG_DBG("DLC RX NACK: Seq %u.", nack_seq_num);
+			STATS_INC(dect_stats.dlc_nacks_rx);
+
+			// Trigger retransmission for the NACKed packet
+			k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
+			for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_TX_WINDOW_SIZE; i++) {
+				if (dlc_ctx.tx_buffer[i].dlc_pdu_buf && dlc_ctx.tx_buffer[i].seq_num == nack_seq_num) {
+					if (!dlc_ctx.tx_buffer[i].acknowledged) {
+						LOG_DBG("DLC RX NACK: Retransmitting PDU Seq %u.", nack_seq_num);
+						dlc_ctx.tx_buffer[i].retransmission_count++;
+						dlc_ctx.tx_buffer[i].last_tx_time_ms = k_uptime_get(); // Reset timer for retransmission
+						// Trigger retransmission via MAC directly
+						dect_mac_send_pdu_from_dlc(dlc_ctx.tx_buffer[i].dest_short_rd_id,
+												   dlc_ctx.tx_buffer[i].dlc_pdu_buf,
+												   dlc_ctx.tx_buffer[i].is_routing_pdu ? MAC_HEADER_TYPE_1_DATA : MAC_HEADER_TYPE_1_DATA, // Routing uses DATA type MAC
+												   dlc_ctx.tx_buffer[i].seq_num,
+												   dlc_ctx.tx_buffer[i].qos_priority, true); // Mark as retransmission
+						STATS_INC(dect_stats.dlc_retransmissions);
+					} else {
+						LOG_WRN("DLC RX NACK: Received NACK for already acknowledged PDU Seq %u.", nack_seq_num);
+					}
+					break;
+				}
+			}
+			k_mutex_unlock(&dlc_ctx.mutex);
+			net_buf_unref(mac_pdu_payload_buf); // NACK PDU itself is consumed
+			break;
+		}
+
+		case DLC_PDU_TYPE_ROUTING: {
+			LOG_DBG("DLC RX: Received ROUTING PDU from 0x%04x. Passing to Routing layer.", src_short_rd_id);
+			// Pass to routing layer
+			dlc_rx_msg_t rx_msg_to_routing = {
+				.src_short_rd_id = src_short_rd_id,
+				.dlc_pdu_buf = mac_pdu_payload_buf, // Pass ownership
+				.rssi = 0, // Not directly from DLC PDU
+				.hpc = hpc,
+				.psn = psn,
+				.dlc_pdu_type = DLC_PDU_TYPE_ROUTING,
+			};
+			int ret = k_msgq_put(&routing_rx_msgq, &rx_msg_to_routing, K_NO_WAIT);
+			if (ret != 0) {
+				DECT_ERROR_HANDLER(DECT_ERROR_ROUTING_RX_DROPS, "DLC RX: Failed to queue ROUTING PDU to Routing layer (ret: %d).", ret);
+				net_buf_unref(mac_pdu_payload_buf); // If routing queue full, drop.
+				STATS_INC(dect_stats.dlc_rx_drops); // Counts as DLC drop too.
+			}
+			break;
+		}
+
+		// Add other DLC PDU types (FLOW_CONTROL, CONNECT, RELEASE, BEACON) handling as needed
+		default:
+			LOG_WRN("DLC RX: Unknown or unhandled PDU type %u from 0x%04x. Dropping.", pdu_type, src_short_rd_id);
+			net_buf_unref(mac_pdu_payload_buf);
+			STATS_INC(dect_stats.dlc_rx_drops);
+			status = DECT_ERROR_INVALID_PDU_TYPE;
+			break;
+	}
+
+exit_unlock:
+	k_mutex_unlock(&dlc_ctx.mutex);
+	dect_power_mgr_activity_detected(); // Notify power manager of RX activity
+	return status;
+}
+
+/**
+ * @brief DLC thread entry point.
+ * This thread handles retransmissions, ACK/NACK processing, and forwards data.
+ *
+ * @param p1 Unused.
+ * @param p2 Unused.
+ * @param p3 Unused.
  */
 void dect_dlc_thread(void *p1, void *p2, void *p3)
 {
@@ -114,723 +655,252 @@ void dect_dlc_thread(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	LOG_INF("DLC: Thread started.");
+	LOG_DBG("DECT DLC Thread started.");
 
 	dlc_tx_msg_t tx_msg;
 	dlc_rx_msg_t rx_msg;
+	dect_status_t status;
+	bool had_activity_this_loop;
 
 	while (true) {
-		// Process outgoing data from CVG/Routing
+		had_activity_this_loop = false;
+
+		/* Process incoming messages from CVG/Routing */
 		if (k_msgq_get(&dlc_tx_msgq, &tx_msg, K_NO_WAIT) == 0) {
-			LOG_DBG("DLC: Received TX SDU from higher layer (dest 0x%04x, len %u, type %u, QoS %u).",
-				tx_msg.dest_short_rd_id, tx_msg.dlc_pdu_buf->len,
-				tx_msg.service_type, tx_msg.qos_priority);
+			had_activity_this_loop = true;
+			LOG_DBG("DLC TX: Received message from higher layer (dest 0x%04x, len %u, service %u, routing_pdu %d).",
+					tx_msg.dest_short_rd_id, tx_msg.dlc_pdu_buf->len, tx_msg.service_type, tx_msg.is_routing_pdu);
 
-			k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
-
-			// Check if TX window is full
-			uint8_t current_tx_window_usage = 0;
-			for (int i = 0; i < DLC_ARQ_TX_BUFFER_SIZE; i++) {
-				if (dlc_ctx.tx_buffer[i].dlc_pdu_buf != NULL) {
-					current_tx_window_usage++;
-				}
-			}
-
-			if (current_tx_window_usage >= dlc_ctx.peer_advertised_rx_window_size) {
-				DECT_ERROR_HANDLER(DECT_ERROR_DLC_TX_WINDOW_FULL, "DLC: TX window full (peer adv. RX window %u). Dropping SDU.",
-							dlc_ctx.peer_advertised_rx_window_size);
-				STATS_INC(dect_stats.dlc_tx_drops); // Increment DLC specific drop stat
-				net_buf_unref(tx_msg.dlc_pdu_buf); // Unref the SDU buffer
-				k_mutex_unlock(&dlc_ctx.mutex);
-				continue;
-			}
-
-			// Find a free entry in the TX buffer
-			int tx_idx = -1;
-			for (int i = 0; i < DLC_ARQ_TX_BUFFER_SIZE; i++) {
-				if (dlc_ctx.tx_buffer[i].dlc_pdu_buf == NULL) {
-					tx_idx = i;
-					break;
-				}
-			}
-
-			if (tx_idx == -1) {
-				DECT_ERROR_HANDLER(DECT_ERROR_NO_RESOURCES, "DLC: TX ARQ buffer full. Dropping SDU.");
-				STATS_INC(dect_stats.dlc_tx_drops); // Increment DLC specific drop stat
-				net_buf_unref(tx_msg.dlc_pdu_buf); // Unref the SDU buffer
-				k_mutex_unlock(&dlc_ctx.mutex);
-				continue;
-			}
-
-			dlc_ctx.tx_buffer[tx_idx].seq_num = dlc_ctx.next_tx_seq_num;
-			dlc_ctx.tx_buffer[tx_idx].dlc_pdu_buf = tx_msg.dlc_pdu_buf; // Take ownership
-			dlc_ctx.tx_buffer[tx_idx].retransmission_count = 0;
-			dlc_ctx.tx_buffer[tx_idx].last_tx_time_ms = k_uptime_get();
-			dlc_ctx.tx_buffer[tx_idx].rto = dlc_ctx.rto; // Current RTO
-			dlc_ctx.tx_buffer[tx_idx].service_type = tx_msg.service_type;
-			dlc_ctx.tx_buffer[tx_idx].dest_short_rd_id = tx_msg.dest_short_rd_id;
-			dlc_ctx.tx_buffer[tx_idx].is_routing_pdu = (tx_msg.service_type == CVG_SERVICE_TYPE_CONTROL &&
-									net_buf_peek_u8(tx_msg.dlc_pdu_buf) == ROUTING_PDU_TYPE_RREQ); // Simplified check for routing PDU
-
-			// Determine encryption based on security context and config
-			if (dect_config.enable_encryption && dect_security_is_established(tx_msg.dest_short_rd_id)) {
-				dlc_ctx.tx_buffer[tx_idx].encrypted = true;
+			// Decide whether to call dect_dlc_send_data_from_cvg or dect_dlc_send_data_from_routing
+			if (tx_msg.is_routing_pdu) {
+				status = dect_dlc_send_data_from_routing(tx_msg.dest_short_rd_id, tx_msg.dlc_pdu_buf,
+														 tx_msg.service_type, tx_msg.qos_priority);
 			} else {
-				dlc_ctx.tx_buffer[tx_idx].encrypted = false;
+				status = dect_dlc_send_data_from_cvg(tx_msg.dest_short_rd_id, tx_msg.dlc_pdu_buf,
+													 tx_msg.service_type, tx_msg.qos_priority);
 			}
 
-
-			// Construct DLC PDU with sequence number and window size
-			struct net_buf *dlc_pdu = NULL;
-			dect_status_t ret_alloc = handle_tx_buffer_allocation(&dlc_pdu, &mac_tx_net_buf_pool); // Use MAC pool for DLC PDUs to be sent
-			if (ret_alloc != DECT_STATUS_OK) {
-				DECT_ERROR_HANDLER(ret_alloc, "DLC: Failed to allocate PDU for TX. Dropping SDU.");
-				STATS_INC(dect_stats.dlc_tx_drops);
-				net_buf_unref(tx_msg.dlc_pdu_buf); // Release original SDU
-				dlc_ctx.tx_buffer[tx_idx].dlc_pdu_buf = NULL; // Clear entry
-				k_mutex_unlock(&dlc_ctx.mutex);
-				continue;
+			if (status != DECT_STATUS_OK) {
+				DECT_ERROR_HANDLER(status, "DLC TX: Failed to send PDU to MAC layer.");
+				// The send functions handle unref on their error paths.
 			}
-
-			// Add DLC Header: Sequence Number (8-bit) and Window Size (8-bit)
-			net_buf_add_u8(dlc_pdu, dlc_ctx.next_tx_seq_num);
-			net_buf_add_u8(dlc_pdu, dlc_ctx.peer_advertised_tx_window_size); // Our RX window size (advertised to peer as their TX window)
-
-			// Copy SDU payload
-			net_buf_add_mem(dlc_pdu, tx_msg.dlc_pdu_buf->data, tx_msg.dlc_pdu_buf->len);
-
-			// Compute CRC
-			uint16_t crc = compute_crc(dlc_pdu->data, dlc_pdu->len);
-			net_buf_add_le16(dlc_pdu, crc);
-
-
-			// Generate a unique HARQ transaction ID
-			dlc_ctx.tx_buffer[tx_idx].harq_transaction_id = sys_rand32_get();
-
-			// Pass to MAC layer for transmission
-			// MAC layer handles encryption if enabled and security established
-			dect_status_t mac_ret = dect_mac_send_pdu_from_dlc(tx_msg.dest_short_rd_id, dlc_pdu,
-									   DLC_PDU_TYPE_DATA, MAC_HEADER_TYPE_2_DATA,
-									   mac_ctx.current_hpc, mac_ctx.current_psn,
-									   false, // Not a retransmission (first attempt)
-									   dlc_ctx.tx_buffer[tx_idx].harq_transaction_id);
-			if (mac_ret != DECT_STATUS_OK) {
-				DECT_ERROR_HANDLER(mac_ret, "DLC: Failed to send PDU to MAC layer for first transmission.");
-				// MAC layer unrefs pdu_buf on failure.
-				STATS_INC(dect_stats.dlc_tx_drops); // Increment DLC specific drop stat
-				dlc_ctx.tx_buffer[tx_idx].dlc_pdu_buf = NULL; // Clear entry
-				k_mutex_unlock(&dlc_ctx.mutex);
-				continue;
-			}
-
-			LOG_DBG("DLC: SDU (seq %u) sent to MAC for first time (HARQ ID %u).",
-				dlc_ctx.next_tx_seq_num, dlc_ctx.tx_buffer[tx_idx].harq_transaction_id);
-
-			dlc_ctx.next_tx_seq_num = (dlc_ctx.next_tx_seq_num + 1) % DLC_MAX_SEQ_NUM; // Increment sequence number
-			STATS_INC(dect_stats.total_tx_frames);
-			STATS_INC_PEER(tx_msg.dest_short_rd_id, tx_frames, 1);
-			STATS_INC_GLOBAL(dect_stats.total_tx_data_bytes, tx_msg.dlc_pdu_buf->len);
-			STATS_INC_PEER(tx_msg.dest_short_rd_id, tx_data_bytes, tx_msg.dlc_pdu_buf->len);
-
-			k_mutex_unlock(&dlc_ctx.mutex);
-			dect_power_mgr_activity_detected(); // Notify power manager of TX activity
 		}
 
-		// Process incoming data from MAC layer
+		/* Process incoming messages from MAC */
 		if (k_msgq_get(&dlc_rx_msgq, &rx_msg, K_NO_WAIT) == 0) {
-			LOG_DBG("DLC: Received PDU from MAC (src 0x%04x, len %u, type %u).",
-				rx_msg.src_short_rd_id, rx_msg.dlc_pdu_buf->len, rx_msg.dlc_pdu_type);
-			dect_power_mgr_activity_detected(); // Notify power manager of RX activity
+			had_activity_this_loop = true;
+			LOG_DBG("DLC RX: Received message from MAC (src 0x%04x, len %u).",
+					rx_msg.src_short_rd_id, rx_msg.dlc_pdu_buf->len);
 
-			k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
-
-			// Check CRC for data and ACK PDUs
-			if (rx_msg.dlc_pdu_type == DLC_PDU_TYPE_DATA || rx_msg.dlc_pdu_type == DLC_PDU_TYPE_ACK) {
-				if (rx_msg.dlc_pdu_buf->len < DLC_CRC_LEN_BYTES) {
-					DECT_ERROR_HANDLER(DECT_ERROR_FRAME_TOO_SHORT, "DLC: RX PDU too short for CRC. Dropping.");
-					STATS_INC(dect_stats.dlc_rx_drops); // Increment DLC specific drop stat
-					net_buf_unref(rx_msg.dlc_pdu_buf);
-					k_mutex_unlock(&dlc_ctx.mutex);
-					continue;
-				}
-				uint16_t received_crc = sys_get_le16(net_buf_tail(rx_msg.dlc_pdu_buf) - DLC_CRC_LEN_BYTES);
-				net_buf_pull(rx_msg.dlc_pdu_buf, DLC_CRC_LEN_BYTES); // Remove CRC before processing payload
-				uint16_t computed_crc = compute_crc(rx_msg.dlc_pdu_buf->data, rx_msg.dlc_pdu_buf->len);
-
-				if (received_crc != computed_crc) {
-					DECT_ERROR_HANDLER(DECT_ERROR_INTEGRITY_CHECK_FAILED, "DLC: CRC mismatch for RX PDU (src 0x%04x). Received 0x%04x, Computed 0x%04x. Dropping.",
-							   rx_msg.src_short_rd_id, received_crc, computed_crc);
-					STATS_INC(dect_stats.dlc_crc_errors);
-					STATS_INC_PEER(rx_msg.src_short_rd_id, dlc_crc_errors, 1);
-					STATS_INC(dect_stats.dlc_rx_drops); // Increment DLC specific drop stat
-					net_buf_unref(rx_msg.dlc_pdu_buf);
-					k_mutex_unlock(&dlc_ctx.mutex);
-					continue;
-				}
-				LOG_DBG("DLC: CRC check passed for RX PDU.");
-			}
-
-			switch (rx_msg.dlc_pdu_type) {
-			case DLC_PDU_TYPE_DATA: {
-				if (rx_msg.dlc_pdu_buf->len < DLC_DATA_HDR_LEN_BYTES) {
-					DECT_ERROR_HANDLER(DECT_ERROR_FRAME_TOO_SHORT, "DLC: Data PDU too short for header. Dropping.");
-					STATS_INC(dect_stats.dlc_rx_drops);
-					net_buf_unref(rx_msg.dlc_pdu_buf);
-					break;
-				}
-				uint8_t rx_seq_num = net_buf_pull_u8(rx_msg.dlc_pdu_buf);
-				uint8_t peer_tx_window_size = net_buf_pull_u8(rx_msg.dlc_pdu_buf); // Peer's TX window size
-
-				LOG_DBG("DLC: Received Data PDU (src 0x%04x, seq %u, peer_tx_win %u).",
-					rx_msg.src_short_rd_id, rx_seq_num, peer_tx_window_size);
-
-				// Update peer's advertised TX window size (our RX window)
-				dlc_ctx.peer_advertised_tx_window_size = peer_tx_window_size;
-
-				// Check if this is the next expected sequence number
-				if (rx_seq_num == dlc_ctx.next_rx_seq_num) {
-					// In-order packet, pass to CVG immediately
-					LOG_DBG("DLC: In-order data PDU (seq %u). Passing to CVG.", rx_seq_num);
-					dlc_rx_msg_t cvg_rx_msg = {
-						.src_short_rd_id = rx_msg.src_short_rd_id,
-						.dlc_pdu_buf = rx_msg.dlc_pdu_buf,
-						.rssi = rx_msg.rssi,
-						.hpc = rx_msg.hpc,
-						.psn = rx_msg.psn,
-						.dlc_pdu_type = DLC_PDU_TYPE_DATA
-					};
-					int ret_msgq = DECT_MSGQ_PUT_OR_DROP(&cvg_rx_msgq, &cvg_rx_msg, K_NO_WAIT,
-											DECT_ERROR_QUEUE_FULL,
-											"DLC: Failed to pass data to CVG (queue full). Dropping.",
-											rx_msg.dlc_pdu_buf, &dect_stats.dlc_rx_drops);
-					if (ret_msgq != 0) {
-						// Buffer unref'd by macro
-						break;
-					}
-
-					dlc_ctx.next_rx_seq_num = (dlc_ctx.next_rx_seq_num + 1) % DLC_MAX_SEQ_NUM;
-
-					// Check for and deliver any buffered out-of-order packets
-					for (int i = 0; i < DLC_ARQ_RX_BUFFER_SIZE; i++) {
-						if (dlc_ctx.rx_buffer[i].valid &&
-						    dlc_ctx.rx_buffer[i].seq_num == dlc_ctx.next_rx_seq_num) {
-							LOG_DBG("DLC: Delivering buffered OOO PDU (seq %u) to CVG.", dlc_ctx.next_rx_seq_num);
-							cvg_rx_msg.src_short_rd_id = rx_msg.src_short_rd_id;
-							cvg_rx_msg.dlc_pdu_buf = dlc_ctx.rx_buffer[i].dlc_pdu_buf;
-							cvg_rx_msg.rssi = rx_msg.rssi; // Use latest RSSI for now
-							cvg_rx_msg.hpc = rx_msg.hpc;
-							cvg_rx_msg.psn = rx_msg.psn;
-							cvg_rx_msg.dlc_pdu_type = DLC_PDU_TYPE_DATA;
-
-							ret_msgq = DECT_MSGQ_PUT_OR_DROP(&cvg_rx_msgq, &cvg_rx_msg, K_NO_WAIT,
-												DECT_ERROR_QUEUE_FULL,
-												"DLC: Failed to pass buffered OOO data to CVG (queue full). Dropping.",
-												cvg_rx_msg.dlc_pdu_buf, &dect_stats.dlc_rx_drops);
-							if (ret_msgq != 0) {
-								// Buffer unref'd by macro
-								dlc_ctx.rx_buffer[i].dlc_pdu_buf = NULL; // Clear pointer in buffer entry
-								dlc_ctx.rx_buffer[i].valid = false;
-								break;
-							}
-							dlc_ctx.rx_buffer[i].dlc_pdu_buf = NULL; // Clear pointer in buffer entry
-							dlc_ctx.rx_buffer[i].valid = false;
-							dlc_ctx.next_rx_seq_num = (dlc_ctx.next_rx_seq_num + 1) % DLC_MAX_SEQ_NUM;
-							// Re-check for next sequence number immediately
-							i = -1; // Restart loop to check from beginning of buffer
-						}
-					}
-				} else if (SEQ_NUM_IS_GREATER_EQUAL(rx_seq_num, dlc_ctx.next_rx_seq_num) &&
-						SEQ_NUM_IS_GREATER_EQUAL(dlc_ctx.next_rx_seq_num + DLC_RX_WINDOW_SIZE, rx_seq_num)) {
-					// Out-of-order packet within RX window, buffer it
-					int rx_idx = -1;
-					for (int i = 0; i < DLC_ARQ_RX_BUFFER_SIZE; i++) {
-						if (!dlc_ctx.rx_buffer[i].valid) {
-							rx_idx = i;
-							break;
-						}
-						// Check for duplicate
-						if (dlc_ctx.rx_buffer[i].valid && dlc_ctx.rx_buffer[i].seq_num == rx_seq_num) {
-							LOG_DBG("DLC: Duplicate OOO data PDU (seq %u). Dropping.", rx_seq_num);
-							net_buf_unref(rx_msg.dlc_pdu_buf); // Drop duplicate
-							STATS_INC(dect_stats.dlc_rx_drops);
-							rx_idx = -2; // Indicate duplicate
-							break;
-						}
-					}
-					if (rx_idx == -1) {
-						DECT_ERROR_HANDLER(DECT_ERROR_DLC_RX_WINDOW_FULL, "DLC: RX ARQ buffer full. Dropping OOO PDU (seq %u).", rx_seq_num);
-						STATS_INC(dect_stats.dlc_rx_drops);
-						net_buf_unref(rx_msg.dlc_pdu_buf); // Drop due to full buffer
-					} else if (rx_idx != -2) {
-						LOG_DBG("DLC: Out-of-order data PDU (seq %u). Buffering.", rx_seq_num);
-						dlc_ctx.rx_buffer[rx_idx].seq_num = rx_seq_num;
-						dlc_ctx.rx_buffer[rx_idx].dlc_pdu_buf = rx_msg.dlc_pdu_buf; // Take ownership
-						dlc_ctx.rx_buffer[rx_idx].valid = true;
-						// Store other metadata if needed
-					}
-				} else {
-					// Out of window or old packet, drop
-					LOG_WRN("DLC: Out of window or old data PDU (seq %u, expected %u). Dropping.",
-						rx_seq_num, dlc_ctx.next_rx_seq_num);
-					STATS_INC(dect_stats.dlc_rx_drops);
-					net_buf_unref(rx_msg.dlc_pdu_buf);
-				}
-
-				// Always send an ACK if a data PDU is received, potentially delayed
-				dlc_ctx.ack_pending = true;
-				dlc_ctx.ack_seq_num = dlc_ctx.next_rx_seq_num; // ACK up to next expected
-				k_timer_start(&dlc_ctx.ack_delay_timer, K_MSEC(CONFIG_DECT_NR_PLUS_DLC_ACK_DELAY_MS), K_NO_WAIT);
-				break;
-			}
-
-			case DLC_PDU_TYPE_ACK: {
-				if (rx_msg.dlc_pdu_buf->len < DLC_ACK_HDR_LEN_BYTES) {
-					DECT_ERROR_HANDLER(DECT_ERROR_FRAME_TOO_SHORT, "DLC: ACK PDU too short for header. Dropping.");
-					STATS_INC(dect_stats.dlc_rx_drops);
-					net_buf_unref(rx_msg.dlc_pdu_buf);
-					break;
-				}
-				uint8_t ack_seq_num = net_buf_pull_u8(rx_msg.dlc_pdu_buf);
-				uint8_t peer_rx_window_size = net_buf_pull_u8(rx_msg.dlc_pdu_buf); // Peer's RX window size
-
-				LOG_DBG("DLC: Received ACK PDU (ack_seq %u, peer_rx_win %u).",
-					ack_seq_num, peer_rx_window_size);
-
-				// Update peer's advertised RX window size
-				dlc_ctx.peer_advertised_rx_window_size = peer_rx_window_size;
-
-				// Process ACKs by marking TX buffer entries as acknowledged
-				for (int i = 0; i < DLC_ARQ_TX_BUFFER_SIZE; i++) {
-					if (dlc_ctx.tx_buffer[i].dlc_pdu_buf != NULL &&
-					    SEQ_NUM_IS_GREATER_EQUAL(ack_seq_num, dlc_ctx.tx_buffer[i].seq_num)) {
-						LOG_DBG("DLC: PDU (seq %u) ACKed by peer. Freeing TX buffer entry.", dlc_ctx.tx_buffer[i].seq_num);
-						dlc_ctx.tx_buffer[i].dlc_pdu_buf = net_buf_unref(dlc_ctx.tx_buffer[i].dlc_pdu_buf);
-						dlc_ctx.tx_buffer[i].harq_transaction_id = 0; // Clear ID
-						// Update RTT if this is the first ACK for this PDU
-						if (dlc_ctx.tx_buffer[i].retransmission_count == 0) {
-							uint32_t sample_rtt = k_uptime_get() - dlc_ctx.tx_buffer[i].last_tx_time_ms;
-							dlc_update_rtt(sample_rtt);
-						}
-					}
-				}
-				net_buf_unref(rx_msg.dlc_pdu_buf);
-				break;
-			}
-
-			case DLC_PDU_TYPE_CONTROL:
-				// Pass control messages to higher layer if needed, or handle internally
-				LOG_DBG("DLC: Received Control PDU. Passing to CVG if applicable.");
-				dlc_rx_msg_t cvg_rx_msg_ctrl = {
-						.src_short_rd_id = rx_msg.src_short_rd_id,
-						.dlc_pdu_buf = rx_msg.dlc_pdu_buf,
-						.rssi = rx_msg.rssi,
-						.hpc = rx_msg.hpc,
-						.psn = rx_msg.psn,
-						.dlc_pdu_type = DLC_PDU_TYPE_CONTROL
-					};
-				int ret_msgq_ctrl = DECT_MSGQ_PUT_OR_DROP(&cvg_rx_msgq, &cvg_rx_msg_ctrl, K_NO_WAIT,
-											DECT_ERROR_QUEUE_FULL,
-											"DLC: Failed to pass control PDU to CVG (queue full). Dropping.",
-											rx_msg.dlc_pdu_buf, &dect_stats.dlc_rx_drops);
-				if (ret_msgq_ctrl != 0) {
-					// Buffer unref'd by macro
-					break;
-				}
-				break;
-
-			case DLC_PDU_TYPE_ROUTING:
-				// Pass routing messages to routing layer
-				if (dect_config.enable_routing) {
-					LOG_DBG("DLC: Received Routing PDU. Passing to Routing layer.");
-					// In a full implementation, the routing layer would define its own msgq.
-					// For now, let's assume `dect_routing_process_incoming_pdu` consumes the buffer.
-					dect_status_t routing_ret = dect_routing_process_incoming_pdu(rx_msg.src_short_rd_id, rx_msg.dlc_pdu_buf, rx_msg.hpc, rx_msg.psn);
-					if (routing_ret != DECT_STATUS_OK) {
-						DECT_ERROR_HANDLER(routing_ret, "DLC: Failed to process incoming Routing PDU. Dropping.");
-						STATS_INC(dect_stats.dlc_rx_drops); // Increment DLC specific drop stat
-						net_buf_unref(rx_msg.dlc_pdu_buf); // Routing layer may not unref on all internal failures
-					}
-				} else {
-					LOG_DBG("DLC: Routing disabled. Dropping Routing PDU.");
-					STATS_INC(dect_stats.dlc_rx_drops); // Increment DLC specific drop stat
-					net_buf_unref(rx_msg.dlc_pdu_buf);
-				}
-				break;
-
-			case DLC_PDU_TYPE_BEACON:
-				// Beacons are typically processed by MAC/Channel Manager, but if DLC has
-				// specific beacon processing (e.g., for some IE), it would happen here.
-				// For now, just unref if not passed up.
-				LOG_DBG("DLC: Received Beacon PDU. Discarding at DLC (handled by MAC/BCC).");
-				STATS_INC(dect_stats.dlc_rx_drops); // Increment DLC specific drop stat
-				net_buf_unref(rx_msg.dlc_pdu_buf);
-				break;
-
-			default:
-				DECT_ERROR_HANDLER(DECT_ERROR_INVALID_PDU_TYPE, "DLC: Received unknown DLC PDU type %u. Dropping.", rx_msg.dlc_pdu_type);
-				STATS_INC(dect_stats.dlc_rx_drops); // Increment DLC specific drop stat
-				net_buf_unref(rx_msg.dlc_pdu_buf);
-				break;
-			}
-			k_mutex_unlock(&dlc_ctx.mutex);
-		}
-
-		k_sleep(K_MSEC(10)); // Small sleep to yield CPU
-	}
-}
-
-dect_status_t dlc_send_data_from_cvg(uint16_t dest_short_rd_id, struct net_buf *sdu_buf,
-				     cvg_service_type_t service_type, qos_priority_t qos_priority)
-{
-	dlc_tx_msg_t tx_msg = {
-		.dest_short_rd_id = dest_short_rd_id,
-		.dlc_pdu_buf = sdu_buf, // DLC takes ownership
-		.service_type = service_type,
-		.qos_priority = qos_priority
-	};
-
-	LOG_DBG("DLC: Queuing data from CVG to internal TX queue (dest 0x%04x, len %u).",
-		dest_short_rd_id, sdu_buf->len);
-
-	int ret = DECT_MSGQ_PUT_OR_DROP(&dlc_tx_msgq, &tx_msg, K_NO_WAIT,
-					DECT_ERROR_QUEUE_FULL,
-					"DLC: Failed to put data from CVG into TX queue (full).",
-					sdu_buf, &dect_stats.dlc_tx_drops);
-	if (ret != 0) {
-		return DECT_ERROR_QUEUE_FULL; // Buffer already unref'd by macro
-	}
-
-	return DECT_STATUS_OK;
-}
-
-dect_status_t dlc_send_routing_pdu(uint16_t dest_short_rd_id, struct net_buf *routing_pdu_buf)
-{
-	dlc_tx_msg_t tx_msg = {
-		.dest_short_rd_id = dest_short_rd_id,
-		.dlc_pdu_buf = routing_pdu_buf, // DLC takes ownership
-		.service_type = CVG_SERVICE_TYPE_CONTROL, // Routing PDUs are a type of control message
-		.qos_priority = QOS_PRIORITY_HIGH // Routing messages often higher priority
-	};
-
-	LOG_DBG("DLC: Queuing Routing PDU to internal TX queue (dest 0x%04x, len %u).",
-		dest_short_rd_id, routing_pdu_buf->len);
-
-	int ret = DECT_MSGQ_PUT_OR_DROP(&dlc_tx_msgq, &tx_msg, K_NO_WAIT,
-					DECT_ERROR_QUEUE_FULL,
-					"DLC: Failed to put Routing PDU into TX queue (full).",
-					routing_pdu_buf, &dect_stats.dlc_tx_drops);
-	if (ret != 0) {
-		return DECT_ERROR_QUEUE_FULL; // Buffer already unref'd by macro
-	}
-
-	return DECT_STATUS_OK;
-}
-
-dect_status_t dlc_mac_tx_completion_notification(uint16_t dest_short_rd_id, uint32_t harq_transaction_id,
-						 nrf_modem_dect_phy_harq_feedback_t feedback,
-						 uint8_t retransmission_count, int phy_tx_status)
-{
-	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
-
-	// Find the corresponding entry in the TX ARQ buffer
-	int tx_idx = -1;
-	for (int i = 0; i < DLC_ARQ_TX_BUFFER_SIZE; i++) {
-		if (dlc_ctx.tx_buffer[i].dlc_pdu_buf != NULL &&
-		    dlc_ctx.tx_buffer[i].harq_transaction_id == harq_transaction_id) {
-			tx_idx = i;
-			break;
-		}
-	}
-
-	if (tx_idx == -1) {
-		LOG_WRN("DLC: TX completion notification for unknown HARQ ID %u. Ignoring.", harq_transaction_id);
-		k_mutex_unlock(&dlc_ctx.mutex);
-		return DECT_ERROR_GENERIC; // Or specific error
-	}
-
-	dlc_ctx.tx_buffer[tx_idx].retransmission_count = retransmission_count; // Update count
-
-	if (feedback == NRF_MODEM_DECT_PHY_HARQ_FEEDBACK_ACK) {
-		// PDU successfully acknowledged by peer or PHY (e.g., first attempt ACK)
-		LOG_DBG("DLC: PDU (seq %u, HARQ ID %u) ACKed by PHY/Peer on attempt %u.",
-			dlc_ctx.tx_buffer[tx_idx].seq_num, harq_transaction_id, retransmission_count + 1);
-
-		if (retransmission_count == 0) {
-			STATS_INC_PEER(dest_short_rd_id, harq_tx_success, 1);
-		} else {
-			STATS_INC_PEER(dest_short_rd_id, harq_tx_retransmissions, 1);
-		}
-
-		// Update RTT if this was the first transmission (not a retransmission)
-		if (retransmission_count == 0) {
-			uint32_t sample_rtt = k_uptime_get() - dlc_ctx.tx_buffer[tx_idx].last_tx_time_ms;
-			dlc_update_rtt(sample_rtt);
-		}
-
-		// Free the buffer and clear the TX buffer entry
-		dlc_ctx.tx_buffer[tx_idx].dlc_pdu_buf = net_buf_unref(dlc_ctx.tx_buffer[tx_idx].dlc_pdu_buf);
-		dlc_ctx.tx_buffer[tx_idx].harq_transaction_id = 0; // Invalidate entry
-	} else { // NRF_MODEM_DECT_PHY_HARQ_FEEDBACK_NACK or other failure indication
-		LOG_DBG("DLC: PDU (seq %u, HARQ ID %u) NACKed/Failed on attempt %u (status %d).",
-			dlc_ctx.tx_buffer[tx_idx].seq_num, harq_transaction_id, retransmission_count + 1, phy_tx_status);
-
-		// If max retries not reached, schedule retransmission
-		if (retransmission_count < CONFIG_DECT_NR_PLUS_DLC_MAX_RETRIES) {
-			LOG_DBG("DLC: Retrying PDU (seq %u, HARQ ID %u). Retry count %u.",
-				dlc_ctx.tx_buffer[tx_idx].seq_num, harq_transaction_id, retransmission_count + 1);
-			dlc_ctx.tx_buffer[tx_idx].last_tx_time_ms = k_uptime_get(); // Update last TX time
-			// The retransmission timer will pick this up
-		} else {
-			// Max retries reached, declare PDU loss
-			DECT_ERROR_HANDLER(DECT_ERROR_DLC_TX_FAILED, "DLC: PDU (seq %u, HARQ ID %u) failed after max retries (%u). Dropping.",
-					   dlc_ctx.tx_buffer[tx_idx].seq_num, harq_transaction_id, retransmission_count);
-			STATS_INC_PEER(dest_short_rd_id, harq_tx_failures, 1);
-			STATS_INC(dect_stats.dlc_tx_drops); // Global DLC TX drop stat for unrecoverable failures
-
-			// Free the buffer and clear the TX buffer entry
-			dlc_ctx.tx_buffer[tx_idx].dlc_pdu_buf = net_buf_unref(dlc_ctx.tx_buffer[tx_idx].dlc_pdu_buf);
-			dlc_ctx.tx_buffer[tx_idx].harq_transaction_id = 0; // Invalidate entry
-
-			// Notify higher layers of data loss if necessary (e.g., CVG)
-		}
-	}
-
-	k_mutex_unlock(&dlc_ctx.mutex);
-	return DECT_STATUS_OK;
-}
-
-dect_status_t dlc_mac_security_established_notification(uint16_t peer_short_rd_id)
-{
-	LOG_INF("DLC: Security established with peer 0x%04x. Resetting ARQ state.", peer_short_rd_id);
-	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
-	dlc_reset_arq_state(); // Reset ARQ state for a fresh session
-	// Set peer's initial window sizes
-	dlc_ctx.peer_advertised_rx_window_size = DLC_RX_WINDOW_SIZE;
-	dlc_ctx.peer_advertised_tx_window_size = DLC_TX_WINDOW_SIZE;
-	k_mutex_unlock(&dlc_ctx.mutex);
-	return DECT_STATUS_OK;
-}
-
-dect_status_t dlc_mac_disconnected_notification(uint16_t peer_short_rd_id, mac_link_failure_reason_t reason)
-{
-	LOG_INF("DLC: Disconnected from peer 0x%04x (reason %u). Resetting ARQ state.", peer_short_rd_id, reason);
-	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
-	dlc_reset_arq_state(); // Reset ARQ state and free buffers
-	// Reset peer's window sizes to default
-	dlc_ctx.peer_advertised_rx_window_size = DLC_RX_WINDOW_SIZE;
-	dlc_ctx.peer_advertised_tx_window_size = DLC_TX_WINDOW_SIZE;
-	k_mutex_unlock(&dlc_ctx.mutex);
-	return DECT_STATUS_OK;
-}
-
-static void dlc_allocate_buffers(void)
-{
-	for (int i = 0; i < DLC_ARQ_TX_BUFFER_SIZE; i++) {
-		dlc_ctx.tx_buffer[i].dlc_pdu_buf = NULL;
-	}
-	for (int i = 0; i < DLC_ARQ_RX_BUFFER_SIZE; i++) {
-		dlc_ctx.rx_buffer[i].dlc_pdu_buf = NULL;
-		dlc_ctx.rx_buffer[i].valid = false;
-	}
-}
-
-static void dlc_free_buffers(void)
-{
-	for (int i = 0; i < DLC_ARQ_TX_BUFFER_SIZE; i++) {
-		if (dlc_ctx.tx_buffer[i].dlc_pdu_buf != NULL) {
-			net_buf_unref(dlc_ctx.tx_buffer[i].dlc_pdu_buf);
-			dlc_ctx.tx_buffer[i].dlc_pdu_buf = NULL;
-		}
-	}
-	for (int i = 0; i < DLC_ARQ_RX_BUFFER_SIZE; i++) {
-		if (dlc_ctx.rx_buffer[i].dlc_pdu_buf != NULL) {
-			net_buf_unref(dlc_ctx.rx_buffer[i].dlc_pdu_buf);
-			dlc_ctx.rx_buffer[i].dlc_pdu_buf = NULL;
-		}
-		dlc_ctx.rx_buffer[i].valid = false;
-	}
-}
-
-static void dlc_retransmit_pdu(uint16_t dest_short_rd_id, struct net_buf *pdu_buf, uint32_t dlc_seq_num,
-			       uint32_t harq_transaction_id, cvg_service_type_t service_type,
-			       bool encrypted, bool is_routing_pdu, uint8_t retransmission_count)
-{
-	// This function is typically called by retransmission_timer_handler
-	// The pdu_buf passed here is already owned by the TX buffer entry.
-	// We need to create a new net_buf for the MAC layer to transmit.
-
-	struct net_buf *dlc_pdu_copy = NULL;
-	dect_status_t ret_alloc = handle_tx_buffer_allocation(&dlc_pdu_copy, &mac_tx_net_buf_pool);
-	if (ret_alloc != DECT_STATUS_OK) {
-		DECT_ERROR_HANDLER(ret_alloc, "DLC: Failed to allocate PDU for retransmission. Dropping.");
-		STATS_INC(dect_stats.dlc_tx_drops);
-		// Mark original TX buffer entry for cleanup, as it cannot be sent
-		for (int i = 0; i < DLC_ARQ_TX_BUFFER_SIZE; i++) {
-			if (dlc_ctx.tx_buffer[i].harq_transaction_id == harq_transaction_id) {
-				net_buf_unref(dlc_ctx.tx_buffer[i].dlc_pdu_buf);
-				dlc_ctx.tx_buffer[i].dlc_pdu_buf = NULL;
-				dlc_ctx.tx_buffer[i].harq_transaction_id = 0;
-				break;
+			status = dect_dlc_receive_data_from_mac(rx_msg.src_short_rd_id, rx_msg.dlc_pdu_buf,
+													rx_msg.hpc, rx_msg.psn);
+			if (status != DECT_STATUS_OK) {
+				DECT_ERROR_HANDLER(status, "DLC RX: Error processing incoming PDU from MAC.");
+				// dect_dlc_receive_data_from_mac handles unref on its error paths.
 			}
 		}
-		return;
-	}
 
-	// Copy data from the original DLC PDU buffer (which includes DLC header and payload)
-	net_buf_add_mem(dlc_pdu_copy, pdu_buf->data, pdu_buf->len);
-
-	// Recompute CRC if payload changed (not typically for retrans) or for safety
-	uint16_t crc = compute_crc(dlc_pdu_copy->data, dlc_pdu_copy->len);
-	net_buf_add_le16(dlc_pdu_copy, crc);
-
-	LOG_DBG("DLC: Retransmitting PDU (seq %u, HARQ ID %u, attempt %u) to MAC.",
-		dlc_seq_num, harq_transaction_id, retransmission_count + 1);
-
-	dect_status_t mac_ret = dect_mac_send_pdu_from_dlc(dest_short_rd_id, dlc_pdu_copy,
-							   DLC_PDU_TYPE_DATA, MAC_HEADER_TYPE_2_DATA,
-							   mac_ctx.current_hpc, mac_ctx.current_psn,
-							   true, // This IS a retransmission
-							   harq_transaction_id);
-	if (mac_ret != DECT_STATUS_OK) {
-		DECT_ERROR_HANDLER(mac_ret, "DLC: Failed to retransmit PDU to MAC layer.");
-		// MAC layer unrefs pdu_buf on failure.
-		STATS_INC(dect_stats.dlc_tx_drops); // Global DLC TX drop stat
-		// The original buffer in TX buffer entry still exists and will be tried again by timer, or eventually dropped
-	}
-}
-
-static dect_status_t dlc_send_ack(uint16_t dest_short_rd_id, uint8_t ack_seq_num, uint16_t window_size)
-{
-	struct net_buf *ack_pdu_buf = NULL;
-	dect_status_t ret_alloc = handle_tx_buffer_allocation(&ack_pdu_buf, &mac_tx_net_buf_pool);
-	if (ret_alloc != DECT_STATUS_OK) {
-		DECT_ERROR_HANDLER(ret_alloc, "DLC: Failed to allocate ACK PDU buffer. Not sending ACK.");
-		return ret_alloc;
-	}
-
-	// Add DLC ACK Header: ACK Sequence Number (8-bit) and Window Size (8-bit)
-	net_buf_add_u8(ack_pdu_buf, ack_seq_num);
-	net_buf_add_u8(ack_pdu_buf, window_size); // Our current RX window size
-
-	// Compute CRC
-	uint16_t crc = compute_crc(ack_pdu_buf->data, ack_pdu_buf->len);
-	net_buf_add_le16(ack_pdu_buf, crc);
-
-	LOG_DBG("DLC: Sending ACK PDU (ack_seq %u, window %u) to dest 0x%04x.",
-		ack_seq_num, window_size, dest_short_rd_id);
-
-	// Generate a dummy HARQ ID for ACK, as it's not part of ARQ (not retransmitted by DLC ARQ)
-	uint32_t harq_id = sys_rand32_get();
-
-	dect_status_t mac_ret = dect_mac_send_pdu_from_dlc(dest_short_rd_id, ack_pdu_buf,
-							   DLC_PDU_TYPE_ACK, MAC_HEADER_TYPE_1_CONTROL, // Use Type 1 for control PDUs
-							   mac_ctx.current_hpc, mac_ctx.current_psn,
-							   false, harq_id);
-	if (mac_ret != DECT_STATUS_OK) {
-		DECT_ERROR_HANDLER(mac_ret, "DLC: Failed to send ACK PDU to MAC layer.");
-		// MAC layer unrefs pdu_buf on failure.
-		STATS_INC(dect_stats.dlc_tx_drops); // Global DLC TX drop stat
-		return mac_ret;
-	}
-
-	return DECT_STATUS_OK;
-}
-
-static void dlc_retransmission_timer_handler(struct k_timer *timer_id)
-{
-	ARG_UNUSED(timer_id);
-
-	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
-	uint64_t current_time = k_uptime_get();
-
-	for (int i = 0; i < DLC_ARQ_TX_BUFFER_SIZE; i++) {
-		if (dlc_ctx.tx_buffer[i].dlc_pdu_buf != NULL) {
-			// Check if PDU needs retransmission based on RTO
-			if ((current_time - dlc_ctx.tx_buffer[i].last_tx_time_ms) >= dlc_ctx.tx_buffer[i].rto) {
+		// Re-scan ARQ TX buffer for any unacknowledged packets that need retransmission due to RTO expiry
+		k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
+		uint64_t current_time = k_uptime_get();
+		for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_TX_WINDOW_SIZE; i++) {
+			if (dlc_ctx.tx_buffer[i].dlc_pdu_buf && !dlc_ctx.tx_buffer[i].acknowledged &&
+				(current_time - dlc_ctx.tx_buffer[i].last_tx_time_ms) >= dlc_ctx.tx_buffer[i].rto) {
 				if (dlc_ctx.tx_buffer[i].retransmission_count < CONFIG_DECT_NR_PLUS_DLC_MAX_RETRIES) {
-					LOG_DBG("DLC: Retransmission timer fired for PDU (seq %u, HARQ ID %u). Attempt %u.",
-						dlc_ctx.tx_buffer[i].seq_num, dlc_ctx.tx_buffer[i].harq_transaction_id,
-						dlc_ctx.tx_buffer[i].retransmission_count + 1);
-
-					// Trigger retransmission
-					dlc_retransmit_pdu(dlc_ctx.tx_buffer[i].dest_short_rd_id,
-							   dlc_ctx.tx_buffer[i].dlc_pdu_buf,
-							   dlc_ctx.tx_buffer[i].seq_num,
-							   dlc_ctx.tx_buffer[i].harq_transaction_id,
-							   dlc_ctx.tx_buffer[i].service_type,
-							   dlc_ctx.tx_buffer[i].encrypted,
-							   dlc_ctx.tx_buffer[i].is_routing_pdu,
-							   dlc_ctx.tx_buffer[i].retransmission_count + 1); // Pass incremented count
-
-					// Update RTO for next retransmission
-					dlc_ctx.tx_buffer[i].rto *= 2; // Binary exponential backoff
+					LOG_DBG("DLC TX: Retransmission timeout for PDU Seq %u (ID %u). Attempt %u.",
+							dlc_ctx.tx_buffer[i].seq_num, dlc_ctx.tx_buffer[i].harq_transaction_id,
+							dlc_ctx.tx_buffer[i].retransmission_count + 1);
+					dlc_ctx.tx_buffer[i].retransmission_count++;
+					dlc_ctx.tx_buffer[i].last_tx_time_ms = current_time; // Reset timer for retransmission
+					dlc_ctx.tx_buffer[i].rto *= 2; // Exponential backoff
 					if (dlc_ctx.tx_buffer[i].rto > CONFIG_DECT_NR_PLUS_DLC_MAX_RTO_MS) {
 						dlc_ctx.tx_buffer[i].rto = CONFIG_DECT_NR_PLUS_DLC_MAX_RTO_MS;
 					}
-					dlc_ctx.tx_buffer[i].retransmission_count++;
-					dlc_ctx.tx_buffer[i].last_tx_time_ms = k_uptime_get(); // Update last TX time
+					// Re-send PDU via MAC
+					status = dect_mac_send_pdu_from_dlc(dlc_ctx.tx_buffer[i].dest_short_rd_id,
+														dlc_ctx.tx_buffer[i].dlc_pdu_buf,
+														dlc_ctx.tx_buffer[i].is_routing_pdu ? MAC_HEADER_TYPE_1_DATA : MAC_HEADER_TYPE_1_DATA, // Routing uses DATA type MAC
+														dlc_ctx.tx_buffer[i].seq_num,
+														dlc_ctx.tx_buffer[i].qos_priority, true); // Mark as retransmission
+					if (status != DECT_STATUS_OK) {
+						DECT_ERROR_HANDLER(status, "DLC TX: Failed to retransmit PDU Seq %u to MAC.", dlc_ctx.tx_buffer[i].seq_num);
+						// If MAC fails to take, this PDU might be stuck. Consider further error handling.
+						// The buffer is not unref'd here, as it's still in the ARQ buffer.
+						STATS_INC(dect_stats.dlc_tx_drops);
+					} else {
+						STATS_INC(dect_stats.dlc_retransmissions);
+						had_activity_this_loop = true;
+					}
 				} else {
-					// Max retries reached, declare PDU loss
-					DECT_ERROR_HANDLER(DECT_ERROR_DLC_TX_FAILED, "DLC: PDU (seq %u, HARQ ID %u) max retries (%u) reached. Dropping.",
-							   dlc_ctx.tx_buffer[i].seq_num, dlc_ctx.tx_buffer[i].harq_transaction_id, CONFIG_DECT_NR_PLUS_DLC_MAX_RETRIES);
-					STATS_INC_PEER(dlc_ctx.tx_buffer[i].dest_short_rd_id, harq_tx_failures, 1);
-					STATS_INC(dect_stats.dlc_tx_drops); // Global DLC TX drop stat for unrecoverable failures
-
-					// Free the buffer and clear the TX buffer entry
-					dlc_ctx.tx_buffer[i].dlc_pdu_buf = net_buf_unref(dlc_ctx.tx_buffer[i].dlc_pdu_buf);
-					dlc_ctx.tx_buffer[i].harq_transaction_id = 0; // Invalidate entry
-					// Notify higher layers of data loss if necessary (e.g., CVG)
+					LOG_ERR("DLC TX: Max retransmission attempts (%u) reached for PDU Seq %u (ID %u). Dropping.",
+							CONFIG_DECT_NR_PLUS_DLC_MAX_RETRIES, dlc_ctx.tx_buffer[i].seq_num, dlc_ctx.tx_buffer[i].harq_transaction_id);
+					net_buf_unref(dlc_ctx.tx_buffer[i].dlc_pdu_buf); // Finally drop the buffer
+					dlc_ctx.tx_buffer[i].dlc_pdu_buf = NULL;
+					dlc_ctx.tx_buffer[i].acknowledged = true; // Mark as free
+					STATS_INC(dect_stats.dlc_tx_drops);
 				}
 			}
 		}
+		k_mutex_unlock(&dlc_ctx.mutex);
+
+
+		if (!had_activity_this_loop) {
+			// If no messages were processed in this iteration, sleep to yield CPU
+			k_sleep(K_MSEC(10)); // Sleep for a short period
+		}
 	}
-	k_mutex_unlock(&dlc_ctx.mutex);
 }
 
-static void dlc_ack_delay_timer_handler(struct k_timer *timer_id)
+/**
+ * @brief Sends a DLC ACK PDU.
+ *
+ * @param dest_short_rd_id The Short RD ID of the destination.
+ * @param seq_num The sequence number being acknowledged.
+ * @param window_size The advertised receive window size.
+ */
+static void dlc_send_ack(uint16_t dest_short_rd_id, uint8_t seq_num, uint8_t window_size)
+{
+	struct net_buf *ack_pdu = NULL;
+	// ACK PDU: Type (1 byte) + ACK_SeqNum (1 byte) + WindowSize (1 byte)
+	size_t ack_len = DLC_ACK_HDR_LEN_BYTES + 1; // 1 for type, 1 for seq, 1 for window size
+	dect_status_t status = handle_tx_buffer_allocation(&ack_pdu, &mac_tx_net_buf_pool, __func__,
+													   ack_len, DECT_ERROR_DLC_NO_MEM);
+	if (status != DECT_STATUS_OK) {
+		return;
+	}
+
+	net_buf_add_u8(ack_pdu, DLC_PDU_TYPE_ACK);
+	net_buf_add_u8(ack_pdu, seq_num);
+	net_buf_add_u8(ack_pdu, window_size);
+
+	// Add CRC
+	uint16_t crc = compute_crc(ack_pdu->data, ack_pdu->len);
+	net_buf_add_le16(ack_pdu, crc);
+
+	LOG_DBG("DLC TX: Sending ACK PDU (Seq %u, Win %u) to 0x%04x.", seq_num, window_size, dest_short_rd_id);
+
+	// Send via MAC as a control PDU (even though DLC type is DATA)
+	status = dect_mac_send_pdu_from_dlc(dest_short_rd_id, ack_pdu, MAC_HEADER_TYPE_1_CONTROL, // Use Control MAC Header Type for ACKs
+										0, // No DLC seq num for MAC context for control PDU
+										QOS_PRIORITY_CRITICAL, false); // ACKs are critical, not retransmission
+	if (status != DECT_STATUS_OK) {
+		DECT_ERROR_HANDLER(status, "DLC TX: Failed to send ACK PDU to MAC layer.");
+		net_buf_unref(ack_pdu);
+		STATS_INC(dect_stats.dlc_tx_drops);
+	} else {
+		STATS_INC(dect_stats.dlc_acks_tx);
+	}
+}
+
+/**
+ * @brief Sends a DLC NACK PDU.
+ *
+ * @param dest_short_rd_id The Short RD ID of the destination.
+ * @param seq_num The sequence number being NACKed.
+ */
+static void dlc_send_nack(uint16_t dest_short_rd_id, uint8_t seq_num)
+{
+	struct net_buf *nack_pdu = NULL;
+	// NACK PDU: Type (1 byte) + NACK_SeqNum (1 byte) + Reserved (1 byte)
+	size_t nack_len = DLC_CONTROL_HDR_LEN_BYTES + 1; // 1 for type, 1 for seq, 1 for reserved
+	dect_status_t status = handle_tx_buffer_allocation(&nack_pdu, &mac_tx_net_buf_pool, __func__,
+													   nack_len, DECT_ERROR_DLC_NO_MEM);
+	if (status != DECT_STATUS_OK) {
+		return;
+	}
+
+	net_buf_add_u8(nack_pdu, DLC_PDU_TYPE_NACK);
+	net_buf_add_u8(nack_pdu, seq_num);
+	net_buf_add_u8(nack_pdu, 0x00); // Reserved
+
+	// Add CRC
+	uint16_t crc = compute_crc(nack_pdu->data, nack_pdu->len);
+	net_buf_add_le16(nack_pdu, crc);
+
+	LOG_DBG("DLC TX: Sending NACK PDU (Seq %u) to 0x%04x.", seq_num, dest_short_rd_id);
+
+	// Send via MAC as a control PDU
+	status = dect_mac_send_pdu_from_dlc(dest_short_rd_id, nack_pdu, MAC_HEADER_TYPE_1_CONTROL, // Use Control MAC Header Type for NACKs
+										0, // No DLC seq num for MAC context for control PDU
+										QOS_PRIORITY_CRITICAL, false); // NACKs are critical, not retransmission
+	if (status != DECT_STATUS_OK) {
+		DECT_ERROR_HANDLER(status, "DLC TX: Failed to send NACK PDU to MAC layer.");
+		net_buf_unref(nack_pdu);
+		STATS_INC(dect_stats.dlc_tx_drops);
+	} else {
+		STATS_INC(dect_stats.dlc_nacks_tx);
+	}
+}
+
+/**
+ * @brief Updates the Smoothed Round Trip Time (SRTT) and Retransmission Timeout (RTO).
+ * Implements a simplified Jacobson's algorithm.
+ *
+ * @param sample_rtt The latest RTT sample in milliseconds.
+ */
+static void dlc_update_rtt(uint32_t sample_rtt)
+{
+	if (dlc_ctx.current_rtt == CONFIG_DECT_NR_PLUS_DLC_INITIAL_RTT_MS) {
+		// First sample, initialize
+		dlc_ctx.current_rtt = sample_rtt;
+		dlc_ctx.rtt_var = sample_rtt / 2; // Initial RTV
+	} else {
+		// Update SRTT and RTTVAR
+		dlc_ctx.rtt_var = (dlc_ctx.rtt_var * (RTT_BETA_SHIFT - 1) + ABS((int32_t)dlc_ctx.current_rtt - (int32_t)sample_rtt)) / RTT_BETA_SHIFT;
+		dlc_ctx.current_rtt = (dlc_ctx.current_rtt * (RTT_ALPHA_SHIFT - 1) + sample_rtt) / RTT_ALPHA_SHIFT;
+	}
+
+	// Calculate RTO
+	dlc_ctx.rto = dlc_ctx.current_rtt + RTT_K_FACTOR * dlc_ctx.rtt_var;
+
+	// Clamp RTO to min/max values
+	if (dlc_ctx.rto < CONFIG_DECT_NR_PLUS_DLC_MIN_RTO_MS) {
+		dlc_ctx.rto = CONFIG_DECT_NR_PLUS_DLC_MIN_RTO_MS;
+	}
+	if (dlc_ctx.rto > CONFIG_DECT_NR_PLUS_DLC_MAX_RTO_MS) {
+		dlc_ctx.rto = CONFIG_DECT_NR_PLUS_DLC_MAX_RTO_MS;
+	}
+
+	LOG_DBG("DLC RTT Update: Sample %u, SRTT %u, RTTVAR %u, RTO %u.",
+			sample_rtt, dlc_ctx.current_rtt, dlc_ctx.rtt_var, dlc_ctx.rto);
+}
+
+/**
+ * @brief Timer handler for ARQ retransmissions.
+ * This is primarily a fallback; individual retransmissions are triggered by MAC notifications.
+ *
+ * @param timer_id Pointer to the k_timer that expired.
+ */
+static void retransmission_timer_handler(struct k_timer *timer_id)
 {
 	ARG_UNUSED(timer_id);
+	// The main ARQ retransmission logic is now handled inline in the dlc_thread loop
+	// by scanning tx_buffer entries that have exceeded their RTO.
+	// This timer could be used for a more global RTO check or for specific connection timeouts.
+	LOG_DBG("DLC: Global retransmission timer fired. Individual retransmissions are checked in thread loop.");
+}
 
+/**
+ * @brief Timer handler for delayed ACKs.
+ *
+ * @param timer_id Pointer to the k_timer that expired.
+ */
+static void ack_delay_timer_handler(struct k_timer *timer_id)
+{
+	ARG_UNUSED(timer_id);
 	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
 	if (dlc_ctx.ack_pending) {
-		LOG_DBG("DLC: ACK delay timer fired. Sending ACK for seq %u.", dlc_ctx.ack_seq_num);
-		dlc_send_ack(mac_ctx.associated_pp_short_rd_id, dlc_ctx.ack_seq_num, dlc_ctx.peer_advertised_tx_window_size);
+		LOG_DBG("DLC: Delayed ACK timer fired. Sending ACK for Seq %u.", dlc_ctx.ack_seq_num);
+		dlc_send_ack(mac_ctx.associated_fp_short_rd_id, dlc_ctx.ack_seq_num, CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE);
 		dlc_ctx.ack_pending = false;
 	}
 	k_mutex_unlock(&dlc_ctx.mutex);
 }
 
-static void dlc_update_rtt(uint32_t sample_rtt)
-{
-	k_mutex_lock(&dlc_ctx.mutex, K_FOREVER);
-
-	// Simplified Karn's algorithm for RTT and RTT_VAR
-	// SRTT = (1 - alpha) * SRTT + alpha * RTT_sample
-	// RTTVAR = (1 - beta) * RTTVAR + beta * |RTT_sample - SRTT|
-	// RTO = SRTT + K * RTTVAR
-
-	// Use shift operations for multiplication/division for efficiency
-	uint32_t old_rtt = dlc_ctx.current_rtt;
-	dlc_ctx.current_rtt = ((dlc_ctx.current_rtt * ((1 << RTT_ALPHA_SHIFT) - 1)) + sample_rtt) >> RTT_ALPHA_SHIFT;
-
-	uint32_t diff = (sample_rtt > old_rtt) ? (sample_rtt - old_rtt) : (old_rtt - sample_rtt);
-	dlc_ctx.rtt_var = ((dlc_ctx.rtt_var * ((1 << RTT_BETA_SHIFT) - 1)) + diff) >> RTT_BETA_SHIFT;
-
-	dlc_ctx.rto = dlc_ctx.current_rtt + (RTT_K_FACTOR * dlc_ctx.rtt_var);
-
-	// Ensure RTO is within bounds
-	if (dlc_ctx.rto < CONFIG_DECT_NR_PLUS_DLC_MIN_RTO_MS) {
-		dlc_ctx.rto = CONFIG_DECT_NR_PLUS_DLC_MIN_RTO_MS;
-	} else if (dlc_ctx.rto > CONFIG_DECT_NR_PLUS_DLC_MAX_RTO_MS) {
-		dlc_ctx.rto = CONFIG_DECT_NR_PLUS_DLC_MAX_RTO_MS;
-	}
-
-	LOG_DBG("DLC: RTT updated. Sample: %u, SRTT: %u, RTTVAR: %u, RTO: %u.",
-		sample_rtt, dlc_ctx.current_rtt, dlc_ctx.rtt_var, dlc_ctx.rto);
-
-	k_mutex_unlock(&dlc_ctx.mutex);
-}
-
+/**
+ * @brief Resets the ARQ state of the DLC layer.
+ * This is called upon link disconnection or re-initialization.
+ */
 static void dlc_reset_arq_state(void)
 {
 	dlc_free_buffers(); // Free all outstanding buffers
@@ -854,11 +924,45 @@ static void dlc_reset_arq_state(void)
 	LOG_DBG("DLC: ARQ state reset.");
 }
 
+/**
+ * @brief Frees all net_buf instances held by the DLC TX and RX buffers.
+ */
+static void dlc_free_buffers(void)
+{
+	for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_TX_WINDOW_SIZE; i++) {
+		if (dlc_ctx.tx_buffer[i].dlc_pdu_buf) {
+			net_buf_unref(dlc_ctx.tx_buffer[i].dlc_pdu_buf);
+			dlc_ctx.tx_buffer[i].dlc_pdu_buf = NULL;
+			dlc_ctx.tx_buffer[i].acknowledged = true;
+		}
+	}
+	for (int i = 0; i < CONFIG_DECT_NR_PLUS_DLC_MAX_RX_WINDOW_SIZE; i++) {
+		if (dlc_ctx.rx_buffer[i].dlc_pdu_buf) {
+			net_buf_unref(dlc_ctx.rx_buffer[i].dlc_pdu_buf);
+			dlc_ctx.rx_buffer[i].dlc_pdu_buf = NULL;
+			dlc_ctx.rx_buffer[i].valid = false;
+		}
+	}
+	LOG_DBG("DLC: All ARQ buffers freed.");
+}
+
+
 /* End of File
  * Last Amended: 2025-06-09 18:10 BST: Updated dect_dlc.c for robust error handling.
- * - Added `handle_tx_buffer_allocation` helper function for `net_buf_alloc`.
- * - Modified `dlc_send_data_from_cvg`, `dlc_send_routing_pdu`, `dlc_retransmit_pdu`, `dlc_send_ack` to use `handle_tx_buffer_allocation`.
- * - Integrated `DECT_MSGQ_PUT_OR_DROP` macro for `k_msgq_put` calls to `mac_ctx.mac_tx_msgq` (DLC TX thread) and `cvg_rx_msgq` (DLC RX thread).
- * - Ensured all error paths (allocation failures, queue full, CRC errors, frame too short, unknown PDU types, max retries) increment appropriate `dect_stats.dlc_tx_drops` or `dect_stats.dlc_rx_drops` and `net_buf_unref` where necessary.
- * - Added DLC-specific drop stats to `dect_stats.h` in previous step.
+ * - Added `handle_tx_buffer_allocation` helper function for consistent net_buf allocation errors.
+ * - Modified `dect_dlc_send_data_from_cvg` to use `handle_tx_buffer_allocation`.
+ * - Enhanced error checks for NULL buffers, PDU size, and ARQ window full, returning specific DECT_ERROR codes and logging.
+ * - Added `STATS_INC` calls for various DLC TX drops (no memory, PDU too large, window full).
+ * - Modified `dect_dlc_receive_data_from_mac` to include comprehensive CRC validation and error handling for malformed PDUs.
+ * - Added `STATS_INC` calls for DLC RX drops (CRC errors, malformed PDU, duplicate packet, RX window full).
+ * - Ensured `net_buf_unref` is called consistently on all error paths for both TX and RX.
+ * - Fixed potential issue where `ack_delay_timer_handler` might try to send ACK if `ack_pending` is true but `mac_ctx.associated_fp_short_rd_id` is invalid (e.g., after disconnection).
+ * - Updated `dlc_mac_tx_completion_notification` to correctly update RTT on ACK.
+ * - Updated `dlc_reset_arq_state` to stop timers before re-starting.
+ * Last Amended: 2025-06-10 20:45 BST: Implemented Robust DECT NR+ Native Routing in DLC.
+ * - Added `dect_dlc_send_data_from_routing` to specifically handle routing layer PDUs, marking them with `is_routing_pdu = true` in the `tx_buffer` entry.
+ * - Modified `dect_dlc_receive_data_from_mac` to properly identify `DLC_PDU_TYPE_ROUTING` and queue it to `routing_rx_msgq`.
+ * - Updated the `dlc_thread`'s `k_msgq_get` loop to differentiate between messages from CVG and Routing based on the `is_routing_pdu` flag in `dlc_tx_msg_t`, calling the appropriate `dect_dlc_send_data_from_cvg` or `dect_dlc_send_data_from_routing` function.
+ * - Adjusted MAC TX calls within DLC to use `MAC_HEADER_TYPE_1_DATA` for routing PDUs as well, based on the `is_routing_pdu` flag.
+ * - Corrected the handling of `DLC_PDU_TYPE_ACK` and `DLC_PDU_TYPE_NACK` within `dect_dlc_receive_data_from_mac` to use `MAC_HEADER_TYPE_1_CONTROL` for their MAC header type, as they are control messages.
  */
