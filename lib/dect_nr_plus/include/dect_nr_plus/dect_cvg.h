@@ -20,7 +20,7 @@
 #endif
 
 #include <dect_nr_plus/dect_errors.h>
-#include <dect_nr_plus/dect_types.h> // For dect_cvg_context_t, cvg_service_type_t, etc.
+#include <dect_nr_plus/dect_types.h> // For dect_cvg_context_t, cvg_service_type_t, cvg_tx_queue_entry_t etc.
 
 /**
  * @brief Global CVG context instance.
@@ -28,107 +28,52 @@
  */
 extern dect_cvg_context_t cvg_ctx;
 
-/* Net buffer pool for CVG transmit PDUs */
-NET_BUF_POOL_PROTOTYPE(cvg_tx_net_buf_pool, 10, 256, 0, NULL); // Example: 10 buffers, max 256 bytes
+/* Message queue for net_pkts from higher layers (e.g., application, IP stack) to CVG TX thread */
+extern struct k_msgq cvg_tx_net_pkt_msgq;
 
-/* Message queues for inter-layer communication for net_pkt */
-extern struct k_msgq cvg_tx_net_pkt_msgq; // From network stack to CVG
-
-/**
- * @brief Message structure for data received from DLC to CVG.
- */
-typedef struct {
-	struct net_buf *data_buf; /**< Pointer to the net_buf containing the DLC payload. */
-	uint16_t src_short_rd_id; /**< Short RD ID of the source. */
-	cvg_service_type_t service_type; /**< Service type of the PDU. */
-	bool encrypted; /**< True if the PDU was encrypted. */
-	uint32_t current_hpc; /**< HPC value at receive. */
-	uint16_t current_psn; /**< PSN value at receive. */
-} cvg_rx_msg_t;
-
-extern struct k_msgq cvg_rx_msgq; // From DLC to CVG
+/* Message queue for data from DLC to CVG (for the CVG RX thread) */
+extern struct k_msgq cvg_rx_msgq;
 
 /**
- * @brief CVG context structure.
+ * @brief Initializes the DECT NR+ network interface.
+ * This function is called by the Zephyr network stack to set up the L2 API
+ * and IPv6 IID generation callback for the DECT NR+ interface.
+ *
+ * @param iface Pointer to the network interface being initialized.
+ * @return 0 on success, or a negative error code.
  */
-typedef struct {
-	uint32_t next_tx_frag_id; /**< Next fragmentation ID to use for outgoing PDUs. */
-	struct k_timer reassembly_timer; /**< Timer for SDU reassembly timeout. */
-	K_MUTEX_DEFINE(mutex); /**< Mutex to protect context access. */
-	struct cvg_tx_sdu_entry_t {
-		struct net_pkt *pkt;
-		uint11_t frag_id;
-		uint8_t total_fragments;
-		uint8_t transmitted_fragments;
-		uint8_t current_fragment_idx;
-		struct k_timer tx_timer;
-		uint32_t next_tx_time_ms; // For delaying next fragment TX
-	} tx_sdu_pending[CONFIG_DECT_NR_PLUS_MAX_PENDING_TX_SDUS];
-	uint8_t num_tx_sdu_pending;
+int dect_nr_plus_iface_init(struct net_if *iface);
 
-	struct cvg_rx_sdu_reassembly_t {
-		struct net_pkt *pkt; // The reassembled net_pkt (or first fragment)
-		uint11_t frag_id;
-		uint8_t expected_total_fragments;
-		uint8_t received_fragment_mask; // Bitmask of received fragments
-		struct k_timer reassembly_timeout_timer;
-		uint16_t src_short_rd_id;
-		uint32_t first_hpc; // HPC of the first fragment for reassembly consistency
-	} rx_sdu_active[CONFIG_DECT_NR_PLUS_MAX_REASSEMBLY_SDUS];
-	uint8_t num_rx_sdu_active;
-} dect_cvg_context_t;
+/**
+ * @brief Handles incoming data from the DLC layer to the CVG layer.
+ * This function processes received DLC PDUs, performs IPv6 reassembly if needed,
+ * and passes complete IP packets to the Zephyr network stack.
+ *
+ * @param src_short_rd_id The Short RD ID of the source peer.
+ * @param dlc_pdu_buf The net_buf containing the DLC payload (IP packet/fragment).
+ * @param service_type The CVG service type (e.g., CVG_SERVICE_TYPE_DATA).
+ * @param hpc Half-Permanent Counter from MAC.
+ * @param psn Packet Sequence Number from MAC.
+ * @return DECT_STATUS_OK on success, or an error code.
+ */
+dect_status_t dect_cvg_receive_sdu_from_dlc(uint16_t src_short_rd_id,
+											struct net_buf *dlc_pdu_buf,
+											cvg_service_type_t service_type,
+											uint32_t hpc,
+											uint16_t psn);
 
 /**
  * @brief Initializes the Convergence (CVG) layer.
- * Sets up message queues, timers, and internal state.
+ * Sets up message queues, reassembly context, and timers.
  *
  * @return DECT_STATUS_OK on success, or an error code.
  */
-dect_status_t dect_cvg_init(void);
+void dect_cvg_init(void);
 
 /**
- * @brief Sends an IPv6 packet from the network stack to the CVG layer for transmission.
- * This function handles queuing the net_pkt for the CVG thread to process.
- *
- * @param pkt Pointer to the net_pkt to send. The CVG layer takes ownership.
- * @return 0 on success, or a negative error code.
- */
-int cvg_send_ipv6_pkt(struct net_pkt *pkt);
-
-/**
- * @brief Receives data from the DLC layer and processes it in the CVG layer.
- * This function performs reassembly and passes complete SDUs to the network stack.
- *
- * @param data_buf Pointer to the net_buf containing the DLC payload.
- * @param src_short_rd_id The Short RD ID of the source.
- * @param service_type The service type of the PDU.
- * @param encrypted True if the PDU was encrypted.
- * @param current_hpc Current HPC of the received frame.
- * @param current_psn Current PSN of the received frame.
- * @return DECT_STATUS_OK on success, or an error code.
- */
-dect_status_t dlc_cvg_receive_data(struct net_buf *data_buf,
-								   uint16_t src_short_rd_id,
-								   cvg_service_type_t service_type,
-								   bool encrypted,
-								   uint32_t current_hpc,
-								   uint16_t current_psn);
-
-/**
- * @brief Timer handler for SDU reassembly timeout.
- * This function is called when a reassembly timer expires, indicating a
- * fragmented SDU was not fully received. It frees resources and logs the event.
- *
- * @param timer_id Pointer to the k_timer that expired.
- */
-void cvg_reassembly_timeout_handler(struct k_timer *timer_id);
-
-/**
- * @brief Thread entry point for the Convergence layer.
- *
- * This thread is responsible for processing incoming messages from the DLC
- * layer (for reassembly) and outgoing messages from the network interface
- * (for fragmentation and transmission).
+ * @brief Combined thread entry point for the CVG layer.
+ * This thread handles IPv6 fragmentation and sends data to the DLC layer,
+ * and processes incoming data from the DLC layer, performing reassembly.
  *
  * @param p1 Unused.
  * @param p2 Unused.
@@ -137,55 +82,27 @@ void cvg_reassembly_timeout_handler(struct k_timer *timer_id);
 void dect_cvg_thread(void *p1, void *p2, void *p3);
 
 
-/**
- * @brief Initializes the DECT NR+ L2 network interface.
- * This function is called by the Zephyr network stack during interface setup.
- *
- * @param iface Pointer to the network interface being initialized.
- * @return 0 on success, or a negative error code.
- */
-int dect_nr_plus_iface_init(struct net_if *iface);
-
-/**
- * @brief Get the DECT NR+ L2 network interface API.
- * This macro defines the Zephyr L2 API for our DECT NR+ driver.
- */
-extern const struct net_l2_init dect_nr_plus_l2_api;
-
-/**
- * @brief Custom IPv6 IID generation callback for DECT NR+.
- * Derives the EUI-64 compliant Interface Identifier from the Long RD ID.
- *
- * @param iface Pointer to the network interface.
- * @param iid Pointer to the in6_addr structure to store the generated IID.
- * @return True if IID was generated successfully, false otherwise.
- */
-bool dect_nr_plus_iface_iid_cb(struct net_if *iface, struct in6_addr *iid);
-
-
 #endif /* DECT_CVG_H__ */
 
 /* End of File
  * Last Amended: 2025-06-05 13:00 BST: Updated dect_cvg.h for 6LoWPAN integration and L2 API.
  * - Added `CONFIG_NET_6LO` includes and definitions.
  * - Defined `cvg_tx_net_pkt_msgq` for `net_pkt`s from the network stack.
- * - Updated `cvg_tx_sdu_entry_t` with `pkt` and `next_tx_time_ms`.
+ * - Updated `cvg_tx_sdu_entry_t` with `pkt` and `next_tx_time_ms`. (Replaced by cvg_tx_queue_entry_t)
  * - Updated `cvg_rx_sdu_reassembly_t` with `pkt` and `first_hpc`.
  * - Updated `dect_cvg_init` to reference `cvg_tx_net_pkt_msgq`.
- * - Updated `cvg_send_ipv6_pkt` to take `net_pkt` and queue it.
+ * - Updated `cvg_send_ipv6_pkt` to take `net_pkt` and queue it. (Now static, not in header)
  * - Added `dect_nr_plus_iface_init` and `dect_nr_plus_l2_api` for Zephyr L2 integration.
- * - Added `dect_nr_plus_iface_iid_cb` for custom IPv6 IID generation.
- */
-
-
-/* End of File
- * Last Amended: 2025-06-05 13:00 BST: Updated dect_cvg.h for 6LoWPAN integration and L2 API.
- * - Added `CONFIG_NET_6LO` includes and definitions.
- * - Defined `cvg_tx_net_pkt_msgq` for `net_pkt`s from the network stack.
- * - Updated `cvg_tx_sdu_entry_t` with `pkt` and `next_tx_time_ms`.
- * - Updated `cvg_rx_sdu_reassembly_t` with `pkt` and `first_hpc`.
- * - Updated `dect_cvg_init` to reference `cvg_tx_net_pkt_msgq`.
- * - Updated `cvg_send_ipv6_pkt` to take `net_pkt` and queue it.
- * - Added `dect_nr_plus_iface_init` and `dect_nr_plus_l2_api` for Zephyr L2 integration.
- * - Added `dect_nr_plus_iface_iid_cb` for custom IPv6 IID generation.
+ * - Added `dect_nr_plus_iface_iid_cb` for custom IPv6 IID generation. (Now static, not in header)
+ * Last Amended: 2025-06-10 16:50 BST: Modified dect_cvg.h for IPv6 fragmentation/reassembly.
+ * - Declared `cvg_tx_net_pkt_msgq` as extern to match `dect_cvg.c`.
+ * - Removed `cvg_send_ipv6_pkt` and `dect_nr_plus_iface_iid_cb` prototypes as they are now static within `dect_cvg.c` and part of the `net_l2_api`.
+ * - Added prototype for `cvg_tx_thread`.
+ * - Ensured inclusion of `dect_types.h` for new CVG structs.
+ * Last Amended: 2025-06-10 17:00 BST: Combined `cvg_tx_thread` and `cvg_rx_thread` into `dect_cvg_thread`.
+ * - Updated `dect_cvg.h` to declare `dect_cvg_thread` instead of separate TX/RX threads.
+ * Last Amended: 2025-06-10 17:05 BST: Reverted to separate `cvg_tx_thread` and `cvg_rx_thread` for consistency.
+ * - Updated `dect_cvg.h` to declare `cvg_tx_thread` and `cvg_rx_thread` prototypes again.
+ * Last Amended: 2025-06-10 17:15 BST: Combined CVG TX/RX into a single `dect_cvg_thread` using `k_msgq_get(K_NO_WAIT)` for consistency.
+ * - Updated `dect_cvg.h` to declare only `dect_cvg_thread`.
  */
