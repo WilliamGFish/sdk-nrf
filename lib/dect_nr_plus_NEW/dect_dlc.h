@@ -130,6 +130,119 @@ static inline uint16_t dlc_hdr_t13_segmented_get_offset(const dect_dlc_header_ty
     return sys_be16_to_cpu(hdr->segmentation_offset_be);
 }
 
+/**
+ * @name DLC Control and Extension Headers
+ * @{
+ * Structures and helpers for DLC Control IEs and the Extension Header mechanism,
+ * as per ETSI TS 103 636-5, Clauses 5.3.3.2 and 5.3.3.3.
+ */
+
+/**
+ * @brief DLC Header for Timers Configuration Control IE.
+ * Total 2 octets. (ETSI TS 103 636-5, Figure 5.3.3.2-1).
+ * Used to configure SDU lifetime timers.
+ */
+typedef struct {
+    uint8_t ie_type_val_reserved; // Bits 7-4: IE Type (0b0100), Bits 3-0: Reserved
+    uint8_t lifetime_timer_val;   // The 8-bit lifetime value code from Table 5.3.3.2-2
+} __attribute__((packed)) dect_dlc_header_timers_config_t;
+
+/**
+ * @brief DLC Extension Header Length Type (DLC Ext field).
+ * (ETSI TS 103 636-5, Table 5.3.3.3-1, bits 7-6 of first octet).
+ */
+typedef enum {
+    DLC_EXT_HDR_NO_LEN_FIELD    = 0b00,
+    DLC_EXT_HDR_8BIT_LEN_FIELD  = 0b01,
+    DLC_EXT_HDR_16BIT_LEN_FIELD = 0b10,
+    DLC_EXT_HDR_RESERVED        = 0b11,
+} dect_dlc_ext_len_type_t;
+
+/**
+ * @brief DLC Extension IE Type field values.
+ * (ETSI TS 103 636-5, Table 5.3.3.3-2, bits 5-0 of first octet).
+ */
+typedef enum {
+    DLC_EXT_IE_ROUTING_HEADER = 0b000000,
+    DLC_EXT_IE_CVG_PDU        = 0b000001,
+    DLC_EXT_IE_NEXT_HOP_ADDR  = 0b000010,
+    DLC_EXT_IE_ROUTE_REGISTER = 0b000011,
+    DLC_EXT_IE_ROUTE_ERROR    = 0b000100,
+    // ... other reserved values
+} dect_dlc_ext_ie_type_t;
+
+/**
+ * @brief DLC Extension Header base structure (first octet).
+ * (ETSI TS 103 636-5, Figure 5.3.3.3-1).
+ * This is a generic wrapper for other IEs like Routing Header, Next Hop Address, etc.
+ * The full header may be 1, 2, or 3 bytes depending on the `dlc_ext_len_type`.
+ */
+typedef struct {
+    uint8_t ext_type_and_ie_type; // Bits 7-6: DLC Ext, Bits 5-0: Extension IE Type
+} __attribute__((packed)) dect_dlc_extension_header_t;
+
+// Helpers for dect_dlc_extension_header_t
+static inline void dlc_ext_hdr_set(dect_dlc_extension_header_t *hdr, dect_dlc_ext_len_type_t len_type,
+                                   dect_dlc_ext_ie_type_t ie_type) {
+    hdr->ext_type_and_ie_type = (((uint8_t)len_type & 0x03) << 6) | ((uint8_t)ie_type & 0x3F);
+}
+static inline dect_dlc_ext_len_type_t dlc_ext_hdr_get_len_type(const dect_dlc_extension_header_t *hdr) {
+    return (dect_dlc_ext_len_type_t)((hdr->ext_type_and_ie_type >> 6) & 0x03);
+}
+static inline dect_dlc_ext_ie_type_t dlc_ext_hdr_get_ie_type(const dect_dlc_extension_header_t *hdr) {
+    return (dect_dlc_ext_ie_type_t)(hdr->ext_type_and_ie_type & 0x3F);
+}
+
+/** @} */
+
+/**
+ * @name DLC Information Elements (Payloads for Extension Header)
+ * @{
+ * Structures for IEs that are wrapped by the DLC Extension Header.
+ */
+
+/**
+ * @brief Next Hop Address IE payload.
+ * (ETSI TS 103 636-5, Figure 5.3.3.4-1). 4 bytes total.
+ */
+typedef struct {
+    uint32_t long_rd_id_be;
+} __attribute__((packed)) dect_dlc_ie_next_hop_t;
+
+/**
+ * @brief Route Register IE payload.
+ * (ETSI TS 103 636-5, Figure 5.3.3.5-1). 4 bytes total.
+ */
+typedef struct {
+    uint32_t source_routing_id_be;
+} __attribute__((packed)) dect_dlc_ie_route_register_t;
+
+/**
+ * @brief Route Error IE payload.
+ * (ETSI TS 103 636-5, Figure 5.3.3.6-1). 5 bytes total.
+ */
+typedef struct {
+    uint8_t error_reason;
+    uint32_t invalid_next_hop_addr_be;
+} __attribute__((packed)) dect_dlc_ie_route_error_t;
+
+/**
+ * @brief DLC Routing Header structure.
+ * (ETSI TS 103 636-5, Figure 5.3.4-1). Variable length based on bitmap.
+ * This struct represents the maximum possible fields for simplicity.
+ * Actual serialization/deserialization must be driven by the bitmap field.
+ */
+typedef struct {
+    uint16_t bitmap_be; // Routing bitmap field (2 octets, Big Endian)
+    uint32_t source_addr_be;
+    uint32_t dest_addr_be;
+    uint8_t hop_count;
+    uint8_t hop_limit;
+    uint32_t delay_be;
+    uint8_t sequence_number;
+} __attribute__((packed)) dect_dlc_routing_header_t;
+
+/** @} */
 
 /**
  * @brief Initializes the entire DECT stack (DLC and MAC layers).
