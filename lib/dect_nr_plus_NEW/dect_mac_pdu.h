@@ -165,6 +165,9 @@ int build_beacon_sdu_area_content(uint8_t *target_sdu_area_buf, size_t target_sd
                                   const dect_mac_cluster_beacon_ie_fields_t *cb_fields,
                                   const dect_mac_rach_info_ie_fields_t *rach_beacon_ie_fields);
 
+int build_broadcast_indication_ie_muxed(uint8_t *target_ie_area_buf, size_t target_buf_max_len,
+                                        uint16_t paged_pt_short_id);
+                                                                          
 int build_keep_alive_ie_muxed(uint8_t *target_ie_area_buf, size_t target_buf_max_len);
 
 int build_mac_security_info_ie_muxed(uint8_t *target_ie_area_buf, size_t target_buf_max_len,

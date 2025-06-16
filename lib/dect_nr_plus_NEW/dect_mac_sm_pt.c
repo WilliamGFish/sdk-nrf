@@ -67,6 +67,46 @@ void pt_rach_backoff_timer_expired_action(void) {
     }
 }
 
+void pt_paging_cycle_timer_expired_action(void)
+{
+    dect_mac_context_t* ctx = get_mac_context();
+    if (ctx->state != MAC_STATE_PT_PAGING) {
+        LOG_WRN("PT_PAGING: Paging timer fired in unexpected state %s. Stopping timer.",
+                dect_mac_state_to_str(ctx->state));
+        k_timer_stop(&ctx->role_ctx.pt.paging_cycle_timer);
+        return;
+    }
+
+    if (ctx->pending_op_type != PENDING_OP_NONE) {
+        LOG_WRN("PT_PAGING: Paging listen time, but op %s pending. Will retry shortly.",
+                dect_pending_op_to_str(ctx->pending_op_type));
+        k_timer_start(&ctx->role_ctx.pt.paging_cycle_timer, K_MSEC(100), K_NO_WAIT); // Quick retry
+        return;
+    }
+
+    LOG_INF("PT_PAGING: Waking up to listen for page (on FT carrier %u).",
+            ctx->role_ctx.pt.associated_ft.operating_carrier);
+
+    uint32_t phy_op_handle = sys_rand32_get();
+    // Listen for a short duration, enough to receive a beacon.
+    uint32_t listen_duration_modem_units = get_subslot_duration_ticks(ctx) *
+                                           SUB_SLOTS_PER_ETSI_SLOT * 2; // Listen for 2 slots (10ms)
+
+    int ret = dect_mac_phy_ctrl_start_rx(
+        ctx->role_ctx.pt.associated_ft.operating_carrier,
+        listen_duration_modem_units,
+        NRF_MODEM_DECT_PHY_RX_MODE_SEMICONTINUOUS, // Stop after first unicast or beacon
+        phy_op_handle,
+        0xFFFF, // Listen for broadcast beacons
+        PENDING_OP_PT_PAGING_LISTEN);
+
+    if (ret != 0) {
+        LOG_ERR("PT_PAGING: Failed to schedule RX for paging listen: %d. Retrying shortly.", ret);
+        k_timer_start(&ctx->role_ctx.pt.paging_cycle_timer, K_MSEC(200), K_NO_WAIT);
+    }
+}
+
+
 void pt_rach_response_window_timer_expired_action(void) {
     dect_mac_context_t* ctx = get_mac_context();
     k_timer_stop(&ctx->rach_context.rach_response_window_timer);
@@ -261,6 +301,26 @@ void dect_mac_sm_pt_handle_event(const struct dect_mac_event_msg *msg) {
         case MAC_EVENT_TIMER_EXPIRED_HARQ:
             dect_mac_data_path_handle_harq_nack_action(msg->data.timer_data.id); // Timeout is a NACK
             break;
+        case MAC_EVENT_CMD_ENTER_PAGING_MODE:
+            if (ctx->state == MAC_STATE_ASSOCIATED) {
+                LOG_INF("PT SM: Command received to enter paging mode.");
+                dect_mac_change_state(MAC_STATE_PT_PAGING);
+                // Stop other periodic activity like keep-alives and mobility scans
+                k_timer_stop(&ctx->role_ctx.pt.keep_alive_timer);
+                k_timer_stop(&ctx->role_ctx.pt.mobility_scan_timer);
+                // Start the paging cycle timer. The first listen will happen after one cycle.
+                // TODO: The cycle duration should be negotiated with the FT. Using a hardcoded value for now.
+                uint32_t paging_cycle_ms = 1280; // e.g., ETSI DRF=8 -> 1.28s
+                k_timer_start(&ctx->role_ctx.pt.paging_cycle_timer, K_MSEC(paging_cycle_ms), K_MSEC(paging_cycle_ms));
+            } else {
+                LOG_WRN("PT SM: Ignoring CMD_ENTER_PAGING_MODE in state %s.", dect_mac_state_to_str(ctx->state));
+            }
+            break;
+        case MAC_EVENT_TIMER_EXPIRED_PAGING_CYCLE:
+            if (ctx->state == MAC_STATE_PT_PAGING) {
+                pt_paging_cycle_timer_expired_action();
+            }
+            break;            
         default:
             LOG_DBG("PT SM: Unhandled event type %s in state %s",
                     dect_mac_event_to_str(msg->type), dect_mac_state_to_str(ctx->state));
@@ -287,6 +347,14 @@ static void pt_handle_phy_op_complete_internal(const struct nrf_modem_dect_phy_o
             // The result is handled in pt_handle_phy_rssi_internal.
             // The periodic mobility timer will trigger the next scan.
             break;
+        case PENDING_OP_PT_PAGING_LISTEN:
+            if (ctx->state == MAC_STATE_PT_PAGING) {
+                LOG_DBG("PT_PAGING: Paging listen RX window complete (err %d).", event->err);
+                // The periodic timer will automatically schedule the next listen window.
+                // If a page *was* received, the PDC handler would have already changed
+                // the state out of PAGING, which would stop the timer.
+            }
+            break;            
         case PENDING_OP_PT_SCAN:
             if (event->err == NRF_MODEM_DECT_PHY_ERR_OP_CANCELED) {
                 LOG_INF("PT SM: Scan successfully canceled (Hdl %u). Presuming association attempt follows.", event->handle);
@@ -813,7 +881,13 @@ process_feedback_pt_rx_sec_path:
             const dect_mac_beacon_header_t *bch = (const dect_mac_beacon_header_t *)common_hdr_start_in_payload;
             uint32_t neighbor_ft_long_id = sys_be32_to_cpu(bch->transmitter_long_rd_id_be);
 
-            if (neighbor_ft_long_id != ctx->role_ctx.pt.associated_ft.long_rd_id) {
+            // If we are in paging mode, a beacon from our associated FT might contain a page
+            if (ctx->state == MAC_STATE_PT_PAGING && neighbor_ft_long_id == ctx->role_ctx.pt.associated_ft.long_rd_id) {
+                // TODO: Parse SDU area for Broadcast Indication IE and check if our ID is paged.
+                // For now, we will assume any beacon received from our FT while paging is a page for us.
+                LOG_DBG("PT_PAGING: Received beacon from associated FT while paging. Treating as a page indication.");
+                pt_process_page_indication();
+            } else if (neighbor_ft_long_id != ctx->role_ctx.pt.associated_ft.long_rd_id) {
                 LOG_INF("MOBILITY: Heard beacon from neighbor FT 0x%08X (S:0x%04X) on carrier %u.",
                         neighbor_ft_long_id, ft_sender_short_id_from_pcc,
                         assoc_pcc_event->pcc_params_from_modem.carrier);
@@ -1712,6 +1786,20 @@ static void pt_update_mobility_candidate(uint16_t carrier, int16_t rssi, uint32_
     cand->operating_carrier = carrier;
     cand->rssi_2 = rssi;
     // TODO: `trigger_count_remaining` and `rach_params` would be populated from a beacon.
+}
+
+static void pt_process_page_indication(void)
+{
+    dect_mac_context_t *ctx = get_mac_context();
+    LOG_INF("PT_PAGING: Page received from FT! Transitioning to Associated state to receive data.");
+
+    // Stop the paging cycle
+    k_timer_stop(&ctx->role_ctx.pt.paging_cycle_timer);
+    // Transition back to the normal connected state
+    dect_mac_change_state(MAC_STATE_ASSOCIATED);
+    // Restart normal link supervision
+    k_timer_start(&ctx->role_ctx.pt.keep_alive_timer, K_MSEC(ctx->config.keep_alive_period_ms), K_MSEC(ctx->config.keep_alive_period_ms));
+    // TODO: Schedule an immediate RX window to listen for the pending downlink data.
 }
 
 static void pt_handle_phy_rssi_internal(const struct nrf_modem_dect_phy_rssi_event *event)

@@ -206,6 +206,28 @@ int build_assoc_resp_sdu_area_content(uint8_t *target_sdu_area_buf, size_t targe
 int build_beacon_sdu_area_content(uint8_t *target_sdu_area_buf, size_t target_sdu_area_max_len, const dect_mac_cluster_beacon_ie_fields_t *cb_fields, const dect_mac_rach_info_ie_fields_t *rach_beacon_ie_fields) { /* ... Full implementation from Phase 1 (corrected) ... */ return 0;}
 
 
+int build_broadcast_indication_ie_muxed(uint8_t *target_ie_area_buf, size_t target_buf_max_len,
+                                        uint16_t paged_pt_short_id)
+{
+    // ETSI 6.4.3.7: The payload is a list of Short_RD-IDs.
+    // For simplicity, we will page one PT at a time.
+    uint8_t payload[2];
+    sys_put_be16(paged_pt_short_id, payload);
+    size_t payload_len = sizeof(payload);
+
+    int mux_hdr_len = build_mac_mux_header_internal(target_ie_area_buf, target_buf_max_len,
+                                                  IE_TYPE_BROADCAST_IND, payload_len, 0);
+    if (mux_hdr_len < 0) {
+        return mux_hdr_len;
+    }
+    if ((size_t)mux_hdr_len + payload_len > target_buf_max_len) {
+        return -ENOMEM;
+    }
+
+    memcpy(target_ie_area_buf + mux_hdr_len, payload, payload_len);
+    return mux_hdr_len + payload_len;
+}
+
 int build_keep_alive_ie_muxed(uint8_t *target_ie_area_buf, size_t target_buf_max_len) {
     // Short IE, 0 byte payload. MAC_Ext = 11 (override code 4), Length bit = 0.
     return build_mac_mux_header_internal(target_ie_area_buf, target_buf_max_len,
