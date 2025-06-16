@@ -53,6 +53,9 @@ K_FIFO_DEFINE(g_app_to_cvg_tx_fifo);
 // FIFO for CVG RX Thread -> App communication
 K_FIFO_DEFINE(g_cvg_to_app_rx_fifo);
 
+// FIFO to signal the CVG ARQ service thread which SN needs retransmission
+K_FIFO_DEFINE(g_cvg_retransmit_signal_fifo);
+
 // The TX FIFO now needs to hold more than just the SDU buffer.
 // It needs to know which service the application requested.
 typedef struct {
@@ -67,6 +70,7 @@ K_MEM_SLAB_DEFINE(g_cvg_tx_item_slab, sizeof(cvg_tx_queue_item_t), CVG_APP_BUFFE
 // --- Forward Declarations for Threads ---
 static void cvg_tx_thread_entry(void *p1, void *p2, void *p3);
 static void cvg_rx_thread_entry(void *p1, void *p2, void *p3);
+static void cvg_arq_service_thread_entry(void *p1, void *p2, void *p3);
 
 // --- CVG Layer Threads ---
 K_THREAD_DEFINE(g_cvg_tx_thread_id, CONFIG_DECT_CVG_TX_THREAD_STACK_SIZE,
@@ -77,6 +81,9 @@ K_THREAD_DEFINE(g_cvg_rx_thread_id, CONFIG_DECT_CVG_RX_THREAD_STACK_SIZE,
                 cvg_rx_thread_entry, NULL, NULL, NULL,
                 CONFIG_DECT_CVG_RX_THREAD_PRIORITY, 0, 0);
 
+K_THREAD_DEFINE(g_cvg_arq_service_thread_id, CONFIG_DECT_CVG_TX_SERVICE_THREAD_STACK_SIZE,
+                cvg_arq_service_thread_entry, NULL, NULL, NULL,
+                CONFIG_DECT_CVG_TX_SERVICE_THREAD_PRIORITY, 0, 0);
 
 /**
  * @brief Builds a complete CVG PDU for a transparent service.
@@ -198,6 +205,52 @@ static int send_cvg_arq_feedback(bool ack, uint8_t feedback_info_code, uint16_t 
 
     // Send the PDU to DLC. This is control traffic, might use a higher priority flow eventually.
     return dlc_send_data(DLC_SERVICE_TYPE_0_TRANSPARENT, pdu_buf, pdu_len);
+}
+
+
+/**
+ * @brief CVG ARQ Retransmission Service Thread.
+ *
+ * Waits for signals (NACKs) to retransmit an in-flight CVG SDU.
+ */
+static void cvg_arq_service_thread_entry(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+    LOG_INF("CVG ARQ Service Thread started.");
+
+    uint8_t cvg_pdu_buf[CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE];
+
+    while (1) {
+        // Wait for a signal that a SN needs re-transmitting.
+        uintptr_t sn_to_retransmit = (uintptr_t)k_fifo_get(&g_cvg_retransmit_signal_fifo, K_FOREVER);
+
+        uint16_t buffer_index = (uint16_t)sn_to_retransmit % CVG_MAX_IN_FLIGHT_SDUS;
+        mac_sdu_t *sdu_to_resend = g_default_cvg_flow_ctx.tx_in_flight_sdu[buffer_index];
+
+        if (!sdu_to_resend) {
+            LOG_WRN("CVG_ARQ_SVC: Received re-TX signal for SN %u, but no SDU in buffer. Already ACKed?",
+                    (uint16_t)sn_to_retransmit);
+            continue;
+        }
+
+        LOG_INF("CVG_ARQ_SVC: Retransmitting SDU for SN %u.", (uint16_t)sn_to_retransmit);
+
+        // Build the PDU again with the original SN.
+        int cvg_pdu_len = build_cvg_data_ie_pdu(cvg_pdu_buf, sizeof(cvg_pdu_buf),
+                                                sdu_to_resend->data, sdu_to_resend->len,
+                                                (uint16_t)sn_to_retransmit);
+
+        if (cvg_pdu_len > 0) {
+            // A more advanced system might use a higher priority DLC flow for retransmissions.
+            int err = dlc_send_data(DLC_SERVICE_TYPE_0_TRANSPARENT, cvg_pdu_buf, cvg_pdu_len);
+            if (err) {
+                LOG_ERR("CVG_ARQ_SVC: Failed to re-queue SDU for SN %u (err %d). It will be resent on next NACK/timeout.",
+                        (uint16_t)sn_to_retransmit, err);
+            }
+        } else {
+             LOG_ERR("CVG_ARQ_SVC: Failed to build PDU for re-TX of SN %u.", (uint16_t)sn_to_retransmit);
+        }
+    }
 }
 
 
@@ -415,7 +468,9 @@ static void cvg_rx_thread_entry(void *p1, void *p2, void *p3)
             } else { // NACK
                 // TODO: Handle NACK for Service Type 4. This would involve
                 // marking the SDU in tx_in_flight_sdu for retransmission.
-                LOG_WRN("CVG_ARQ_RX: Received NACK for SN %u. Re-transmission not yet implemented.", sn);
+                LOG_WRN("CVG_ARQ_RX: Received NACK for SN %u. Signaling for re-transmission.", sn);
+                // Signal the ARQ service thread to retransmit this specific SN.
+                k_fifo_put(&g_cvg_retransmit_signal_fifo, (void *)((uintptr_t)sn));
             }
 
         } else if (ie_type == CVG_IE_TYPE_DATA_TRANSPARENT) {
@@ -455,6 +510,7 @@ int dect_cvg_init(void)
     // We can set names for easier debugging.
     k_thread_name_set(g_cvg_tx_thread_id, "dect_cvg_tx");
     k_thread_name_set(g_cvg_rx_thread_id, "dect_cvg_rx");
+    k_thread_name_set(g_cvg_arq_service_thread_id, "cvg_arq_svc");        
 
     // Initialize the flow context
     memset(&g_default_cvg_flow_ctx, 0, sizeof(g_default_cvg_flow_ctx));
