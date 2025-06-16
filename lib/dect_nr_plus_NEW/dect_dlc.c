@@ -99,6 +99,8 @@ static int queue_dlc_pdu_to_mac(const uint8_t *dlc_header, size_t dlc_header_len
 
     return dect_mac_api_send(mac_sdu, mac_qos_flow);
 }
+
+
 static dlc_reassembly_session_t* find_reassembly_session(uint16_t sequence_number)
 {
     for (int i = 0; i < MAX_DLC_REASSEMBLY_SESSIONS; i++) {
@@ -156,14 +158,14 @@ static void dlc_tx_status_cb_handler(uint16_t dlc_sn, bool success)
     k_timer_stop(&job->timeout_timer); // Stop the timeout timer for this job
 
     if (success) {
-        LOG_INF("DLC_ARQ_CB: SUCCESS for SN %u. Freeing job.", dlc_sn);
+        LOG_INF("DLC_ARQ_CB: MAC SUCCESS for SN %u. Freeing job.", dlc_sn);
         // Free the SDU buffer and the job slot
         dect_mac_api_buffer_free(job->sdu_payload);
         job->is_active = false;
     } else {
         // MAC layer has reported permanent failure after all its HARQ retries.
         // The DLC layer will now attempt a full retransmission.
-        LOG_WRN("DLC_ARQ_CB: PERMANENT MAC FAILURE for SN %u. Signaling for DLC re-TX.", dlc_sn);
+        LOG_WRN("DLC_ARQ_CB: MAC PERMANENT FAILURE for SN %u. Signaling for DLC re-TX.", dlc_sn);
         k_fifo_put(&g_dlc_retransmit_signal_fifo, (void *)((uintptr_t)job_idx));
     }
 }
@@ -426,7 +428,6 @@ int dect_dlc_init(void)
     return 0;
 }
 
-
 int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, size_t dlc_sdu_payload_len)
 {
     if (dlc_sdu_payload == NULL && dlc_sdu_payload_len > 0) {
@@ -503,17 +504,11 @@ int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, si
         mac_qos_flow = (service == DLC_SERVICE_TYPE_3_SEGMENTATION_ARQ) ? MAC_FLOW_RELIABLE_DATA : MAC_FLOW_BEST_EFFORT;
         size_t sent_len = 0;
         while (sent_len < dlc_sdu_payload_len) {
-            // ... (The existing segmentation loop from the previous step fits here)
-            // ... with one modification: the call to queue_dlc_pdu_to_mac must pass the `needs_dlc_arq` flag
-            // Note: only the *last segment* needs to trigger the status report, but for simplicity, we can request it for all.
-            // A better optimization is to only set `report_status=true` for the last segment.
-
             uint8_t hdr_buf[sizeof(dect_dlc_header_type13_segmented_t)];
             size_t hdr_len;
             size_t payload_this_segment;
             dlc_segmentation_indication_t si;
             uint16_t seg_offset = 0;
-
             bool is_last_segment = false;
 
             if (sent_len == 0) {
@@ -531,7 +526,7 @@ int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, si
             } else {
                 si = (sent_len == 0) ? DLC_SI_FIRST_SEGMENT : DLC_SI_MIDDLE_SEGMENT;
             }
-            
+
             if (si == DLC_SI_COMPLETE_SDU) {
                 hdr_len = sizeof(dect_dlc_header_type123_basic_t);
                 dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t*)hdr_buf, ie_type, si, dlc_tx_sequence_number);
@@ -541,14 +536,12 @@ int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, si
                  dlc_hdr_t13_segmented_set((dect_dlc_header_type13_segmented_t*)hdr_buf, ie_type, si, dlc_tx_sequence_number, seg_offset);
             }
 
-            // Only the final segment of an ARQ transmission should request a status report.
             bool report_status_for_this_segment = needs_dlc_arq && is_last_segment;
             
             err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload + sent_len, payload_this_segment,
                                        mac_qos_flow, report_status_for_this_segment, dlc_tx_sequence_number);
             if (err) {
                 LOG_ERR("DLC_SEND_SEG: Failed to queue segment (err %d). Aborting send of SN %u.", err, dlc_tx_sequence_number);
-                // If any segment fails, we need to clean up the ARQ job if one was created.
                 if (arq_job) {
                     k_timer_stop(&arq_job->timeout_timer);
                     dect_mac_api_buffer_free(arq_job->sdu_payload);
@@ -566,7 +559,6 @@ int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, si
         return -EINVAL;
     }
 
-    // If an error occurred mid-send and an ARQ job was created, clean it up.
     if (err && arq_job) {
         LOG_WRN("DLC_SEND: Cleaning up ARQ job for SN %u due to send error %d.", dlc_tx_sequence_number, err);
         k_timer_stop(&arq_job->timeout_timer);
@@ -576,8 +568,6 @@ int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, si
 
     return err;
 }
-
-
 
 int dlc_receive_data(dlc_service_type_t *service_type_out,
                      uint8_t *app_level_payload_buf,
