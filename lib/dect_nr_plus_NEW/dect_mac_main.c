@@ -15,8 +15,9 @@
 #include "dect_mac_data_path.h" // For dect_mac_data_path_service_tx()
 
 // For DLC API usage by this "application" main thread
-#include "dect_dlc.h"           // For dect_stack_init, dlc_send_data, dlc_receive_data
-#include "dect_mac_api.h"       // For mac_flow_id_t (used by dlc_send_data indirectly)
+#include "dect_cvg.h"           // For dect_cvg_init, dect_cvg_send, dect_cvg_receive
+#include "dect_mac_api.h"       // For dect_mac_api_init (now called from main)
+#include "dect_dlc.h"           // For the g_dlc_internal_mac_rx_fifo reference
 
 LOG_MODULE_REGISTER(dect_app_main, CONFIG_DECT_APP_MAIN_LOG_LEVEL);
 
@@ -25,6 +26,9 @@ LOG_MODULE_REGISTER(dect_app_main, CONFIG_DECT_APP_MAIN_LOG_LEVEL);
  * Defined in dect_mac_phy_if.c
  */
 extern struct k_msgq mac_event_msgq;
+
+// This now needs to be visible to main for passing to dect_mac_api_init
+extern struct k_fifo g_dlc_internal_mac_rx_fifo;
 
 /**
  * The MAC layer's dedicated thread stack area.
@@ -102,12 +106,9 @@ void main(void)
     LOG_INF("DECT NR+ Application Main Started (Zephyr Main Thread)");
 
     // Initialize settings subsystem (optional, for loading/saving config)
-    // err = settings_subsys_init();
-    // if (err) {
-    //     LOG_ERR("Failed to initialize settings subsystem: %d", err);
-    // } else {
-    // settings_load(); // Load any saved MAC/DLC/App context or config
-    // }
+    // err = settings_subsys_init(); ...
+
+    // --- STACK INITIALIZATION (ORDER IS CRITICAL) ---
 
     // 1. Initialize the MAC's interface to the nRF Modem DECT PHY library.
     // This registers the PHY event handler that queues events to mac_event_msgq.
@@ -117,9 +118,16 @@ void main(void)
         return;
     }
 
-    // 2. Initialize the DECT Stack (DLC and MAC Core).
-    //    dect_stack_init() internally calls dect_mac_api_init() and dect_mac_core_init().
-    // Role selection for demonstration:
+    // 2. Initialize the MAC API layer.
+    // This sets up the buffer slab and registers the DLC's RX FIFO with the MAC.
+    err = dect_mac_api_init(&g_dlc_internal_mac_rx_fifo);
+    if (err) {
+        LOG_ERR("CRITICAL: Failed to initialize MAC API, halting. Err: %d", err);
+        return;
+    }
+
+    // 3. Initialize the MAC Core layer.
+    // This sets up the main context, role, IDs, and timers.
 #if defined(CONFIG_DECT_MAC_ROLE_FT)
     dect_mac_role_t my_role = MAC_ROLE_FT;
     LOG_INF("APP_MAIN: Configuring DECT Stack in FT Role.");
@@ -128,27 +136,32 @@ void main(void)
     LOG_INF("APP_MAIN: Configuring DECT Stack in PT Role.");
 #else
     #error "No DECT MAC role (FT or PT) selected in Kconfig (CONFIG_DECT_MAC_ROLE_...)"
-    return; // Should not happen if Kconfig is set up
 #endif
-
-    // Example: Use a Kconfig for provisioned Long RD ID, or 0 to derive from HW ID.
     uint32_t provisioned_id = CONFIG_DECT_MAC_PROVISIONED_LONG_RD_ID;
-    err = dect_stack_init(my_role, provisioned_id);
+    err = dect_mac_core_init(my_role, provisioned_id);
     if (err) {
-        LOG_ERR("CRITICAL: Failed to initialize DECT stack, halting. Err: %d", err);
+        LOG_ERR("CRITICAL: Failed to initialize MAC Core, halting. Err: %d", err);
         return;
     }
 
-    // 3. Initialize and register application's management service handler (optional)
+    // 4. Initialize the CVG layer (which in turn initializes the DLC layer).
+    err = dect_cvg_init();
+    if (err) {
+        LOG_ERR("CRITICAL: Failed to initialize CVG/DLC layers, halting. Err: %d", err);
+        return;
+    }
+
+
+    // 5. Initialize and register application's management service handler (optional)
     dect_mac_mgmt_service_init();
     dect_mac_mgmt_service_register_callback(app_management_handler);
 
-    // 4. Create and start the dedicated MAC processing thread
+    // 6. Create and start the dedicated MAC processing thread
     dect_mac_thread_id = k_thread_create(&dect_mac_thread_data, dect_mac_stack_area,
                                          K_THREAD_STACK_SIZEOF(dect_mac_stack_area),
                                          dect_mac_thread_entry,
-                                         NULL, NULL, NULL, // p1, p2, p3
-                                         CONFIG_DECT_MAC_THREAD_PRIORITY, // Priority
+                                         NULL, NULL, NULL,
+                                         CONFIG_DECT_MAC_THREAD_PRIORITY,
                                          0, K_NO_WAIT);
     if (dect_mac_thread_id == NULL) {
         LOG_ERR("CRITICAL: Failed to create DECT MAC thread!");
@@ -157,47 +170,55 @@ void main(void)
     k_thread_name_set(dect_mac_thread_id, "dect_mac");
     LOG_INF("DECT MAC Thread created and started.");
 
-    // 5. Start the role-specific MAC State Machine operations
-    //    This should be done *after* the MAC thread is running and ready to process events.
-    //    A brief delay or a sync mechanism could be used if SM start sends immediate events.
-    //    For simplicity, starting it right after thread creation.
+    // 7. Start the role-specific MAC State Machine operations
+    k_sleep(K_MSEC(100)); // Brief delay to ensure threads are scheduled and running
     if (my_role == MAC_ROLE_PT) {
-        dect_mac_sm_pt_start_operation(); // Triggers initial scan for PT
+        dect_mac_sm_pt_start_operation();
     } else { // MAC_ROLE_FT
-        dect_mac_sm_ft_start_operation(); // Triggers initial channel survey/beaconing for FT
+        dect_mac_sm_ft_start_operation();
     }
 
-    // --- Application Main Loop (Example using DLC API) ---
-    uint8_t rx_app_buf[128]; // Application buffer for received data
+    // --- Application Main Loop (Example using CVG API) ---
+    uint8_t rx_app_buf[128];
     int app_tx_counter = 0;
 
     while(1) {
         k_sleep(K_SECONDS(CONFIG_DECT_APP_TX_INTERVAL_S));
 
-        // Example: Application sends data periodically via DLC
+        // Alternate between sending transparent and sequenced data for testing
+        cvg_service_type_t service_to_use;
         char payload_buf[64];
-        snprintk(payload_buf, sizeof(payload_buf), "Hello DECT via DLC! Count: %d", app_tx_counter++);
 
-        LOG_INF("APP_MAIN: Attempting to send: '%s'", payload_buf);
-        err = dlc_send_data(DLC_SERVICE_TYPE_0_TRANSPARENT, // Example service type
-                              (const uint8_t *)payload_buf, strlen(payload_buf));
-        if (err == 0) {
-            LOG_INF("APP_MAIN: DLC Send successful (queued to MAC).");
+        if (app_tx_counter % 2 == 0) {
+            service_to_use = CVG_SERVICE_TYPE_0_TRANSPARENT;
+            snprintk(payload_buf, sizeof(payload_buf), "Transparent data, count: %d", app_tx_counter);
         } else {
-            LOG_WRN("APP_MAIN: dlc_send_data failed: %d", err);
+            service_to_use = CVG_SERVICE_TYPE_1_SEQ_NUM;
+            snprintk(payload_buf, sizeof(payload_buf), "Sequenced data, count: %d", app_tx_counter);
+        }
+        app_tx_counter++;
+
+        LOG_INF("APP_MAIN: Attempting to send (Svc %d): '%s'", service_to_use, payload_buf);
+        err = dect_cvg_send(service_to_use, (const uint8_t *)payload_buf, strlen(payload_buf));
+
+        if (err == 0) {
+            LOG_INF("APP_MAIN: CVG Send successful (queued to CVG TX thread).");
+        } else {
+            LOG_WRN("APP_MAIN: dect_cvg_send failed: %d", err);
         }
 
-        // Example: Application tries to receive data via DLC (non-blocking poll)
-        dlc_service_type_t received_service;
+        // Poll for any received data
         size_t received_len_inout = sizeof(rx_app_buf);
-        err = dlc_receive_data(&received_service, rx_app_buf, &received_len_inout, K_NO_WAIT);
+        err = dect_cvg_receive(rx_app_buf, &received_len_inout, K_NO_WAIT);
 
         if (err == 0) {
-            rx_app_buf[received_len_inout < sizeof(rx_app_buf) ? received_len_inout : sizeof(rx_app_buf) -1] = '\0'; // Null terminate for printing
-            LOG_INF("APP_MAIN: DLC Received data (Service %d, Len %zu): '%s'",
-                    received_service, received_len_inout, rx_app_buf);
-        } else if (err != -EAGAIN) { // -EAGAIN means no data available (expected with K_NO_WAIT)
-            LOG_WRN("APP_MAIN: dlc_receive_data error: %d", err);
+            // Null terminate for safe printing, even if it's not a string
+            rx_app_buf[received_len_inout < sizeof(rx_app_buf) ? received_len_inout : sizeof(rx_app_buf) - 1] = '\0';
+            LOG_INF("APP_MAIN: CVG Received data (Len %zu): '%s'",
+                    received_len_inout, rx_app_buf);
+        } else if (err != -EAGAIN) { // -EAGAIN is expected when no data is ready
+            LOG_WRN("APP_MAIN: dect_cvg_receive error: %d", err);
         }
     }
 }
+

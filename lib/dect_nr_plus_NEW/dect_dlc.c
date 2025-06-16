@@ -269,25 +269,11 @@ static void dlc_rx_thread_entry(void *p1, void *p2, void *p3)
 }
 
 // --- Public API Implementation ---
-int dect_stack_init(dect_mac_role_t role, uint32_t provisioned_long_rd_id)
+int dect_dlc_init(void)
 {
-    int err;
-    LOG_INF("Initializing DECT Stack (DLC & MAC)... Role: %s", (role == MAC_ROLE_PT ? "PT" : "FT"));
-
-    // Initialize MAC API first (provides SDU buffers and TX FIFOs to MAC, registers DLC RX FIFO)
-    err = dect_mac_api_init(&g_dlc_internal_mac_rx_fifo);
-    if (err) {
-        LOG_ERR("Failed to initialize MAC API: %d", err);
-        return err;
-    }
-
-    // Initialize MAC Core (sets up context, IDs, default configs, timers, HARQ processes via data_path_init)
-    err = dect_mac_core_init(role, provisioned_long_rd_id);
-    if (err) {
-        LOG_ERR("Failed to initialize MAC Core: %d", err);
-        // No specific deinit for mac_api if core_init fails before SMs start using it.
-        return err;
-    }
+    // The responsibility of initializing the MAC layer (API and Core) is now
+    // handled by the application's main setup, before the upper layers are initialized.
+    // This function now only initializes resources specific to the DLC layer.
 
     // Initialize reassembly sessions and their timers
     for (int i=0; i < MAX_DLC_REASSEMBLY_SESSIONS; i++) {
@@ -296,12 +282,14 @@ int dect_stack_init(dect_mac_role_t role, uint32_t provisioned_long_rd_id)
         reassembly_sessions[i].is_active = false;
     }
 
-    // Start the DLC RX thread (if not already auto-started by K_THREAD_DEFINE)
-    // k_thread_name_set(g_dlc_rx_thread_id, "dect_dlc_rx"); // Name set by K_THREAD_DEFINE
+    // The DLC RX thread is auto-started by K_THREAD_DEFINE.
+    // We can set its name for easier debugging.
+    k_thread_name_set(g_dlc_rx_thread_id, "dect_dlc_rx");
 
-    LOG_INF("DECT Stack Initialized successfully.");
+    LOG_INF("DLC Layer Initialized.");
     return 0;
 }
+
 
 int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, size_t dlc_sdu_payload_len)
 {

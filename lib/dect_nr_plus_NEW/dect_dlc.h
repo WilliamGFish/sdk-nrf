@@ -245,19 +245,14 @@ typedef struct {
 /** @} */
 
 /**
- * @brief Initializes the entire DECT stack (DLC and MAC layers).
+ * @brief Initializes the DLC layer.
  *
- * This function handles provisioning the device's unique ID from hardware (if not provided by caller)
- * and setting up all underlying layers (MAC Core, MAC Data Path, MAC PHY Interface).
- * It must be called once at boot by the application before any other DECT functions.
+ * Sets up the DLC receive thread and reassembly sessions. This function is
+ * called by the CVG layer during stack initialization.
  *
- * @param role The operational role for this device (PT or FT).
- * @param provisioned_long_rd_id The 32-bit Long RD ID for this device.
- *                               If 0, the stack will attempt to derive one from the hardware ID.
- *                               Must not be 0xFFFFFFFF (broadcast).
  * @return 0 on success, or a negative error code.
  */
-int dect_stack_init(dect_mac_role_t role, uint32_t provisioned_long_rd_id);
+int dect_dlc_init(void);
 
 /**
  * @brief Sends application data (which forms a CVG PDU payload from DLC's perspective)
