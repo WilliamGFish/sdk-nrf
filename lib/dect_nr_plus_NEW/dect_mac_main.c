@@ -178,47 +178,59 @@ void main(void)
         dect_mac_sm_ft_start_operation();
     }
 
+    // --- Application Setup ---
+    // Wait for the stack to become associated before proceeding
+    dect_mac_context_t *ctx = get_mac_context();
+    LOG_INF("APP_MAIN: Waiting for MAC to become associated...");
+    while (ctx->state != MAC_STATE_ASSOCIATED) {
+        k_sleep(K_SECONDS(1));
+    }
+    LOG_INF("APP_MAIN: MAC is associated. Configuring CVG flow control.");
+
+    // Configure a flow-controlled service with a small window size for testing
+    const uint16_t test_window_size = 4;
+    err = dect_cvg_configure_flow(CVG_SERVICE_TYPE_3_FC, test_window_size, 0);
+    if (err) {
+        LOG_ERR("APP_MAIN: Failed to configure CVG flow: %d", err);
+        return;
+    }
+
     // --- Application Main Loop (Example using CVG API) ---
     uint8_t rx_app_buf[128];
     int app_tx_counter = 0;
 
-    while(1) {
+    while (1) {
+        // Send a burst of packets to test the flow control window
+        LOG_INF("APP_MAIN: Sending a burst of %d packets...", test_window_size + 2);
+        for (int i = 0; i < test_window_size + 2; i++) {
+            char payload_buf[64];
+            snprintk(payload_buf, sizeof(payload_buf), "FC Packet %d (Overall %d)", i, app_tx_counter++);
+
+            // Note: The service type is now taken from the configured flow context,
+            // so passing it here is for the TX queue item, but the thread uses the configured one.
+            err = dect_cvg_send(CVG_SERVICE_TYPE_3_FC, (const uint8_t *)payload_buf, strlen(payload_buf));
+            if (err) {
+                LOG_WRN("APP_MAIN: dect_cvg_send failed for burst packet %d: %d", i, err);
+            }
+            // No delay between sends to ensure we fill the window quickly
+        }
+        LOG_INF("APP_MAIN: Burst sent. The CVG TX thread should now be blocked by the window semaphore.");
+
+        // In a real app, this thread would do other work or sleep.
+        // Here, we'll just check for received data and then sleep before the next burst.
+        for (int i = 0; i < 10; i++) {
+             size_t received_len_inout = sizeof(rx_app_buf);
+             err = dect_cvg_receive(rx_app_buf, &received_len_inout, K_MSEC(100)); // Poll for 100ms
+             if (err == 0) {
+                 rx_app_buf[received_len_inout < sizeof(rx_app_buf) ? received_len_inout : sizeof(rx_app_buf) - 1] = '\0';
+                 LOG_INF("APP_MAIN: CVG Received data (Len %zu): '%s'",
+                         received_len_inout, rx_app_buf);
+             } else if (err != -EAGAIN) {
+                 LOG_WRN("APP_MAIN: dect_cvg_receive error: %d", err);
+             }
+        }
+
         k_sleep(K_SECONDS(CONFIG_DECT_APP_TX_INTERVAL_S));
-
-        // Alternate between sending transparent and sequenced data for testing
-        cvg_service_type_t service_to_use;
-        char payload_buf[64];
-
-        if (app_tx_counter % 2 == 0) {
-            service_to_use = CVG_SERVICE_TYPE_0_TRANSPARENT;
-            snprintk(payload_buf, sizeof(payload_buf), "Transparent data, count: %d", app_tx_counter);
-        } else {
-            service_to_use = CVG_SERVICE_TYPE_1_SEQ_NUM;
-            snprintk(payload_buf, sizeof(payload_buf), "Sequenced data, count: %d", app_tx_counter);
-        }
-        app_tx_counter++;
-
-        LOG_INF("APP_MAIN: Attempting to send (Svc %d): '%s'", service_to_use, payload_buf);
-        err = dect_cvg_send(service_to_use, (const uint8_t *)payload_buf, strlen(payload_buf));
-
-        if (err == 0) {
-            LOG_INF("APP_MAIN: CVG Send successful (queued to CVG TX thread).");
-        } else {
-            LOG_WRN("APP_MAIN: dect_cvg_send failed: %d", err);
-        }
-
-        // Poll for any received data
-        size_t received_len_inout = sizeof(rx_app_buf);
-        err = dect_cvg_receive(rx_app_buf, &received_len_inout, K_NO_WAIT);
-
-        if (err == 0) {
-            // Null terminate for safe printing, even if it's not a string
-            rx_app_buf[received_len_inout < sizeof(rx_app_buf) ? received_len_inout : sizeof(rx_app_buf) - 1] = '\0';
-            LOG_INF("APP_MAIN: CVG Received data (Len %zu): '%s'",
-                    received_len_inout, rx_app_buf);
-        } else if (err != -EAGAIN) { // -EAGAIN is expected when no data is ready
-            LOG_WRN("APP_MAIN: dect_cvg_receive error: %d", err);
-        }
     }
 }
 

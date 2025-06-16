@@ -136,6 +136,81 @@ static inline uint16_t cvg_ie_data_base_get_sn(const cvg_ie_data_base_t *base) {
     return (uint16_t)(((base->si_sli_resv_sn_msb & 0x0F) << 8) | base->sequence_number_lsb);
 }
 
+/**
+ * @brief CVG TX Services Config IE structure. Fixed size.
+ * (ETSI TS 103 636-5, Figure 6.3.8-1).
+ * Used to negotiate service parameters for a flow.
+ */
+typedef struct {
+    cvg_header_t header;
+    uint8_t rqrs_reserved_svctype; // Rq/Rs(1b)|Reserved(4b)|ServiceType(3b)
+    uint8_t lifetime;              // 8-bit lifetime code
+    uint16_t max_window_size_be;   // 11-bit value in BE format
+} __attribute__((packed)) cvg_ie_tx_services_cfg_t;
+
+
+/**
+ * @brief CVG ARQ Feedback IE "base" structure. Variable size.
+ * (ETSI TS 103 636-5, Figure 6.3.9-1).
+ * Used to send ACK/NACK information.
+ */
+typedef struct {
+    cvg_header_t header;
+    uint8_t an_fbinfo_sn_msb;      // A/N(1b)|Feedback info(3b)|SN(4b, msb)
+    uint8_t sequence_number_lsb;   // SN(8b, lsb)
+} __attribute__((packed)) cvg_ie_arq_feedback_base_t;
+
+
+/**
+ * @brief CVG ARQ Poll IE structure. Fixed size.
+ * (ETSI TS 103 636-5, Figure 6.3.10-1).
+ * Used to explicitly request an ARQ Feedback IE from the peer.
+ */
+typedef struct {
+    cvg_header_t header;
+    uint16_t sequence_number_be; // Points to the last sent SDU
+} __attribute__((packed)) cvg_ie_arq_poll_t;
+
+
+/**
+ * @brief CVG Data EP IE "base" structure. Variable size.
+ * (ETSI TS 103 636-5, Figure 6.3.5-1).
+ * Combines an Endpoint Mux field with the Data IE fields.
+ */
+typedef struct {
+    uint16_t endpoint_mux_be;
+    cvg_ie_data_base_t data_base;
+} __attribute__((packed)) cvg_ie_data_ep_base_t;
+
+/**
+ * @brief CVG Data IE "base" structure. Variable size.
+ * (ETSI TS 103 636-5, Figure 6.3.4-1).
+ * This struct represents the fields immediately following the CVG header.
+ * Optional fields (SDU Length, Segmentation Offset) and the payload follow this base.
+ */
+typedef struct {
+    uint8_t si_sli_resv_sn_msb;   // SI(2b)|SLI(1b)|Resv(1b)|SN(4b, msb)
+    uint8_t sequence_number_lsb;  // SN(8b, lsb)
+} __attribute__((packed)) cvg_ie_data_base_t;
+
+// --- Helpers for cvg_ie_data_base_t ---
+static inline void cvg_ie_data_base_set(cvg_ie_data_base_t *base, cvg_segmentation_indication_t si,
+                                        bool sli, uint16_t sn_12bit) {
+    base->si_sli_resv_sn_msb = (((uint8_t)si & 0x03) << 6) |
+                               ((sli ? 1 : 0) << 5) |
+                               (((uint8_t)(sn_12bit >> 8) & 0x0F)); // SN ms4b are in bits 3-0
+    base->sequence_number_lsb = (uint8_t)(sn_12bit & 0xFF);
+}
+static inline cvg_segmentation_indication_t cvg_ie_data_base_get_si(const cvg_ie_data_base_t *base) {
+    return (cvg_segmentation_indication_t)((base->si_sli_resv_sn_msb >> 6) & 0x03);
+}
+static inline bool cvg_ie_data_base_get_sli(const cvg_ie_data_base_t *base) {
+    return (base->si_sli_resv_sn_msb >> 5) & 0x01;
+}
+static inline uint16_t cvg_ie_data_base_get_sn(const cvg_ie_data_base_t *base) {
+    return (uint16_t)(((base->si_sli_resv_sn_msb & 0x0F) << 8) | base->sequence_number_lsb);
+}
+
 
 /**
  * @brief CVG Data EP IE "base" structure. Variable size.
@@ -168,6 +243,19 @@ typedef struct {
  * @return 0 on success, or a negative error code on failure.
  */
 int dect_cvg_init(void);
+
+/**
+ * @brief Configures a CVG data flow with specific service parameters.
+ *
+ * For services requiring configuration (like Flow Control), this function must
+ * be called before sending data on that flow.
+ *
+ * @param service The CVG service type to configure.
+ * @param max_window_size The maximum number of unacknowledged SDUs for FC services.
+ * @param lifetime_ms The SDU lifetime in milliseconds for services that use it.
+ * @return 0 on success, or a negative error code.
+ */
+int dect_cvg_configure_flow(cvg_service_type_t service, uint16_t max_window_size, uint32_t lifetime_ms);
 
 /**
  * @brief Sends application data through the DECT stack.
