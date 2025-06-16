@@ -30,7 +30,8 @@ static struct {
 static void pt_handle_phy_op_complete_internal(const struct nrf_modem_dect_phy_op_complete_event *event, pending_op_type_t completed_op_type);
 static void pt_handle_phy_pcc_internal(const struct nrf_modem_dect_phy_pcc_event *event, uint64_t pcc_event_time);
 static void pt_handle_phy_pdc_internal(const struct nrf_modem_dect_phy_pdc_event *pdc_event, const struct nrf_modem_dect_phy_pcc_event *assoc_pcc_event, uint64_t pcc_reception_modem_time);
-// static void pt_handle_phy_rssi_internal(const struct nrf_modem_dect_phy_rssi_event *event); // For mobility (TODO)
+static void pt_handle_phy_rssi_internal(const struct nrf_modem_dect_phy_rssi_event *event);
+static void pt_update_mobility_candidate(uint16_t carrier, int16_t rssi, uint32_t long_id, uint16_t short_id);
 
 static void pt_process_identified_beacon_and_attempt_assoc(dect_mac_context_t *ctx,
                                                            const dect_mac_cluster_beacon_ie_fields_t *cb_fields,
@@ -99,18 +100,45 @@ void dect_mac_sm_pt_keep_alive_timer_expired_action(void) {
     }
 }
 
-void dect_mac_sm_pt_mobility_scan_timer_expired_action(void) {
+void dect_mac_sm_pt_mobility_scan_timer_expired_action(void)
+{
     dect_mac_context_t* ctx = get_mac_context();
-    if (ctx->state == MAC_STATE_ASSOCIATED) { // Only scan for mobility if associated
-        if (ctx->pending_op_type == PENDING_OP_NONE) {
-            LOG_INF("PT SM: Mobility scan timer expired. Initiating background scan (TODO).");
-            // pt_initiate_background_mobility_scan_action(); // TODO
-        } else {
-            LOG_WRN("PT SM: Mobility scan time, but op %s pending.", dect_pending_op_to_str(ctx->pending_op_type));
-        }
+    if (ctx->state != MAC_STATE_ASSOCIATED) { // Only scan for mobility if associated
+        LOG_DBG("PT SM: Mobility scan timer fired but not associated. Restarting general scan.");
+        dect_mac_sm_pt_start_operation();
+        return;
     }
-    // Reschedule regardless of current action for periodic check
-    k_timer_start(&ctx->role_ctx.pt.mobility_scan_timer, K_MSEC(ctx->config.mobility_scan_interval_ms), K_NO_WAIT);
+
+    if (ctx->pending_op_type != PENDING_OP_NONE) {
+        LOG_WRN("PT SM: Mobility scan time, but op %s pending. Deferring scan.",
+                dect_pending_op_to_str(ctx->pending_op_type));
+        // The timer will fire again later.
+        return;
+    }
+
+    // Simple channel selection logic: scan the next channel.
+    // A production system would use a more sophisticated channel hopping sequence.
+    uint16_t current_carrier = ctx->role_ctx.pt.associated_ft.operating_carrier;
+    uint16_t scan_carrier = (current_carrier != 0) ? (current_carrier + 1) : DEFAULT_DECT_CARRIER;
+    // TODO: Add logic to wrap around the valid channel range.
+
+    LOG_INF("PT SM: Starting mobility background RSSI scan on carrier %u.", scan_carrier);
+
+    uint32_t phy_op_handle = sys_rand32_get();
+    // A short scan, e.g., for one or two slots duration.
+    uint32_t scan_duration_modem_units = get_subslot_duration_ticks(ctx) * SUB_SLOTS_PER_ETSI_SLOT * 2;
+
+    int ret = dect_mac_phy_ctrl_start_rssi_scan(
+        scan_carrier,
+        scan_duration_modem_units,
+        NRF_MODEM_DECT_PHY_RSSI_INTERVAL_24_SLOTS, // Get one report for this short scan
+        phy_op_handle,
+        PENDING_OP_PT_MOBILITY_SCAN);
+
+    if (ret != 0) {
+        LOG_ERR("PT SM: Failed to start mobility RSSI scan: %d.", ret);
+        // The periodic timer will try again on its next cycle.
+    }
 }
 
 
@@ -204,7 +232,7 @@ void dect_mac_sm_pt_handle_event(const struct dect_mac_event_msg *msg) {
             }
             break;
         case MAC_EVENT_PHY_RSSI_RESULT:
-            // pt_handle_phy_rssi_internal(&msg->data.rssi); // TODO: For mobility
+            pt_handle_phy_rssi_internal(&msg->data.rssi);
             LOG_DBG("PT SM: RSSI Result received (unhandled for now).");
             break;
         case MAC_EVENT_TIMER_EXPIRED_RACH_BACKOFF:
@@ -254,6 +282,11 @@ static void pt_handle_phy_op_complete_internal(const struct nrf_modem_dect_phy_o
     dect_mac_context_t* ctx = get_mac_context();
 
     switch (completed_op_type) {
+        case PENDING_OP_PT_MOBILITY_SCAN:
+            LOG_DBG("PT SM: Mobility scan op completed (err %d).", event->err);
+            // The result is handled in pt_handle_phy_rssi_internal.
+            // The periodic mobility timer will trigger the next scan.
+            break;
         case PENDING_OP_PT_SCAN:
             if (event->err == NRF_MODEM_DECT_PHY_ERR_OP_CANCELED) {
                 LOG_INF("PT SM: Scan successfully canceled (Hdl %u). Presuming association attempt follows.", event->handle);
@@ -775,6 +808,21 @@ process_feedback_pt_rx_sec_path:
             uint32_t ft_tx_long_id_data = sys_be32_to_cpu(uch->transmitter_long_rd_id_be);
             LOG_INF("PT_SM_PDC: Data SDU Area (len %zu) from FT 0x%04X.", sdu_area_final_len, ft_sender_short_id_from_pcc);
             dect_mac_data_path_handle_rx_sdu(sdu_area_final_ptr, sdu_area_final_len, ft_tx_long_id_data);
+        } else if (mac_hdr_type_octet.mac_header_type == MAC_COMMON_HEADER_TYPE_BEACON) {
+            // Received a beacon while already associated - this must be from a neighbor FT.
+            const dect_mac_beacon_header_t *bch = (const dect_mac_beacon_header_t *)common_hdr_start_in_payload;
+            uint32_t neighbor_ft_long_id = sys_be32_to_cpu(bch->transmitter_long_rd_id_be);
+
+            if (neighbor_ft_long_id != ctx->role_ctx.pt.associated_ft.long_rd_id) {
+                LOG_INF("MOBILITY: Heard beacon from neighbor FT 0x%08X (S:0x%04X) on carrier %u.",
+                        neighbor_ft_long_id, ft_sender_short_id_from_pcc,
+                        assoc_pcc_event->pcc_params_from_modem.carrier);
+                pt_update_mobility_candidate(assoc_pcc_event->pcc_params_from_modem.carrier,
+                                             assoc_pcc_event->rssi_2,
+                                             neighbor_ft_long_id,
+                                             ft_sender_short_id_from_pcc);
+                // TODO: Parse beacon IEs and store RACH info for this candidate.
+            }            
         }
     } else {
         LOG_WRN("PT_SM_PDC: PDC received in unhandled state %s for FT 0x%04X.",
@@ -1606,5 +1654,88 @@ static void pt_authentication_complete_action(dect_mac_context_t* ctx, bool succ
             LOG_ERR("PT_AUTH_COMPLETE: Authentication failed and no valid associated FT. Restarting scan.");
             dect_mac_sm_pt_start_operation(); // Go back to scanning
         }
+    }
+}
+
+
+static void pt_update_mobility_candidate(uint16_t carrier, int16_t rssi, uint32_t long_id, uint16_t short_id)
+{
+    dect_mac_context_t* ctx = get_mac_context();
+    int free_slot = -1;
+    int existing_slot = -1;
+
+    // Check if this candidate (by Long ID) already exists
+    for (int i = 0; i < MAX_MOBILITY_CANDIDATES; i++) {
+        if (ctx->role_ctx.pt.mobility_candidates[i].is_valid) {
+            if (ctx->role_ctx.pt.mobility_candidates[i].long_rd_id == long_id) {
+                existing_slot = i;
+                break;
+            }
+        } else if (free_slot == -1) {
+            free_slot = i;
+        }
+    }
+
+    int target_slot = -1;
+    if (existing_slot != -1) {
+        target_slot = existing_slot;
+        LOG_DBG("MOBILITY: Updating existing candidate in slot %d.", target_slot);
+    } else if (free_slot != -1) {
+        target_slot = free_slot;
+        LOG_INF("MOBILITY: Adding new candidate in slot %d.", target_slot);
+    } else {
+        // No free slots. Find the weakest candidate to replace.
+        int16_t weakest_rssi = 0; // RSSI is negative, so 0 is very strong
+        int weakest_slot = 0;
+        for (int i = 0; i < MAX_MOBILITY_CANDIDATES; i++) {
+            if (ctx->role_ctx.pt.mobility_candidates[i].rssi_2 < weakest_rssi) {
+                weakest_rssi = ctx->role_ctx.pt.mobility_candidates[i].rssi_2;
+                weakest_slot = i;
+            }
+        }
+        if (rssi > weakest_rssi) {
+            target_slot = weakest_slot;
+            LOG_INF("MOBILITY: Evicting weakest candidate (slot %d, RSSI %.1f) for new one (RSSI %.1f).",
+                    target_slot, (float)weakest_rssi / 2.0f, (float)rssi / 2.0f);
+        } else {
+            LOG_DBG("MOBILITY: New candidate (RSSI %.1f) not stronger than weakest in full list (RSSI %.1f). Ignoring.",
+                    (float)rssi / 2.0f, (float)weakest_rssi / 2.0f);
+            return;
+        }
+    }
+
+    // Update the target slot with the new information
+    dect_mobility_candidate_t *cand = &ctx->role_ctx.pt.mobility_candidates[target_slot];
+    cand->is_valid = true;
+    cand->long_rd_id = long_id;
+    cand->short_rd_id = short_id;
+    cand->operating_carrier = carrier;
+    cand->rssi_2 = rssi;
+    // TODO: `trigger_count_remaining` and `rach_params` would be populated from a beacon.
+}
+
+static void pt_handle_phy_rssi_internal(const struct nrf_modem_dect_phy_rssi_event *event)
+{
+    if (event == NULL || event->meas_len == 0) {
+        return;
+    }
+
+    // For mobility, we are just interested in the average channel energy.
+    // If we find a quiet channel, we could schedule a brief RX on it to listen for beacons.
+    int32_t rssi_sum = 0;
+    int valid_count = 0;
+    for (uint16_t i = 0; i < event->meas_len; ++i) {
+        if (event->meas[i] != NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED) {
+            rssi_sum += event->meas[i];
+            valid_count++;
+        }
+    }
+
+    if (valid_count > 0) {
+        int16_t avg_rssi = rssi_sum / valid_count;
+        LOG_DBG("MOBILITY: Scan on carrier %u result: avg RSSI %.1f dBm.", event->carrier, (float)avg_rssi / 2.0f);
+
+        // TODO: Here you would decide if this channel is "interesting" enough to
+        // do a follow-up RX listen for a beacon. For now, this RSSI scan is just a placeholder.
     }
 }

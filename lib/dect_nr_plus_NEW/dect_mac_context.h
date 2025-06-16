@@ -311,6 +311,7 @@ typedef struct {
 typedef struct {
     dect_mac_peer_info_t target_ft;
     dect_mac_peer_info_t associated_ft;
+    
     dect_mobility_candidate_t mobility_candidates[MAX_MOBILITY_CANDIDATES];
     struct k_timer keep_alive_timer;
     struct k_timer mobility_scan_timer;
