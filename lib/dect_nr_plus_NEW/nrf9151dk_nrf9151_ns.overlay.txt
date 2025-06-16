@@ -1,0 +1,8 @@
+/ {
+	dect_nrplus0 {
+		compatible = "nordic,dect-nrplus";
+		status = "okay";
+		/* Use CVG Service Type 1 (Sequenced) for IP traffic */
+		cvg-service-type = <1>;
+	};
+};
