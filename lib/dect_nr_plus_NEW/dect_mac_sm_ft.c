@@ -191,26 +191,41 @@ static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluste
     cb_fields->min_quality_code = 1;         // 3dB
 }
 
-static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sfn_zero_anchor_time, uint8_t sfn_of_anchor_relevance, uint8_t target_sfn_val, uint16_t target_subslot_idx) {
-    if (sfn_zero_anchor_time == 0 && ctx->last_known_modem_time != 0) {
-        uint32_t frame_duration_ticks_calc = (uint32_t)FRAME_DURATION_MS_NOMINAL * (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
-        sfn_zero_anchor_time = ctx->last_known_modem_time - ((uint64_t)sfn_of_anchor_relevance * frame_duration_ticks_calc);
-        if (sfn_zero_anchor_time > ctx->last_known_modem_time && ctx->last_known_modem_time != 0) {
-             sfn_zero_anchor_time = ctx->last_known_modem_time; 
-        }
-    }
+static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sfn_zero_anchor_time,
+                                            uint8_t sfn_of_anchor_relevance, uint8_t target_sfn_val,
+                                            uint16_t target_subslot_idx)
+{
     if (sfn_zero_anchor_time == 0) {
-        LOG_WRN("CALC_TIME: SFN Zero Anchor is 0 or uninitialized, returning near future time for target SFN %u, SS %u.", target_sfn_val, target_subslot_idx);
-        return ctx->last_known_modem_time + modem_us_to_ticks(10000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+        LOG_WRN("CALC_TIME: SFN Zero Anchor is 0. Cannot calculate precise target time.");
+        // Return a time slightly in the future as a fallback.
+        return ctx->last_known_modem_time +
+               modem_us_to_ticks(FRAME_DURATION_MS_NOMINAL * 1000,
+                                 NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
     }
 
-    uint32_t frame_duration_ticks = (uint32_t)FRAME_DURATION_MS_NOMINAL * (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
+    uint32_t frame_duration_ticks = (uint32_t)FRAME_DURATION_MS_NOMINAL *
+                                    (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
     uint32_t subslot_duration_ticks = get_subslot_duration_ticks(ctx);
 
-    uint64_t target_sfn_offset_from_sfn0 = (uint64_t)target_sfn_val * frame_duration_ticks;
+    // Calculate the number of frames between the anchor's SFN and the target SFN,
+    // correctly handling wraparound.
+    int16_t sfn_diff = (int16_t)target_sfn_val - (int16_t)sfn_of_anchor_relevance;
+    if (sfn_diff < -128) { // Target SFN has wrapped around relative to anchor SFN
+        sfn_diff += 256;
+    } else if (sfn_diff > 128) { // Anchor SFN has wrapped around relative to target SFN
+        sfn_diff -= 256;
+    }
+
+    // The anchor relevance time is the modem time when SFN was sfn_of_anchor_relevance
+    uint64_t anchor_relevance_time = sfn_zero_anchor_time +
+                                     ((uint64_t)sfn_of_anchor_relevance * frame_duration_ticks);
+
+    uint64_t target_frame_start_time = anchor_relevance_time +
+                                       ((int64_t)sfn_diff * frame_duration_ticks);
+
     uint64_t target_subslot_offset_in_frame = (uint64_t)target_subslot_idx * subslot_duration_ticks;
 
-    return sfn_zero_anchor_time + target_sfn_offset_from_sfn0 + target_subslot_offset_in_frame;
+    return target_frame_start_time + target_subslot_offset_in_frame;
 }
 
 

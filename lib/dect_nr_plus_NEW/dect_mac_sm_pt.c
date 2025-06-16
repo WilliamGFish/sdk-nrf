@@ -843,19 +843,29 @@ static void pt_process_identified_beacon_and_attempt_assoc(dect_mac_context_t *c
         }
 
 
-        // Estimate FT's SFN 0 time based on received beacon's SFN and reception time
-        if (ctx->ft_sfn_zero_modem_time_anchor == 0 || select_this_ft) { // Update anchor if new FT or first time
-            uint32_t frame_duration_ticks = (uint32_t)FRAME_DURATION_MS_NOMINAL * (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
-            // Estimate start of SFN frame containing the beacon
-            // beacon_pcc_rx_time is when PCC was received. Beacon transmission starts earlier.
-            // For simplicity, assume beacon_pcc_rx_time is roughly start of cb_fields->sfn, subslot 0.
-            // A more precise calculation would subtract typical beacon length and processing delays.
-            uint64_t time_into_sfn_cycle_ticks = (uint64_t)cb_fields->sfn * frame_duration_ticks;
-            ctx->ft_sfn_zero_modem_time_anchor = beacon_pcc_rx_time - time_into_sfn_cycle_ticks;
-            ctx->current_sfn_at_anchor_update = cb_fields->sfn;
-            LOG_INF("PT_BEACON_PROC: Estimated FT SFN0 Anchor: %llu (based on Beacon SFN %u at time %llu)",
+        // Estimate or refine the FT's SFN timing anchor
+        uint32_t frame_duration_ticks = (uint32_t)FRAME_DURATION_MS_NOMINAL *
+                                        (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
+
+        // Calculate a new estimate for SFN 0 based on the current beacon
+        uint64_t new_sfn0_estimate = beacon_pcc_rx_time -
+                                     ((uint64_t)cb_fields->sfn * frame_duration_ticks);
+
+        if (ctx->ft_sfn_zero_modem_time_anchor == 0 || select_this_ft) {
+            // First time seeing this FT, or switching to a new one. Set the anchor directly.
+            ctx->ft_sfn_zero_modem_time_anchor = new_sfn0_estimate;
+            LOG_INF("PT_BEACON_PROC: Set initial FT SFN0 Anchor: %llu (from Beacon SFN %u at time %llu)",
                     ctx->ft_sfn_zero_modem_time_anchor, cb_fields->sfn, beacon_pcc_rx_time);
+        } else {
+            // We already have an anchor. Refine it to compensate for clock drift.
+            // This is a simple averaging filter. A more advanced filter (e.g., Kalman) could be used.
+            // We average the new estimate with the old anchor.
+            ctx->ft_sfn_zero_modem_time_anchor = (ctx->ft_sfn_zero_modem_time_anchor + new_sfn0_estimate) / 2;
+            LOG_DBG("PT_BEACON_PROC: Refined FT SFN0 Anchor: %llu (NewEst: %llu)",
+                    ctx->ft_sfn_zero_modem_time_anchor, new_sfn0_estimate);
         }
+        // Always update the SFN value that corresponds to our latest timing information.
+        ctx->current_sfn_at_anchor_update = cb_fields->sfn;
 
 
         // Copy RACH parameters from parsed IE into PT's operational RACH context for this FT

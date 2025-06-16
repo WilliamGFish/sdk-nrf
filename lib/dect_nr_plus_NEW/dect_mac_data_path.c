@@ -767,206 +767,143 @@ free_slab_and_return_error_tx_sec_path:
     return ret;
 }
 
-void dect_mac_data_path_service_tx(void) {
-    dect_mac_context_t* ctx = get_mac_context();
-    uint64_t current_modem_time = ctx->last_known_modem_time;
-    uint32_t subslot_duration_ticks = get_subslot_duration_ticks(ctx);
-    uint32_t frame_duration_ticks = (uint32_t)MAX_SUBSLOTS_IN_FRAME_NOMINAL * subslot_duration_ticks; // Used by update_next_occurrence
-    uint32_t phy_prep_latency_ticks = modem_us_to_ticks(ctx->phy_latency.idle_to_active_tx_us, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ) +
-                                      modem_us_to_ticks(ctx->phy_latency.scheduled_operation_startup_us, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
-
-    if (ctx->pending_op_type != PENDING_OP_NONE) {
-        // Allow PENDING_OP_FT_RACH_RX_WINDOW to be active while FT services DL data to other PTs,
-        // but not if a TX operation or PT scan is ongoing.
-        // More refined: check if pending_op_type is a TX op or a long RX op that blocks TX.
-        if (! (ctx->role == MAC_ROLE_FT && ctx->pending_op_type == PENDING_OP_FT_RACH_RX_WINDOW) ) {
-             LOG_DBG("DATA_PATH_SVC_TX: PHY op %s pending, deferring TX service.", dect_pending_op_to_str(ctx->pending_op_type));
-             return;
-        }
-    }
-
-    if (current_modem_time == 0 && ctx->state >= MAC_STATE_PT_ASSOCIATING) {
-        LOG_WRN("DATA_PATH_SVC_TX: Modem time not accurately known. Schedule adherence may be impacted.");
-    }
-
-    // 1. Prioritize HARQ Retransmissions
-    for (int i = 0; i < MAX_HARQ_PROCESSES; i++) {
-        dect_harq_tx_process_t *harq_p = &ctx->harq_tx_processes[i];
-        if (harq_p->is_active && harq_p->needs_retransmission) {
-            // Target for retransmission is based on original schedule parameters
-            uint64_t target_re_tx_start_time = harq_p->scheduled_tx_start_time;
-            uint16_t re_tx_carrier = harq_p->scheduled_carrier;
-            int ft_peer_idx_for_re_tx = -1;
-
-            if (ctx->role == MAC_ROLE_FT) {
-                ft_peer_idx_for_re_tx = ft_get_peer_slot_idx(ctx, harq_p->peer_short_id_for_ft_dl);
-                if(ft_peer_idx_for_re_tx == -1) {
-                    LOG_ERR("HARQ ReTX FT: Peer 0x%04X for proc %d no longer valid/found. Discarding HARQ.",
-                            harq_p->peer_short_id_for_ft_dl, i);
-                    // Force discard by maxing out attempts then calling NACK handler
-                    harq_p->tx_attempts = MAX_HARQ_RETRIES;
-                    dect_mac_data_path_handle_harq_nack_action(i);
-                    continue; // Try next HARQ process
-                }
-            } // For PT, target is always associated_ft, implicit in send_data_mac_sdu_via_phy_internal if peer_idx is -1
-
-            // Heuristic: If original scheduled time is too far in the past, try sending "immediately"
-            // This means it will use LBT and whatever slot might be implicitly open due to contention.
-            // This is not ideal for TDMA but ensures reTX attempt if original slot is long gone.
-            // A better approach would be to find the *next actual scheduled slot* for this peer.
-            if (target_re_tx_start_time != 0 && (target_re_tx_start_time + frame_duration_ticks < current_modem_time) ) {
-                LOG_WRN("HARQ ReTX %d: Original slot %llu missed significantly. Attempting immediate TX.",
-                        i, target_re_tx_start_time);
-                target_re_tx_start_time = 0; // Request immediate scheduling attempt
-            }
-            
-            // If a specific start time is still targeted, check if it's too soon.
-            if (target_re_tx_start_time > 0 && target_re_tx_start_time < current_modem_time + phy_prep_latency_ticks) {
-                LOG_WRN("HARQ ReTX %d: Target start %llu too soon for prep (now %llu, prep %u ticks). Sending immediate.",
-                        i, target_re_tx_start_time, current_modem_time, phy_prep_latency_ticks);
-                target_re_tx_start_time = 0; // Try immediate
-            }
-
-            LOG_INF("DATA_PATH_SVC_TX: Attempting HARQ re-TX proc %d (PSN %u, Att %u, RV %u) on C%u, TargetStart %llu",
-                    i, harq_p->original_psn, harq_p->tx_attempts + 1, /* This will be the next attempt */
-                    harq_p->redundancy_version, re_tx_carrier, target_re_tx_start_time);
-
-            int ret = send_data_mac_sdu_via_phy_internal(ctx, harq_p->sdu, i, true /*is_retransmission*/,
-                                                         re_tx_carrier, ft_peer_idx_for_re_tx, target_re_tx_start_time);
-            if (ret == 0) {
-                // If re-TX scheduled successfully, the HARQ timer is restarted inside send_data...
-                // Update the schedule for this peer only if a *scheduled* re-TX was successful.
-                // If target_re_tx_start_time was 0 (immediate), don't update schedule based on this.
-                if (target_re_tx_start_time > 0) {
-                     if (ctx->role == MAC_ROLE_PT) update_next_occurrence(ctx, &ctx->role_ctx.pt.ul_schedule, current_modem_time);
-                     else if (ft_peer_idx_for_re_tx != -1) update_next_occurrence(ctx, &ctx->role_ctx.ft.peer_schedules[ft_peer_idx_for_re_tx], current_modem_time);
-                }
-                return; // One PHY op scheduled, service again later
-            } else {
-                LOG_ERR("DATA_PATH_SVC_TX: Failed to schedule HARQ re-TX for proc %d, err %d. Will retry later.", i, ret);
-                // needs_retransmission remains true. Timer is not running. Next service_tx or timer expiry will retry.
-            }
-            return; // Stop servicing TX for this cycle if a reTX attempt (even if failed to schedule) was made.
-        }
-    }
-
-    // 2. Dequeue New MAC SDUs if TX opportunity and free HARQ process
-    int free_harq_idx = find_free_harq_tx_process(ctx);
-    if (free_harq_idx == -1) {
-        // LOG_DBG("DATA_PATH_SVC_TX: No free HARQ TX processes for new SDU.");
+void dect_mac_data_path_service_tx(void)
+{
+    dect_mac_context_t *ctx = get_mac_context();
+    if (ctx->state < MAC_STATE_ASSOCIATED) {
+        // Only service TX for data when in a connected state
         return;
     }
 
-    dect_mac_schedule_t *active_tx_schedule = NULL;
-    int scheduled_target_peer_idx_for_ft = -1; // For FT role, if a DL slot for a specific PT is found
+    uint64_t current_modem_time = ctx->last_known_modem_time;
+    if (current_modem_time == 0) {
+        LOG_WRN("DATA_PATH_SVC_TX: Modem time not yet known. Deferring TX service.");
+        return;
+    }
 
-    if (ctx->role == MAC_ROLE_PT) {
-        if (ctx->state == MAC_STATE_ASSOCIATED && ctx->role_ctx.pt.associated_ft.is_valid &&
-            ctx->role_ctx.pt.ul_schedule.is_active) {
-            active_tx_schedule = &ctx->role_ctx.pt.ul_schedule;
-        }
-    } else { // MAC_ROLE_FT
-        if (ctx->state == MAC_STATE_FT_BEACONING || ctx->state == MAC_STATE_ASSOCIATED) {
-            for (int i = 0; i < MAX_PEERS_PER_FT; ++i) {
-                if (ctx->role_ctx.ft.connected_pts[i].is_valid &&
-                    ctx->role_ctx.ft.peer_schedules[i].is_active &&
-                    (ctx->role_ctx.ft.peer_schedules[i].alloc_type == RES_ALLOC_TYPE_DOWNLINK ||
-                     ctx->role_ctx.ft.peer_schedules[i].alloc_type == RES_ALLOC_TYPE_BIDIR)) {
-                    // Check if this PT has data pending in its specific queues
-                    if (!k_fifo_is_empty(&ctx->role_ctx.ft.peer_tx_data_fifos[i].high_priority_fifo) ||
-                        !k_fifo_is_empty(&ctx->role_ctx.ft.peer_tx_data_fifos[i].reliable_data_fifo) ||
-                        !k_fifo_is_empty(&ctx->role_ctx.ft.peer_tx_data_fifos[i].best_effort_fifo)) {
-                        active_tx_schedule = &ctx->role_ctx.ft.peer_schedules[i];
-                        scheduled_target_peer_idx_for_ft = i;
-                        break; // Found a PT with data and an active schedule
+    if (ctx->pending_op_type != PENDING_OP_NONE) {
+        // A PHY operation is already in flight. We cannot schedule another one.
+        // Let the current operation complete.
+        LOG_DBG("DATA_PATH_SVC_TX: PHY op %s pending, deferring TX service.",
+                dect_pending_op_to_str(ctx->pending_op_type));
+        return;
+    }
+
+    // --- 1. Prioritize HARQ Retransmissions ---
+    for (int i = 0; i < MAX_HARQ_PROCESSES; i++) {
+        dect_harq_tx_process_t *harq_p = &ctx->harq_tx_processes[i];
+        if (harq_p->is_active && harq_p->needs_retransmission) {
+            // This HARQ process needs a re-TX. We need to find its *next* available slot.
+            // For simplicity, we assume retransmissions use the same schedule as original transmissions.
+            // A more advanced system might have a separate contention-based re-TX schedule.
+            dect_mac_schedule_t *schedule = NULL;
+            int peer_idx = -1;
+
+            if (ctx->role == MAC_ROLE_PT) {
+                schedule = &ctx->role_ctx.pt.ul_schedule;
+            } else { // FT Role
+                peer_idx = ft_get_peer_slot_idx(ctx, harq_p->peer_short_id_for_ft_dl);
+                if (peer_idx != -1) {
+                    schedule = &ctx->role_ctx.ft.peer_schedules[peer_idx];
+                }
+            }
+
+            if (schedule && schedule->is_active) {
+                update_next_occurrence(ctx, schedule, current_modem_time);
+                uint64_t target_start_time = schedule->next_occurrence_modem_time;
+                uint32_t phy_prep_latency_ticks = modem_us_to_ticks(ctx->phy_latency.idle_to_active_tx_us +
+                                                                  ctx->phy_latency.scheduled_operation_startup_us,
+                                                                  NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+
+                if (target_start_time > current_modem_time + phy_prep_latency_ticks) {
+                    LOG_INF("DATA_PATH_SVC_TX: Scheduling HARQ re-TX proc %d for next slot at %llu.",
+                            i, target_start_time);
+
+                    int ret = send_data_mac_sdu_via_phy_internal(ctx, harq_p->sdu, i, true,
+                                                                 schedule->channel, peer_idx,
+                                                                 target_start_time);
+                    if (ret == 0) {
+                        // Mark schedule as used for this cycle by updating to the next occurrence
+                        update_next_occurrence(ctx, schedule, target_start_time);
+                        return; // One operation scheduled per service call
                     }
                 }
             }
         }
     }
 
-    if (active_tx_schedule && active_tx_schedule->is_active) {
-        uint64_t slot_start_modem_time = active_tx_schedule->next_occurrence_modem_time;
-        uint32_t slot_duration_subslots = (active_tx_schedule->alloc_type == RES_ALLOC_TYPE_UPLINK || (active_tx_schedule->alloc_type == RES_ALLOC_TYPE_BIDIR && ctx->role == MAC_ROLE_PT)) ?
-                                          active_tx_schedule->ul_duration_subslots : active_tx_schedule->dl_duration_subslots;
-        uint64_t slot_end_modem_time = slot_start_modem_time + (uint64_t)slot_duration_subslots * subslot_duration_ticks;
-        uint64_t earliest_phy_start_for_sdu = 0;
-        uint16_t new_tx_carrier = active_tx_schedule->channel;
-        bool opportunity_is_now = false;
+    // --- 2. Service New SDUs from TX Queues if no HARQ re-TX was scheduled ---
+    int free_harq_idx = find_free_harq_tx_process(ctx);
+    if (free_harq_idx == -1) {
+        LOG_DBG("DATA_PATH_SVC_TX: No free HARQ TX processes for new SDU.");
+        return;
+    }
 
-        if (current_modem_time + phy_prep_latency_ticks <= slot_end_modem_time && // Enough time left for prep + min op
-            current_modem_time < slot_end_modem_time && // Must start before slot strictly ends
-            (slot_start_modem_time <= current_modem_time + phy_prep_latency_ticks + (subslot_duration_ticks / 2) ) /* Slot is current or starting very soon */
-           ) {
-            opportunity_is_now = true;
-            earliest_phy_start_for_sdu = MAX(current_modem_time + phy_prep_latency_ticks, slot_start_modem_time);
-        } else if (slot_end_modem_time <= current_modem_time && slot_start_modem_time != 0) { // Missed this slot occurrence
-            LOG_DBG("DATA_PATH_SVC_TX: Missed new TX slot for ch %u (ended %llu, now %llu). Updating schedule.",
-                    active_tx_schedule->channel, slot_end_modem_time, current_modem_time);
-            update_next_occurrence(ctx, active_tx_schedule, current_modem_time);
-            // No opportunity this cycle for this schedule
-        }
+    if (ctx->role == MAC_ROLE_PT) {
+        // PT has one uplink schedule and a set of generic FIFOs
+        dect_mac_schedule_t *ul_schedule = &ctx->role_ctx.pt.ul_schedule;
+        if (ul_schedule->is_active) {
+            update_next_occurrence(ctx, ul_schedule, current_modem_time);
+            uint64_t target_start_time = ul_schedule->next_occurrence_modem_time;
+            uint32_t phy_prep_latency_ticks = modem_us_to_ticks(ctx->phy_latency.idle_to_active_tx_us +
+                                                              ctx->phy_latency.scheduled_operation_startup_us,
+                                                              NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
 
-
-        if (opportunity_is_now) {
-            mac_sdu_t *sdu_to_send = NULL;
-            mac_flow_id_t dequeued_from_flow = MAC_FLOW_COUNT;
-            struct k_fifo ** fifos_to_check_list = (ctx->role == MAC_ROLE_PT) ? mac_tx_fifos :
-                (struct k_fifo*[]){
-                    &ctx->role_ctx.ft.peer_tx_data_fifos[scheduled_target_peer_idx_for_ft].high_priority_fifo,
-                    &ctx->role_ctx.ft.peer_tx_data_fifos[scheduled_target_peer_idx_for_ft].reliable_data_fifo,
-                    &ctx->role_ctx.ft.peer_tx_data_fifos[scheduled_target_peer_idx_for_ft].best_effort_fifo
-                };
-
-            for (int flow_idx = 0; flow_idx < MAC_FLOW_COUNT; flow_idx++) {
-                sdu_to_send = k_fifo_get(fifos_to_check_list[flow_idx], K_NO_WAIT);
-                if (sdu_to_send) {
-                    dequeued_from_flow = (mac_flow_id_t)flow_idx;
-                    break;
-                }
-            }
-
-            if (sdu_to_send) {
-                uint8_t pcc_pkt_len_f, pcc_mcs_f, pcc_pkt_len_type_f;
-                // Approx PDC len: SDU content + UnicastHeader + MIC (if secured)
-                // This needs to be consistent with send_data_mac_sdu_via_phy_internal PDU construction
-                bool link_will_be_secured = (ctx->role == MAC_ROLE_PT) ? (ctx->role_ctx.pt.associated_ft.is_secure && ctx->keys_provisioned) :
-                                           (scheduled_target_peer_idx_for_ft != -1 && ctx->role_ctx.ft.connected_pts[scheduled_target_peer_idx_for_ft].is_secure && ctx->role_ctx.ft.keys_provisioned_for_peer[scheduled_target_peer_idx_for_ft]);
-                size_t sdu_pdc_len_approx = sdu_to_send->len + sizeof(dect_mac_unicast_header_t) + (link_will_be_secured ? 5 : 0);
-
-                dect_mac_phy_ctrl_calculate_pcc_params(sdu_pdc_len_approx, &pcc_pkt_len_f, &pcc_mcs_f, &pcc_pkt_len_type_f);
-                uint32_t sdu_tx_duration_subslots_needed = pcc_pkt_len_f + 1; // N-1 coded
-                if (pcc_pkt_len_type_f == 1) sdu_tx_duration_subslots_needed *= SUB_SLOTS_PER_ETSI_SLOT;
-                uint64_t sdu_tx_duration_ticks_needed = (uint64_t)sdu_tx_duration_subslots_needed * subslot_duration_ticks;
-
-                if (earliest_phy_start_for_sdu + sdu_tx_duration_ticks_needed <= slot_end_modem_time) {
-                    LOG_INF("DATA_PATH_SVC_TX: New SDU (Flow %d, len %u) for HARQ %d on C%u. TargetStart %llu. PeerIdx(FT):%d",
-                            dequeued_from_flow, sdu_to_send->len, free_harq_idx, new_tx_carrier, earliest_phy_start_for_sdu, scheduled_target_peer_idx_for_ft);
-
-                    int ret = send_data_mac_sdu_via_phy_internal(ctx, sdu_to_send, free_harq_idx, false,
-                                                                 new_tx_carrier, scheduled_target_peer_idx_for_ft, earliest_phy_start_for_sdu);
-                    if (ret == 0) { // Successfully scheduled
-                        update_next_occurrence(ctx, active_tx_schedule, current_modem_time); // Update for next time
-                        // Ownership of sdu_to_send passed to HARQ process
-                    } else { // Failed to schedule with PHY
-                        k_fifo_put(fifos_to_check_list[dequeued_from_flow], sdu_to_send); // Put SDU back
+            if (target_start_time > current_modem_time + phy_prep_latency_ticks) {
+                // We have a valid future slot. Check if there's data to send.
+                for (int flow_idx = 0; flow_idx < MAC_FLOW_COUNT; flow_idx++) {
+                    mac_sdu_t *sdu = k_fifo_get(mac_tx_fifos[flow_idx], K_NO_WAIT);
+                    if (sdu) {
+                        // TODO: PDU Fit Check - ensure this SDU fits in the scheduled slot duration.
+                        int ret = send_data_mac_sdu_via_phy_internal(ctx, sdu, free_harq_idx, false,
+                                                                     ul_schedule->channel, -1,
+                                                                     target_start_time);
+                        if (ret == 0) {
+                            update_next_occurrence(ctx, ul_schedule, target_start_time);
+                        } else {
+                            k_fifo_put_first(mac_tx_fifos[flow_idx], sdu); // Re-queue at the front
+                        }
+                        return; // One attempt per service call
                     }
-                    return; // One PHY op attempt per service call
-                } else {
-                    LOG_DBG("DATA_PATH_SVC_TX: SDU from Flow %d needs %u ticks, but slot for Ch %u only has ~%llu remaining. Re-queuing.",
-                            dequeued_from_flow, (uint32_t)sdu_tx_duration_ticks_needed, new_tx_carrier,
-                            (slot_end_modem_time > earliest_phy_start_for_sdu) ? (slot_end_modem_time - earliest_phy_start_for_sdu) : 0);
-                    k_fifo_put(fifos_to_check_list[dequeued_from_flow], sdu_to_send);
-                    // This slot is too short for this SDU. Update schedule to its next opportunity.
-                    update_next_occurrence(ctx, active_tx_schedule, current_modem_time);
                 }
-            } else { // No SDU in queues for this active slot
-                 // If the slot was valid but no data, still update its next occurrence
-                 update_next_occurrence(ctx, active_tx_schedule, current_modem_time);
             }
-        } // if opportunity_is_now
-    } // if active_tx_schedule
+        }
+    } else { // FT Role - iterate through connected PTs
+        for (int i = 0; i < MAX_PEERS_PER_FT; i++) {
+            if (ctx->role_ctx.ft.connected_pts[i].is_valid && ctx->role_ctx.ft.peer_schedules[i].is_active) {
+                dect_mac_schedule_t *dl_schedule = &ctx->role_ctx.ft.peer_schedules[i];
+                update_next_occurrence(ctx, dl_schedule, current_modem_time);
+                uint64_t target_start_time = dl_schedule->next_occurrence_modem_time;
+                uint32_t phy_prep_latency_ticks = modem_us_to_ticks(ctx->phy_latency.idle_to_active_tx_us +
+                                                                  ctx->phy_latency.scheduled_operation_startup_us,
+                                                                  NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+
+                if (target_start_time > current_modem_time + phy_prep_latency_ticks) {
+                    // This peer has a valid future slot. Check its FIFOs.
+                    dect_mac_peer_tx_fifo_set_t *fifos = &ctx->role_ctx.ft.peer_tx_data_fifos[i];
+                    mac_sdu_t *sdu = NULL;
+                    sdu = k_fifo_get(&fifos->high_priority_fifo, K_NO_WAIT);
+                    if (!sdu) sdu = k_fifo_get(&fifos->reliable_data_fifo, K_NO_WAIT);
+                    if (!sdu) sdu = k_fifo_get(&fifos->best_effort_fifo, K_NO_WAIT);
+
+                    if (sdu) {
+                        // TODO: PDU Fit Check
+                        int ret = send_data_mac_sdu_via_phy_internal(ctx, sdu, free_harq_idx, false,
+                                                                     dl_schedule->channel, i,
+                                                                     target_start_time);
+                        if (ret == 0) {
+                            update_next_occurrence(ctx, dl_schedule, target_start_time);
+                        } else {
+                            k_fifo_put_first(&fifos->high_priority_fifo, sdu); // Re-queue to HP for simplicity
+                        }
+                        return; // One attempt per service call
+                    }
+                }
+            }
+        }
+    }
 }
+
 
 
 void dect_mac_data_path_handle_rx_sdu(const uint8_t *mac_sdu_area_data,
