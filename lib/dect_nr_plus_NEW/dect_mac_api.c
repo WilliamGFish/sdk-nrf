@@ -66,7 +66,7 @@ mac_sdu_t* dect_mac_api_buffer_alloc(k_timeout_t timeout)
 {
     mac_sdu_t *sdu = NULL;
     int ret = k_mem_slab_alloc(&g_mac_sdu_slab, (void **)&sdu, timeout);
-    if (ret != 0) {
+    if (ret != 0) {                
         // LOG_WRN: Use WRN for transient failures like timeout, ERR for persistent.
         if (K_TIMEOUT_EQ(timeout, K_NO_WAIT) && ret == -ENOMEM) { // Changed from -EAGAIN to -ENOMEM for k_mem_slab_alloc
              LOG_DBG("Failed to allocate MAC SDU buffer (no wait), slab empty or err: %d", ret);
@@ -77,9 +77,8 @@ mac_sdu_t* dect_mac_api_buffer_alloc(k_timeout_t timeout)
         }
         return NULL;
     }
-    // It's good practice to initialize the SDU structure, especially len.
-    // The data buffer itself doesn't strictly need clearing if len correctly tracks content.
-    memset(sdu, 0, sizeof(mac_sdu_t)); // Clears fifo_reserved, data, len, target_peer_short_rd_id
+    // This memset correctly initializes the new boolean field to false and the SN to 0.
+    memset(sdu, 0, sizeof(mac_sdu_t));
     return sdu;
 }
 

@@ -83,6 +83,9 @@ typedef struct mac_sdu {
     uint8_t data[CONFIG_DECT_MAC_SDU_MAX_SIZE];
     uint16_t len;
     uint16_t target_peer_short_rd_id;
+    // --- Fields for DLC ARQ Status Reporting ---
+    bool dlc_status_report_required;
+    uint16_t dlc_sn_for_status;    
 } mac_sdu_t;
 #endif
 

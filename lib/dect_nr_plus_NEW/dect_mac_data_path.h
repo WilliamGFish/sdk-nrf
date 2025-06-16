@@ -6,6 +6,7 @@
 #include <stdint.h>             // For uintxx_t types
 #include <stddef.h>             // For size_t
 #include <nrf_modem_dect_phy.h> // For union nrf_modem_dect_phy_feedback
+#include "dect_dlc.h"           // For dlc_tx_status_cb_t
 
 /**
  * @brief Initializes the MAC data path module.
@@ -15,6 +16,17 @@
  * primarily initializing the HARQ process structures and their associated timers.
  */
 void dect_mac_data_path_init(void);
+
+/**
+ * @brief Registers the DLC's callback for TX status reports.
+ *
+ * The DLC layer calls this during its initialization to provide the MAC data
+ * path with a function to call when a reportable SDU transmission is complete.
+ *
+ * @param cb The DLC's callback handler function.
+ */
+void dect_mac_data_path_register_dlc_callback(dlc_tx_status_cb_t cb);
+
 
 /**
  * @brief Services the transmit (TX) queues, HARQ retransmissions, and scheduled TX opportunities.

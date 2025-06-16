@@ -15,6 +15,9 @@
 
 LOG_MODULE_REGISTER(dect_mac_data_path, CONFIG_DECT_MAC_DATA_PATH_LOG_LEVEL);
 
+// Function pointer to the DLC's callback for reporting final TX status.
+static dlc_tx_status_cb_t g_dlc_status_callback = NULL;
+
 // External FIFOs and slab (defined in dect_mac_api.c)
 extern struct k_fifo * const mac_tx_fifos[]; // Generic TX FIFOs (used by PT for UL)
 extern struct k_fifo *g_dlc_rx_sdu_fifo_ptr; // Pointer to DLC's RX FIFO
@@ -178,6 +181,12 @@ void dect_mac_data_path_init(void) {
     LOG_INF("MAC Data Path Initialized (HARQ Timers and Processes set up).");
 }
 
+void dect_mac_data_path_register_dlc_callback(dlc_tx_status_cb_t cb)
+{
+    g_dlc_status_callback = cb;
+    LOG_INF("DLC TX status callback registered with MAC Data Path.");
+}
+
 static int find_free_harq_tx_process(dect_mac_context_t* ctx) {
     if (!ctx) return -1;
     for (int i = 0; i < MAX_HARQ_PROCESSES; i++) {
@@ -227,6 +236,10 @@ void dect_mac_data_path_handle_harq_ack_action(int harq_process_idx) {
         LOG_INF("HARQ_ACK: ACK received for HARQ process %d (PSN: %u, Attempts: %u).",
                 harq_process_idx, harq_p->original_psn, harq_p->tx_attempts);
         k_timer_stop(&harq_p->retransmission_timer);
+        if (harq_p->sdu && harq_p->sdu->dlc_status_report_required && g_dlc_status_callback) {
+            LOG_DBG("HARQ_ACK: Reporting success to DLC for SN %u.", harq_p->sdu->dlc_sn_for_status);
+            g_dlc_status_callback(harq_p->sdu->dlc_sn_for_status, true);
+        }        
         if (harq_p->sdu) {
             dect_mac_api_buffer_free(harq_p->sdu); // Free the SDU buffer
             harq_p->sdu = NULL;
@@ -260,6 +273,10 @@ void dect_mac_data_path_handle_harq_nack_action(int harq_process_idx) {
         if (harq_p->tx_attempts >= MAX_HARQ_RETRIES) {
             LOG_ERR("HARQ_NACK: Max retries (%u) reached for HARQ process %d (PSN: %u). Discarding SDU.",
                     MAX_HARQ_RETRIES, harq_process_idx, harq_p->original_psn);
+            if (harq_p->sdu && harq_p->sdu->dlc_status_report_required && g_dlc_status_callback) {
+                LOG_DBG("HARQ_NACK: Reporting permanent failure to DLC for SN %u.", harq_p->sdu->dlc_sn_for_status);
+                g_dlc_status_callback(harq_p->sdu->dlc_sn_for_status, false);
+            }                    
             if (harq_p->sdu) {
                 dect_mac_api_buffer_free(harq_p->sdu);
                 harq_p->sdu = NULL;

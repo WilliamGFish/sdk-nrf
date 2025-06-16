@@ -14,6 +14,9 @@ LOG_MODULE_REGISTER(dect_dlc, CONFIG_DECT_DLC_LOG_LEVEL);
 
 // --- DLC Internal State and Buffers ---
 #define MAX_DLC_REASSEMBLY_SESSIONS 4
+#define MAX_DLC_RETRANSMISSION_JOBS 8
+#define DLC_RETRANSMISSION_TIMEOUT_MS 10000 // e.g., 10 seconds
+#define DLC_MAX_RETRIES 3
 // REASSEMBLY_BUF_SIZE should be large enough for the largest possible *CVG PDU* after reassembly.
 // This is a placeholder size. A real system would need this configurable or dynamically sized.
 #define DLC_REASSEMBLY_BUF_SIZE (CONFIG_DECT_MAC_SDU_MAX_SIZE * 4) // Example: Can reassemble up to ~4 MAC SDUs
@@ -21,6 +24,18 @@ LOG_MODULE_REGISTER(dect_dlc, CONFIG_DECT_DLC_LOG_LEVEL);
 
 // Sequence number for DLC Service Types 1, 2, 3 (10-bit)
 static uint16_t dlc_tx_sequence_number = 0; // Per DLC entity set, or global if only one logical link active
+
+typedef struct {
+    bool is_active;
+    uint16_t sequence_number;
+    uint8_t retries;
+    dlc_service_type_t service;
+    mac_sdu_t *sdu_payload; // Holds the original DLC SDU payload
+    struct k_timer timeout_timer;
+} dlc_retransmission_job_t;
+
+static dlc_retransmission_job_t retransmission_jobs[MAX_DLC_RETRANSMISSION_JOBS];
+
 
 typedef struct {
     bool is_active;
@@ -40,17 +55,21 @@ static dlc_reassembly_session_t reassembly_sessions[MAX_DLC_REASSEMBLY_SESSIONS]
 K_FIFO_DEFINE(g_dlc_internal_mac_rx_fifo);
 // FIFO for fully reassembled DLC SDUs (CVG PDUs) to be passed to the application layer
 K_FIFO_DEFINE(g_dlc_to_app_rx_fifo);
-
+// FIFO to signal the DLC TX service thread which job index needs retransmission
+K_FIFO_DEFINE(g_dlc_retransmit_signal_fifo);
 
 // --- Forward Declarations ---
 static void dlc_reassembly_timeout_handler(struct k_timer *timer_id);
+static void dlc_retransmission_timeout_handler(struct k_timer *timer_id);
+static void dlc_tx_service_thread_entry(void *p1, void *p2, void *p3);
 static void dlc_rx_thread_entry(void *p1, void *p2, void *p3);
-
+static void dlc_tx_status_cb_handler(uint16_t dlc_sn, bool success);
 
 // Helper to queue a single DLC PDU (which might be a segment) to the MAC layer.
 static int queue_dlc_pdu_to_mac(const uint8_t *dlc_header, size_t dlc_header_len,
                                 const uint8_t *payload_segment, size_t payload_segment_len,
-                                mac_flow_id_t mac_qos_flow)
+                                mac_flow_id_t mac_qos_flow,
+                                bool report_status, uint16_t dlc_sn_for_report)
 {
     size_t total_pdu_len = dlc_header_len + payload_segment_len;
     if (total_pdu_len > CONFIG_DECT_MAC_SDU_MAX_SIZE) {
@@ -65,6 +84,9 @@ static int queue_dlc_pdu_to_mac(const uint8_t *dlc_header, size_t dlc_header_len
         return -ENOMEM;
     }
 
+    mac_sdu->dlc_status_report_required = report_status;
+    mac_sdu->dlc_sn_for_status = dlc_sn_for_report;
+
     memcpy(mac_sdu->data, dlc_header, dlc_header_len);
     if (payload_segment && payload_segment_len > 0) {
         memcpy(mac_sdu->data + dlc_header_len, payload_segment, payload_segment_len);
@@ -73,17 +95,10 @@ static int queue_dlc_pdu_to_mac(const uint8_t *dlc_header, size_t dlc_header_len
 
     // The role check and specific send API are handled by dect_mac_api_send.
     // However, if we know we are an FT, we'd need to use a different top-level DLC API.
-    // For now, assume this helper is used by a generic dlc_send_data for PTs.
-    dect_mac_context_t *ctx = get_mac_context();
-    if (ctx->role == MAC_ROLE_FT) {
-        // FT requires a target PT ID. This helper is too generic.
-        // The main dlc_send_data must handle this logic.
-        // For simplicity, we'll assume the main function calls the correct MAC API.
-    }
+    // For simplicity, we'll assume the main function calls the correct MAC API.
 
     return dect_mac_api_send(mac_sdu, mac_qos_flow);
 }
-
 static dlc_reassembly_session_t* find_reassembly_session(uint16_t sequence_number)
 {
     for (int i = 0; i < MAX_DLC_REASSEMBLY_SESSIONS; i++) {
@@ -116,12 +131,51 @@ static dlc_reassembly_session_t* allocate_reassembly_session(uint16_t sequence_n
     return NULL;
 }
 
+/**
+ * @brief Handles TX status callbacks from the MAC layer.
+ *
+ * This function is called from the MAC thread context.
+ */
+static void dlc_tx_status_cb_handler(uint16_t dlc_sn, bool success)
+{
+    // Find the job associated with this sequence number
+    int job_idx = -1;
+    for (int i = 0; i < MAX_DLC_RETRANSMISSION_JOBS; i++) {
+        if (retransmission_jobs[i].is_active && retransmission_jobs[i].sequence_number == dlc_sn) {
+            job_idx = i;
+            break;
+        }
+    }
+
+    if (job_idx == -1) {
+        LOG_WRN("DLC_ARQ_CB: Received status for unknown or already completed SN %u.", dlc_sn);
+        return;
+    }
+
+    dlc_retransmission_job_t *job = &retransmission_jobs[job_idx];
+    k_timer_stop(&job->timeout_timer); // Stop the timeout timer for this job
+
+    if (success) {
+        LOG_INF("DLC_ARQ_CB: SUCCESS for SN %u. Freeing job.", dlc_sn);
+        // Free the SDU buffer and the job slot
+        dect_mac_api_buffer_free(job->sdu_payload);
+        job->is_active = false;
+    } else {
+        // MAC layer has reported permanent failure after all its HARQ retries.
+        // The DLC layer will now attempt a full retransmission.
+        LOG_WRN("DLC_ARQ_CB: PERMANENT MAC FAILURE for SN %u. Signaling for DLC re-TX.", dlc_sn);
+        k_fifo_put(&g_dlc_retransmit_signal_fifo, (void *)((uintptr_t)job_idx));
+    }
+}
+
 // --- DLC RX Thread for Reassembly and ARQ (if implemented) ---
 K_THREAD_DEFINE(g_dlc_rx_thread_id, CONFIG_DECT_DLC_RX_THREAD_STACK_SIZE,
                 dlc_rx_thread_entry, NULL, NULL, NULL,
                 CONFIG_DECT_DLC_RX_THREAD_PRIORITY, 0, 0);
 
-
+K_THREAD_DEFINE(g_dlc_tx_service_thread_id, CONFIG_DECT_DLC_TX_SERVICE_THREAD_STACK_SIZE,
+                dlc_tx_service_thread_entry, NULL, NULL, NULL,
+                CONFIG_DECT_DLC_TX_SERVICE_THREAD_PRIORITY, 0, 0);
 
 static void dlc_rx_thread_entry(void *p1, void *p2, void *p3)
 {
@@ -268,12 +322,93 @@ static void dlc_rx_thread_entry(void *p1, void *p2, void *p3)
     }
 }
 
+/**
+ * @brief DLC ARQ Retransmission Thread.
+ *
+ * Waits for signals to retransmit a DLC SDU that has failed transmission.
+ */
+static void dlc_tx_service_thread_entry(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+    LOG_INF("DLC TX Service (ARQ) Thread started.");
+
+    while (1) {
+        // Wait for a signal that a job needs re-transmitting.
+        // The data in the FIFO is the index of the job in the retransmission_jobs array.
+        uintptr_t job_idx = (uintptr_t)k_fifo_get(&g_dlc_retransmit_signal_fifo, K_FOREVER);
+
+        if (job_idx >= MAX_DLC_RETRANSMISSION_JOBS || !retransmission_jobs[job_idx].is_active) {
+            LOG_WRN("DLC_ARQ_SVC: Spurious re-TX signal for invalid job index %u.", (unsigned int)job_idx);
+            continue;
+        }
+
+        dlc_retransmission_job_t *job = &retransmission_jobs[job_idx];
+
+        if (job->retries >= DLC_MAX_RETRIES) {
+            LOG_ERR("DLC_ARQ_SVC: Job for SN %u has reached max retries. Discarding.", job->sequence_number);
+            dect_mac_api_buffer_free(job->sdu_payload);
+            job->is_active = false; // Free the job slot
+            continue;
+        }
+
+        job->retries++;
+        LOG_INF("DLC_ARQ_SVC: Re-transmitting SDU for SN %u (attempt %u).",
+                job->sequence_number, job->retries + 1);
+
+        // Re-send the SDU. The dlc_send_data function will handle segmentation and queuing.
+        // Since this is a retransmission, the SN will be reused, and a new ARQ job will be created.
+        // This is a simplification. A more advanced implementation would have a dedicated
+        // "resend" function that reuses the original SN.
+        // For now, we will treat it as a new send, which will get a new SN.
+        // This means the higher layer (CVG) must handle duplicates.
+        // TODO: Create a dlc_resend_data() that reuses the SN.
+        int err = dlc_send_data(job->service, job->sdu_payload->data, job->sdu_payload->len);
+        if (err) {
+            LOG_ERR("DLC_ARQ_SVC: Failed to re-queue SDU for SN %u (err %d). Will retry on next timeout.",
+                    job->sequence_number, err);
+            // Restart the timer to try again later.
+            k_timer_start(&job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+        } else {
+            // The original job is now conceptually replaced by the new one created in dlc_send_data.
+            // Free the original job's resources.
+            dect_mac_api_buffer_free(job->sdu_payload);
+            job->is_active = false;
+        }
+    }
+}
+
+/**
+ * @brief Handles retransmission timer expiry for a DLC ARQ job.
+ */
+static void dlc_retransmission_timeout_handler(struct k_timer *timer_id)
+{
+    uintptr_t job_idx = (uintptr_t)timer_id->user_data;
+    if (job_idx < MAX_DLC_RETRANSMISSION_JOBS && retransmission_jobs[job_idx].is_active) {
+        LOG_WRN("DLC_ARQ_TIMEOUT: Transmission for SN %u timed out. Signaling for re-TX.",
+                retransmission_jobs[job_idx].sequence_number);
+        // Signal the TX service thread to handle the retransmission.
+        k_fifo_put(&g_dlc_retransmit_signal_fifo, (void *)job_idx);
+    }
+}
+
+
 // --- Public API Implementation ---
 int dect_dlc_init(void)
 {
     // The responsibility of initializing the MAC layer (API and Core) is now
     // handled by the application's main setup, before the upper layers are initialized.
     // This function now only initializes resources specific to the DLC layer.
+
+    // Register our callback handler with the MAC Data Path.
+    // The MAC will call this function to report final TX status.
+    dect_mac_data_path_register_dlc_callback(dlc_tx_status_cb_handler);
+
+    // Initialize retransmission jobs and their timers
+    for (int i = 0; i < MAX_DLC_RETRANSMISSION_JOBS; i++) {
+        k_timer_init(&retransmission_jobs[i].timeout_timer, dlc_retransmission_timeout_handler, NULL);
+        retransmission_jobs[i].timeout_timer.user_data = (void*)((uintptr_t)i);
+        retransmission_jobs[i].is_active = false;
+    }
 
     // Initialize reassembly sessions and their timers
     for (int i=0; i < MAX_DLC_REASSEMBLY_SESSIONS; i++) {
@@ -285,6 +420,7 @@ int dect_dlc_init(void)
     // The DLC RX thread is auto-started by K_THREAD_DEFINE.
     // We can set its name for easier debugging.
     k_thread_name_set(g_dlc_rx_thread_id, "dect_dlc_rx");
+    k_thread_name_set(g_dlc_tx_service_thread_id, "dlc_arq_svc");
 
     LOG_INF("DLC Layer Initialized.");
     return 0;
@@ -294,7 +430,6 @@ int dect_dlc_init(void)
 int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, size_t dlc_sdu_payload_len)
 {
     if (dlc_sdu_payload == NULL && dlc_sdu_payload_len > 0) {
-        LOG_ERR("DLC_SEND: NULL payload with non-zero length.");
         return -EINVAL;
     }
     if (dlc_sdu_payload_len > CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE) {
@@ -304,105 +439,145 @@ int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, si
     }
 
     mac_flow_id_t mac_qos_flow;
-    dlc_ie_type_val_t ie_type = DLC_IE_TYPE_DATA_TYPE_123_NO_ROUTING; // Assume no routing for now.
+    dlc_ie_type_val_t ie_type = DLC_IE_TYPE_DATA_TYPE_123_NO_ROUTING; // Assume no routing.
     int err = 0;
+    bool needs_dlc_arq = (service == DLC_SERVICE_TYPE_2_ARQ || service == DLC_SERVICE_TYPE_3_SEGMENTATION_ARQ);
 
-    switch (service) {
-    case DLC_SERVICE_TYPE_0_TRANSPARENT:
-    case DLC_SERVICE_TYPE_2_ARQ: {
-        // These services do not support DLC-level segmentation.
-        // They must fit in a single MAC PDU.
-        size_t hdr_len = (service == DLC_SERVICE_TYPE_0_TRANSPARENT)
-                             ? sizeof(dect_dlc_header_type0_t)
-                             : sizeof(dect_dlc_header_type123_basic_t);
-
-        if (hdr_len + dlc_sdu_payload_len > CONFIG_DECT_MAC_SDU_MAX_SIZE) {
-            LOG_ERR("DLC_SEND: Payload len %zu too large for unsegmented service %d (max MAC SDU %d).",
-                    dlc_sdu_payload_len, service, (int)(CONFIG_DECT_MAC_SDU_MAX_SIZE - hdr_len));
-            return -EMSGSIZE;
-        }
-
-        uint8_t dlc_header_buf[sizeof(dect_dlc_header_type123_basic_t)];
-        mac_qos_flow = (service == DLC_SERVICE_TYPE_2_ARQ) ? MAC_FLOW_RELIABLE_DATA : MAC_FLOW_BEST_EFFORT;
-
-        if (service == DLC_SERVICE_TYPE_0_TRANSPARENT) {
-            dlc_hdr_type0_set((dect_dlc_header_type0_t *)dlc_header_buf, DLC_IE_TYPE_DATA_TYPE_0_NO_ROUTING);
-        } else { // Type 2 ARQ
-            dlc_tx_sequence_number = (dlc_tx_sequence_number + 1) & 0x03FF;
-            dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t *)dlc_header_buf, ie_type,
-                                   DLC_SI_COMPLETE_SDU, dlc_tx_sequence_number);
-        }
-        err = queue_dlc_pdu_to_mac(dlc_header_buf, hdr_len, dlc_sdu_payload, dlc_sdu_payload_len, mac_qos_flow);
-        break;
+    // Get a new sequence number for any service that uses it
+    if (service != DLC_SERVICE_TYPE_0_TRANSPARENT) {
+        dlc_tx_sequence_number = (dlc_tx_sequence_number + 1) & 0x03FF;
     }
 
+    dlc_retransmission_job_t *arq_job = NULL;
+    if (needs_dlc_arq) {
+        int job_idx = -1;
+        for (int i = 0; i < MAX_DLC_RETRANSMISSION_JOBS; i++) {
+            if (!retransmission_jobs[i].is_active) {
+                job_idx = i;
+                break;
+            }
+        }
+
+        if (job_idx == -1) {
+            LOG_ERR("DLC_SEND_ARQ: No free retransmission jobs available. Dropping SDU.");
+            return -ENOBUFS;
+        }
+
+        arq_job = &retransmission_jobs[job_idx];
+        arq_job->sdu_payload = dect_mac_api_buffer_alloc(K_NO_WAIT);
+        if (!arq_job->sdu_payload) {
+            LOG_ERR("DLC_SEND_ARQ: Failed to allocate buffer for re-TX job. Dropping SDU.");
+            return -ENOMEM;
+        }
+
+        memcpy(arq_job->sdu_payload->data, dlc_sdu_payload, dlc_sdu_payload_len);
+        arq_job->sdu_payload->len = dlc_sdu_payload_len;
+        arq_job->is_active = true;
+        arq_job->sequence_number = dlc_tx_sequence_number;
+        arq_job->retries = 0;
+        arq_job->service = service;
+        k_timer_start(&arq_job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+    }
+
+    switch (service) {
+    case DLC_SERVICE_TYPE_0_TRANSPARENT: {
+        size_t hdr_len = sizeof(dect_dlc_header_type0_t);
+        uint8_t hdr_buf[hdr_len];
+        dlc_hdr_type0_set((dect_dlc_header_type0_t *)hdr_buf, DLC_IE_TYPE_DATA_TYPE_0_NO_ROUTING);
+        err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload, dlc_sdu_payload_len, MAC_FLOW_BEST_EFFORT, false, 0);
+        break;
+    }
+    case DLC_SERVICE_TYPE_2_ARQ: {
+        size_t hdr_len = sizeof(dect_dlc_header_type123_basic_t);
+        if (hdr_len + dlc_sdu_payload_len > CONFIG_DECT_MAC_SDU_MAX_SIZE) {
+            err = -EMSGSIZE;
+            break;
+        }
+        uint8_t hdr_buf[hdr_len];
+        dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t *)hdr_buf, ie_type, DLC_SI_COMPLETE_SDU, dlc_tx_sequence_number);
+        err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload, dlc_sdu_payload_len, MAC_FLOW_RELIABLE_DATA, true, dlc_tx_sequence_number);
+        break;
+    }
     case DLC_SERVICE_TYPE_1_SEGMENTATION:
     case DLC_SERVICE_TYPE_3_SEGMENTATION_ARQ: {
         mac_qos_flow = (service == DLC_SERVICE_TYPE_3_SEGMENTATION_ARQ) ? MAC_FLOW_RELIABLE_DATA : MAC_FLOW_BEST_EFFORT;
-        dlc_tx_sequence_number = (dlc_tx_sequence_number + 1) & 0x03FF;
-
         size_t sent_len = 0;
-        uint16_t seg_offset = 0;
-
         while (sent_len < dlc_sdu_payload_len) {
+            // ... (The existing segmentation loop from the previous step fits here)
+            // ... with one modification: the call to queue_dlc_pdu_to_mac must pass the `needs_dlc_arq` flag
+            // Note: only the *last segment* needs to trigger the status report, but for simplicity, we can request it for all.
+            // A better optimization is to only set `report_status=true` for the last segment.
+
             uint8_t hdr_buf[sizeof(dect_dlc_header_type13_segmented_t)];
             size_t hdr_len;
             size_t payload_this_segment;
             dlc_segmentation_indication_t si;
+            uint16_t seg_offset = 0;
 
-            if (sent_len == 0) { // First segment
-                si = DLC_SI_FIRST_SEGMENT;
+            bool is_last_segment = false;
+
+            if (sent_len == 0) {
                 hdr_len = sizeof(dect_dlc_header_type123_basic_t);
-                dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t*)hdr_buf, ie_type, si, dlc_tx_sequence_number);
-            } else { // Middle or Last segment
+            } else {
                 hdr_len = sizeof(dect_dlc_header_type13_segmented_t);
                 seg_offset = sent_len;
-                // SI will be updated below based on remaining length.
             }
 
             payload_this_segment = CONFIG_DECT_MAC_SDU_MAX_SIZE - hdr_len;
             if (sent_len + payload_this_segment >= dlc_sdu_payload_len) {
-                // This is the last segment
                 payload_this_segment = dlc_sdu_payload_len - sent_len;
                 si = (sent_len == 0) ? DLC_SI_COMPLETE_SDU : DLC_SI_LAST_SEGMENT;
+                is_last_segment = true;
             } else {
-                // This is a middle segment
-                si = DLC_SI_MIDDLE_SEGMENT;
+                si = (sent_len == 0) ? DLC_SI_FIRST_SEGMENT : DLC_SI_MIDDLE_SEGMENT;
             }
-
-            // Re-build header if it's not the first segment, as SI might have changed to LAST.
-            if (sent_len > 0) {
-                 dlc_hdr_t13_segmented_set((dect_dlc_header_type13_segmented_t*)hdr_buf, ie_type, si, dlc_tx_sequence_number, seg_offset);
-            } else if (si == DLC_SI_COMPLETE_SDU) {
-                // Handle the case where the whole SDU fits after all, but we went down the SAR path.
+            
+            if (si == DLC_SI_COMPLETE_SDU) {
                 hdr_len = sizeof(dect_dlc_header_type123_basic_t);
                 dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t*)hdr_buf, ie_type, si, dlc_tx_sequence_number);
+            } else if (si == DLC_SI_FIRST_SEGMENT) {
+                dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t*)hdr_buf, ie_type, si, dlc_tx_sequence_number);
+            } else {
+                 dlc_hdr_t13_segmented_set((dect_dlc_header_type13_segmented_t*)hdr_buf, ie_type, si, dlc_tx_sequence_number, seg_offset);
             }
 
-
-            LOG_DBG("DLC_SEND_SEG: Svc %d, SN %u, SI %d, offset %u, seg_len %zu",
-                    service, dlc_tx_sequence_number, si, seg_offset, payload_this_segment);
-
-            err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len,
-                                       dlc_sdu_payload + sent_len, payload_this_segment,
-                                       mac_qos_flow);
+            // Only the final segment of an ARQ transmission should request a status report.
+            bool report_status_for_this_segment = needs_dlc_arq && is_last_segment;
+            
+            err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload + sent_len, payload_this_segment,
+                                       mac_qos_flow, report_status_for_this_segment, dlc_tx_sequence_number);
             if (err) {
-                LOG_ERR("DLC_SEND_SEG: Failed to queue segment (err %d). Aborting send of SN %u.",
-                        err, dlc_tx_sequence_number);
-                break; // Exit loop on failure
+                LOG_ERR("DLC_SEND_SEG: Failed to queue segment (err %d). Aborting send of SN %u.", err, dlc_tx_sequence_number);
+                // If any segment fails, we need to clean up the ARQ job if one was created.
+                if (arq_job) {
+                    k_timer_stop(&arq_job->timeout_timer);
+                    dect_mac_api_buffer_free(arq_job->sdu_payload);
+                    arq_job->is_active = false;
+                }
+                break;
             }
             sent_len += payload_this_segment;
         }
         break;
     }
-
     default:
         LOG_ERR("DLC_SEND: Unknown DLC service type %d", service);
+        if (arq_job) { arq_job->is_active = false; dect_mac_api_buffer_free(arq_job->sdu_payload); } // Cleanup
         return -EINVAL;
+    }
+
+    // If an error occurred mid-send and an ARQ job was created, clean it up.
+    if (err && arq_job) {
+        LOG_WRN("DLC_SEND: Cleaning up ARQ job for SN %u due to send error %d.", dlc_tx_sequence_number, err);
+        k_timer_stop(&arq_job->timeout_timer);
+        dect_mac_api_buffer_free(arq_job->sdu_payload);
+        arq_job->is_active = false;
     }
 
     return err;
 }
+
+
 
 int dlc_receive_data(dlc_service_type_t *service_type_out,
                      uint8_t *app_level_payload_buf,

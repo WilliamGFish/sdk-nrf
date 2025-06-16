@@ -24,6 +24,29 @@ typedef enum {
 } dlc_service_type_t;
 
 /**
+ * @brief Callback for DLC TX status reports from the MAC layer.
+ *
+ * This function is called by the MAC layer to inform the DLC layer of the final
+ * outcome of a transmission for which a status report was requested.
+ *
+ * @param dlc_sn The DLC sequence number of the SDU.
+ * @param success True if the SDU was successfully acknowledged by the peer (MAC HARQ ACK).
+ *                False if the SDU failed all transmission attempts (MAC HARQ permanent failure).
+ */
+typedef void (*dlc_tx_status_cb_t)(uint16_t dlc_sn, bool success);
+
+/**
+ * @brief Registers the DLC's TX status callback handler.
+ *
+ * This function is intended to be called by the MAC layer during its initialization
+ * to provide the DLC with a function to call for status updates. This is a "reverse"
+ * registration to decouple the layers.
+ *
+ * @param cb The function pointer to the MAC's callback handler.
+ */
+void dlc_set_tx_status_reporter(dlc_tx_status_cb_t cb);
+
+/**
  * @brief DLC PDU IE Type field values relevant to data transfer.
  * (ETSI TS 103 636-5 Table 5.3.1-1, first 4 bits of DLC PDU).
  * These define the structure of the DLC PDU header.
