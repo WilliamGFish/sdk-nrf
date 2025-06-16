@@ -927,7 +927,6 @@ void dect_mac_data_path_handle_rx_sdu(const uint8_t *mac_sdu_area_data,
                                       size_t mac_sdu_area_len,
                                       uint32_t transmitter_long_rd_id)
 {
-    // ... (Full implementation from Phase 4 "SFN Anchoring..." step) ...
     uint8_t ie_type;
     uint16_t dlc_pdu_len_from_mux;
     const uint8_t *dlc_pdu_ptr_from_mux;

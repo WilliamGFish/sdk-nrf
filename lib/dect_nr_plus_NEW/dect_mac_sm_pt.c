@@ -335,8 +335,6 @@ void dect_mac_sm_pt_handle_event(const struct dect_mac_event_msg *msg) {
 // pt_authentication_complete_action) are included below with their full implementations.
 
 // --- PT Static Helper Implementations ---
-// (Includes logic from Phase 2, 3, 4, and 5)
-
 static void pt_handle_phy_op_complete_internal(const struct nrf_modem_dect_phy_op_complete_event *event,
                                                pending_op_type_t completed_op_type) {
     dect_mac_context_t* ctx = get_mac_context();
@@ -1384,7 +1382,7 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
             return;
         }
 
-        // Proceed to "authentication" (simplified PSK key derivation for Phase 5)
+        // Proceed to "authentication" (simplified PSK key derivation)
         pt_start_authentication_with_ft_action(ctx); // This changes state to AUTHENTICATING then to ASSOCIATED
                                                      // and starts KeepAlive timer.
 

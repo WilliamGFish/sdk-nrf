@@ -391,9 +391,7 @@ void dect_mac_phy_ctrl_calculate_pcc_params(size_t mac_pdc_payload_len_bytes,
                                            uint8_t *in_out_selected_mcs_field,
                                            uint8_t *out_packet_length_type_field)
 {
-    // ... (Implementation from Phase 0.B, with simplified MCS0 logic) ...
     // This function remains critical and needs full implementation for all MCS/mu/beta.
-    // For now, copy the full implementation from the "Phase 0.B" response.
     if (!out_packet_length_field || !in_out_selected_mcs_field || !out_packet_length_type_field) {
         LOG_ERR("PCC_CALC: NULL output pointers!");
         if(out_packet_length_field) *out_packet_length_field = 0;

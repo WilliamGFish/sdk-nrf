@@ -484,10 +484,6 @@ static int  ft_find_and_init_peer_slot(uint32_t pt_long_id, uint16_t pt_short_id
     return -1;
 }
 
-// All other static helper functions (ft_process_association_request_pdu, ft_send_association_response_action,
-// ft_handle_phy_op_complete_ft, ft_handle_phy_rssi_ft, ft_handle_phy_pcc_ft, ft_handle_phy_pdc_ft)
-// are now included below, reflecting their state as of Phase 5, Step 1 (Secure RX in FT PDC).
-
 static void ft_handle_phy_op_complete_ft(const struct nrf_modem_dect_phy_op_complete_event *event, pending_op_type_t completed_op_type) {
     dect_mac_context_t* ctx = get_mac_context();
     switch (completed_op_type) {

@@ -130,7 +130,6 @@ int parse_mac_mux_header(const uint8_t *buf, size_t len,
                          uint8_t *out_ie_type_value, uint16_t *out_ie_payload_len,
                          const uint8_t **out_ie_payload_ptr)
 {
-    // ... (Implementation from Phase 1, assumed correct and complete) ...
     // Ensure it handles all mac_ext_bits cases (00, 01, 10, 11) correctly for length and IE type.
     if (!buf || len == 0 || !out_ie_type_value || !out_ie_payload_len || !out_ie_payload_ptr) {
         return -EINVAL;
@@ -581,7 +580,7 @@ int parse_rach_info_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_le
 /**
  * @brief Serializes the payload of an Association Request IE.
  * Ref: ETSI TS 103 636-4, Clause 6.4.2.4 & Table 6.4.2.4-1
- * For Phase 2/3, this implements only the first mandatory octet.
+ * For this implements only the first mandatory octet.
  *
  * @param buf Buffer to write the serialized payload into.
  * @param buf_max_len Max length of the buffer in bytes.
@@ -670,7 +669,7 @@ static int serialize_assoc_req_ie_payload(uint8_t *buf, size_t buf_max_len,
 /**
  * @brief Deserializes the payload of an Association Request IE.
  * Ref: ETSI TS 103 636-4, Clause 6.4.2.4 & Table 6.4.2.4-1
- * For Phase 3 (FT receiving), this implements parsing of the first mandatory octet.
+ * For (FT receiving), this implements parsing of the first mandatory octet.
  *
  * @param ie_payload Pointer to the start of the Association Request IE payload.
  * @param ie_payload_len Length of the IE payload in bytes.
@@ -733,7 +732,7 @@ int parse_assoc_req_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_le
         // and the flags for optional channel/time fields to parse the rest of the IE.
     }
 
-    // For Phase 3, successfully parsing the first octet is sufficient to identify the request.
+    // For successfully parsing the first octet is sufficient to identify the request.
     return 0;
 }
 
@@ -821,7 +820,7 @@ static int serialize_rd_capability_ie_payload(uint8_t *buf, size_t buf_max_len,
     // support for HARQ based on HARQ process count IE, etc.) form the "base" capability set.
     // ETSI Annex A.2 describes some fields as "part of first set of PHY capabilities".
 
-    // For Phase 2, we only send the 2 summary octets.
+    // we only send the 2 summary octets.
     // A fully compliant device *must* send its actual PHY capabilities.
     if (cap_fields->num_phy_capabilities > 0) {
         LOG_WRN("RD_CAP_SER: Serialization of %u additional PHY capability set(s) (5 octets each) is NOT YET IMPLEMENTED.",
@@ -990,7 +989,7 @@ int serialize_assoc_resp_ie_payload(uint8_t *buf, size_t buf_max_len,
     uint8_t octet0 = 0;
 
     WRITE_BIT(octet0, 7, resp_fields->ack_nack);
-    WRITE_BIT(octet0, 6, resp_fields->harq_mod_present); // For Phase 3, this is usually false
+    WRITE_BIT(octet0, 6, resp_fields->harq_mod_present); // this is usually false
 
     if (resp_fields->number_of_flows_accepted > 0x07) {
         LOG_WRN("ASSOC_RESP_SER: Number of flows accepted %u exceeds 3-bit field. Clamping to 7 (all).", resp_fields->number_of_flows_accepted);
@@ -999,7 +998,7 @@ int serialize_assoc_resp_ie_payload(uint8_t *buf, size_t buf_max_len,
         octet0 |= ((resp_fields->number_of_flows_accepted & 0x07) << 3);
     }
 
-    WRITE_BIT(octet0, 2, resp_fields->group_assignment_active); // For Phase 3, usually false
+    WRITE_BIT(octet0, 2, resp_fields->group_assignment_active); // usually false
 
     // Bits 1-0 are reserved and should be 0 (achieved by initial memset and not setting them)
     // octet0 |= (resp_fields->reserved_2bits & 0x03); // If reserved_2bits was a field
