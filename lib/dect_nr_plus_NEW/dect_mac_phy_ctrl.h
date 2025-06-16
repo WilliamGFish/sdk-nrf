@@ -182,6 +182,7 @@ int dect_mac_phy_ctrl_assemble_final_pdu(
  * @param out_packet_length_type_field Pointer to store calculated `packet_length_type` (0=subslots, 1=slots).
  */
 void dect_mac_phy_ctrl_calculate_pcc_params(size_t mac_pdc_payload_len_bytes,
+                                           uint8_t mu, uint8_t beta, /* New parameters */
                                            uint8_t *out_packet_length_field,
                                            uint8_t *in_out_selected_mcs_field,
                                            uint8_t *out_packet_length_type_field);

@@ -246,10 +246,81 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_dect_cmds,
     SHELL_CMD(get_context, NULL, "Print the current MAC context", cmd_get_context),
     SHELL_CMD(disable_timers, NULL, "Disable all autonomous MAC timers", cmd_disable_timers),
     SHELL_CMD(send_sdu, NULL, "Queue an SDU for TX <\"payload\"> [target_pt_short_id_hex_if_ft]", cmd_send_sdu),
+    SHELL_CMD(test_pcc, NULL, "Test PCC parameter calculation", cmd_test_pcc_params),
     SHELL_SUBCMD_SET_END
 );
 
 SHELL_CMD_REGISTER(dect, &sub_dect_cmds, "DECT MAC Debug/Test Commands", NULL);
+
+#if IS_ENABLED(CONFIG_DECT_MAC_SHELL_ENABLE) // Or a specific Kconfig for this test
+
+#include "dect_mac_phy_ctrl.h" // For the function to test
+
+// Existing shell includes and LOG_MODULE_REGISTER if in dect_mac_shell.c
+
+static int cmd_test_pcc_params(const struct shell *sh, size_t argc, char **argv)
+{
+    if (argc < 3) {
+        shell_error(sh, "Usage: dect test_pcc <payload_bytes> <mcs_code> [mu] [beta]");
+        shell_help(sh, "Calculates PCC params. mu, beta default to 1 if not given.");
+        return -EINVAL;
+    }
+
+    char *endptr;
+    long payload_bytes_long = strtol(argv[1], &endptr, 10);
+    if (*endptr != '\0' || payload_bytes_long < 0 || payload_bytes_long > 2000) { // Max PDC len approx 2000B for 16 subslots MCS0
+        shell_error(sh, "Invalid payload_bytes: %s (must be 0-2000).", argv[1]);
+        return -EINVAL;
+    }
+    size_t payload_bytes = (size_t)payload_bytes_long;
+
+    long mcs_code_long = strtol(argv[2], &endptr, 10);
+    if (*endptr != '\0' || mcs_code_long < 0 || mcs_code_long > MAX_MCS_INDEX_SUPPORTED_CTRL) {
+        shell_error(sh, "Invalid mcs_code: %s (must be 0-%d).", argv[2], MAX_MCS_INDEX_SUPPORTED_CTRL);
+        return -EINVAL;
+    }
+    uint8_t mcs_code = (uint8_t)mcs_code_long;
+    uint8_t original_mcs_code = mcs_code; // To see if it gets modified
+
+    uint8_t mu = 1;
+    uint8_t beta = 1;
+
+    if (argc > 3) {
+        long mu_long = strtol(argv[3], &endptr, 10);
+        if (*endptr != '\0' || mu_long <= 0 || mu_long > 8) { // Example valid mu range
+            shell_error(sh, "Invalid mu: %s", argv[3]); return -EINVAL;
+        }
+        mu = (uint8_t)mu_long;
+    }
+    if (argc > 4) {
+        long beta_long = strtol(argv[4], &endptr, 10);
+         if (*endptr != '\0' || beta_long <= 0 || beta_long > 16) { // Example valid beta range
+            shell_error(sh, "Invalid beta: %s", argv[4]); return -EINVAL;
+        }
+        beta = (uint8_t)beta_long;
+    }
+
+    uint8_t out_pkt_len_field, out_pkt_len_type;
+    uint8_t mcs_after_calc = mcs_code; // Pass by value to see if it's changed
+
+    shell_print(sh, "Testing PCC Calc: Payload: %zu B, MCS_in: %u, mu: %u, beta: %u",
+                payload_bytes, original_mcs_code, mu, beta);
+
+    dect_mac_phy_ctrl_calculate_pcc_params(payload_bytes, mu, beta,
+                                           &out_pkt_len_field,
+                                           &mcs_after_calc, // Pass address to allow modification
+                                           &out_pkt_len_type);
+
+    shell_print(sh, "Output: PacketLenField: %u (0x%02X) => %u units",
+                out_pkt_len_field, out_pkt_len_field, out_pkt_len_field + 1);
+    shell_print(sh, "        PacketLenType: %u (%s)",
+                out_pkt_len_type, out_pkt_len_type == 0 ? "subslots" : "slots");
+    shell_print(sh, "        MCS_final: %u (was %u)", mcs_after_calc, original_mcs_code);
+
+    return 0;
+}
+
+
 
 #else /* IS_ENABLED(CONFIG_DECT_MAC_SHELL_ENABLE) */
 // Provide a stub or log if shell is disabled but file is compiled

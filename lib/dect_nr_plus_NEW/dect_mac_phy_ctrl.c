@@ -18,6 +18,35 @@ LOG_MODULE_REGISTER(dect_mac_phy_ctrl, CONFIG_DECT_MAC_PHY_CTRL_LOG_LEVEL);
 // This buffer is filled before each TX operation.
 static union nrf_modem_dect_phy_hdr g_phy_pcc_tx_constructor_buf;
 
+// --- TBS Table Definitions ---
+// ETSI TS 103 636-3 v2.1.1 Table 7.4.3-2: PDSCH Transport block size Tb(j) for µ=1, β=1
+// Values are Tb(j) in BITS. Index j is number of subslots (1 to 16).
+// Array index [j-1] corresponds to j subslots.
+// Max j (number of subslots) is 16 (PCC packet_length field is 0-15, so N=1 to 16 subslots/slots)
+#define MAX_PDSCH_SUB_SLOTS_CTRL 16 // Renamed to avoid conflict with any similar define in context.h
+#define MAX_MCS_INDEX_SUPPORTED_CTRL 11 // Renamed
+
+// TBS table for mu=1, beta=1
+// Indexed as: tbs_mu1_beta1[MCS_INDEX][j-1_SUBOTS]
+// TODO: Fully populate this table from ETSI TS 103 636-3 Table 7.4.3-2 for all MCS 0-11 and j=1 to 16.
+//       Ensure accuracy, especially for any "---" (not supported) entries (use 0).
+static const uint16_t tbs_mu1_beta1_ctrl[MAX_MCS_INDEX_SUPPORTED_CTRL + 1][MAX_PDSCH_SUB_SLOTS_CTRL] = {
+    // MCS 0 (π/2-DBPSK, R=1/3)
+    {136, 264, 400, 536, 664, 792, 920, 1064, 1192, 1320, 1448, 1576, 1704, 1864, 1992, 2120 /* Verify/Adjust j=16 */},
+    // MCS 1 (QPSK, R=1/2)
+    {296, 552, 824, 1096, 1352, 1608, 1864, 2104, 2360, 2616, 2872, 3128, 3384, 3704, 3960, 4216 /* Verify/Adjust j=16 */},
+    // MCS 2 (QPSK, R=3/4)
+    {456, 856, 1256, 1640, 2024, 2360, 2744, 3192, 3576, 3960, 4320, 4768, 5152, 5536, 5920 /* Verify/Adjust j=15,16 */},
+    // MCS 3 (16QAM, R=1/2)
+    {616, 1128, 1672, 2168, 2680, 3192, 3704, 4256, 4768, 5280, 5792, 6304, 6816, 7456, 7720 /* Verify/Adjust j=15,16 */},
+    // MCS 4 (16QAM, R=3/4)
+    {936, 1736, 2488, 3256, 4024, 4832, 5600, 6304, 7000, 7720, 8480, 9240, 10000, 10760, 11520, 12280 /* Verify/Adjust j=16 */},
+    // MCS 5 to MCS 11 - TODO: Populate with actual values from ETSI Table 7.4.3-2
+    // Using placeholder 0 for now for remaining MCS to allow compilation
+    {0},{0},{0},{0},{0},{0},{0} // Placeholders for MCS 5, 6, 7, 8, 9, 10, 11
+};
+// --- End of TBS Table Definitions ---
+
 // Global buffer for the MAC PDU's PDC part (MAC Common Hdr + MAC SDU Area + MIC if secured)
 // to be sent to nRF PHY API's data field.
 // Size is MAX_MAC_PDU_SIZE_FOR_PCC_CALC (e.g. 1637 bytes from dect_mac_context.h)
@@ -40,14 +69,6 @@ static const uint16_t mcs0_mu1_beta1_cumulative_bits_pdcch_tb_j_ctrl[] = {
 #define PCC_PACKET_LENGTH_FIELD_MAX_VALUE_CTRL (PCC_PACKET_LENGTH_FIELD_MAX_UNITS_CTRL - 1)
 
 
-void dect_mac_phy_ctrl_init(void) {
-    // Initialize global buffers if necessary (e.g., zero them out), though they are static.
-    memset(&g_phy_pcc_tx_constructor_buf, 0, sizeof(g_phy_pcc_tx_constructor_buf));
-    memset(g_phy_pdc_tx_constructor_buf_ctrl, 0, sizeof(g_phy_pdc_tx_constructor_buf_ctrl));
-    LOG_INF("DECT MAC PHY Control initialized.");
-    // Note: nrf_modem_dect_phy_init() is called by the application/main after nrf_modem_init()
-    // and after dect_mac_phy_if_init() sets the event handler.
-}
 
 int dect_mac_phy_ctrl_start_rx(uint16_t carrier, uint32_t duration_modem_units,
                                enum nrf_modem_dect_phy_rx_mode mode,
@@ -158,122 +179,148 @@ int dect_mac_phy_ctrl_start_tx_assembled(uint16_t carrier,
 {
     dect_mac_context_t* ctx = get_mac_context();
     if (ctx->pending_op_type != PENDING_OP_NONE && ctx->pending_op_handle != phy_op_handle) {
+        // Strict check: if any op is pending and it's not this exact one being re-issued/updated, reject.
         if (ctx->pending_op_type != op_type || ctx->pending_op_handle != phy_op_handle) {
-            LOG_WRN("PHY_CTRL_TX: Op %s (H:%u) busy with %s (H:%u).",
-                    dect_pending_op_to_str(op_type), phy_op_handle,
-                    dect_pending_op_to_str(ctx->pending_op_type), ctx->pending_op_handle);
+            LOG_WRN("PHY_CTRL_TX: Op %s (H:%u) busy with %s (H:%u). New TX for %s (H:%u) rejected.",
+                    dect_pending_op_to_str(ctx->pending_op_type), ctx->pending_op_handle,
+                    dect_pending_op_to_str(ctx->pending_op_type), ctx->pending_op_handle, // Log current pending
+                    dect_pending_op_to_str(op_type), phy_op_handle); // Log requested
             return -EBUSY;
         }
     }
     // If op_type and handle match, it might be an update to an existing pending op, allow.
-    // Or, more strictly, no new op if any op is pending.
-    // For simplicity, if an op is pending, only allow if it's the *same* op being rescheduled.
-    // The pending_op_handle should be unique per call that intends to start a new PHY op.
+    // Or, if no op pending, this is a new op.
 
     ctx->pending_op_handle = phy_op_handle;
     ctx->pending_op_type = op_type;
 
     if (full_mac_pdu_to_send == NULL || full_mac_pdu_len == 0 ||
-        full_mac_pdu_len < sizeof(dect_mac_header_type_octet_t) || // Must have at least the type octet
-        full_mac_pdu_len > CONFIG_DECT_MAC_PDU_MAX_SIZE) { // CONFIG_DECT_MAC_PDU_MAX_SIZE from Kconfig/api.h
-        LOG_ERR("PHY_CTRL_TX: Invalid PDU or length: %p, %u", full_mac_pdu_to_send, full_mac_pdu_len);
-        if (ctx->pending_op_handle == phy_op_handle) {ctx->pending_op_type = PENDING_OP_NONE; ctx->pending_op_handle = 0;}
+        full_mac_pdu_len < sizeof(dect_mac_header_type_octet_t) ||
+        full_mac_pdu_len > CONFIG_DECT_MAC_PDU_MAX_SIZE) {
+        LOG_ERR("PHY_CTRL_TX: Invalid PDU or length: %p, len %u (min_hdr_type %zu, max_pdu %d)",
+                full_mac_pdu_to_send, full_mac_pdu_len,
+                sizeof(dect_mac_header_type_octet_t), CONFIG_DECT_MAC_PDU_MAX_SIZE);
+        if (ctx->pending_op_handle == phy_op_handle && ctx->pending_op_type == op_type) {
+            ctx->pending_op_type = PENDING_OP_NONE;
+            ctx->pending_op_handle = 0;
+        }
         return -EINVAL;
     }
 
+    // The PDC content for the PHY is the MAC PDU excluding the first MAC Header Type octet.
+    // The MAC Header Type octet's info (security, type) is used to construct the PCC.
     const uint8_t *pdc_content_for_phy = full_mac_pdu_to_send + sizeof(dect_mac_header_type_octet_t);
     uint16_t pdc_content_len_for_phy = full_mac_pdu_len - sizeof(dect_mac_header_type_octet_t);
 
+    // Copy PDC content to global buffer for PHY API
     if (pdc_content_len_for_phy > sizeof(g_phy_pdc_tx_constructor_buf_ctrl)) {
         LOG_ERR("PHY_CTRL_TX: Effective PDC content for PHY TX too large (%u > %zu)",
                 pdc_content_len_for_phy, sizeof(g_phy_pdc_tx_constructor_buf_ctrl));
-        if (ctx->pending_op_handle == phy_op_handle) {ctx->pending_op_type = PENDING_OP_NONE; ctx->pending_op_handle = 0;}
-        return -ENOMEM;
+        if (ctx->pending_op_handle == phy_op_handle && ctx->pending_op_type == op_type) {
+            ctx->pending_op_type = PENDING_OP_NONE;
+            ctx->pending_op_handle = 0;
+        }
+        return -ENOMEM; // Or -EMSGSIZE
     }
-    if (pdc_content_len_for_phy > 0) { // Only copy if there's actual PDC data
+    if (pdc_content_len_for_phy > 0) {
         memcpy(g_phy_pdc_tx_constructor_buf_ctrl, pdc_content_for_phy, pdc_content_len_for_phy);
     }
 
 
     memset(&g_phy_pcc_tx_constructor_buf, 0, sizeof(g_phy_pcc_tx_constructor_buf));
-    uint8_t pcc_nrf_phy_type_val;
-    uint8_t calculated_packet_len_val, selected_mcs_val, calculated_pkt_len_type_val;
+    uint8_t pcc_nrf_phy_type_val; // nRF PHY Type 0 for Beacon (ETSI Type 1 PCC), 1 for Data (ETSI Type 2 PCC)
+    uint8_t calculated_pcc_packet_len_field; // N-1 coded value for PCC packet_length field
+    uint8_t mcs_to_use_for_pcc_calc;         // The MCS code to be used for this TX
+    uint8_t calculated_pcc_pkt_len_type_field; // 0 for subslots, 1 for slots
 
-    selected_mcs_val = ctx->config.default_data_mcs_code; // Base MCS
-    if (is_beacon) { // Beacons should use a robust MCS, e.g., MCS0
-        selected_mcs_val = 0; // Force MCS0 for beacons
+    // Determine MCS to use for this transmission
+    mcs_to_use_for_pcc_calc = ctx->config.default_data_mcs_code;
+    if (is_beacon) {
+        mcs_to_use_for_pcc_calc = 0; // Beacons typically use a robust MCS like MCS0
     }
-    // TODO: Allow op_type to influence selected_mcs_val (e.g. RACH might use robust MCS)
+    if (op_type == PENDING_OP_PT_RACH_ASSOC_REQ) {
+        mcs_to_use_for_pcc_calc = 0; // Use robust MCS for RACH Association Request
+    }
+    // TODO: More advanced MCS selection based on link quality, QoS, etc.
+
+    // TODO: Determine mu and beta for the current link/operation from context.
+    uint8_t current_link_mu = 1;   // Placeholder
+    uint8_t current_link_beta = 1; // Placeholder
 
     dect_mac_phy_ctrl_calculate_pcc_params(pdc_content_len_for_phy,
-                                           &calculated_packet_len_val,
-                                           &selected_mcs_val, // Pass current selection, function will use/validate it
-                                           &calculated_pkt_len_type_val);
+                                           current_link_mu, current_link_beta,
+                                           &calculated_pcc_packet_len_field,
+                                           &mcs_to_use_for_pcc_calc, // Input is desired, output is actual used for calc
+                                           &calculated_pcc_pkt_len_type_field);
 
-    // Retrieve the MAC Header Type octet from the full PDU
-    dect_mac_header_type_octet_t hdr_type_from_pdu;
-    memcpy(&hdr_type_from_pdu, full_mac_pdu_to_send, sizeof(dect_mac_header_type_octet_t));
-
-
+    // Populate PCC Header (g_phy_pcc_tx_constructor_buf)
     if (is_beacon) {
-        pcc_nrf_phy_type_val = 0; // nRF PHY Type 0 (ETSI PCC Type 1)
+        pcc_nrf_phy_type_val = 0; // nRF PHY Type 0 (ETSI PCC Type 1 for beacons)
         struct nrf_modem_dect_phy_hdr_type_1 *pcc1 = &g_phy_pcc_tx_constructor_buf.hdr_type_1;
-        pcc1->header_format = 0b000; // ETSI Figure 6.2.1-1: Bits are set to 000
-        pcc1->packet_length_type = calculated_pkt_len_type_val;
-        pcc1->packet_length = calculated_packet_len_val;
+        pcc1->header_format = 0b000; // Per ETSI Figure 6.2.1-1, for Type 1, these are just 000.
+        pcc1->packet_length_type = calculated_pcc_pkt_len_type_field; // Should be 0 (subslots)
+        pcc1->packet_length = calculated_pcc_packet_len_field;       // N-1 coded
         pcc1->short_network_id = (uint8_t)(ctx->network_id_32bit & 0xFF);
         uint16_t be_tx_short_id = sys_cpu_to_be16(ctx->own_short_rd_id);
         pcc1->transmitter_id_hi = (uint8_t)(be_tx_short_id >> 8);
         pcc1->transmitter_id_lo = (uint8_t)(be_tx_short_id & 0xFF);
-        pcc1->transmit_power = ctx->config.default_tx_power_code; // From MAC config
-        pcc1->df_mcs = selected_mcs_val & 0x07; // 3 bits for Type 1 PCC's DF MCS
+        pcc1->transmit_power = ctx->config.default_tx_power_code;
+        pcc1->df_mcs = mcs_to_use_for_pcc_calc & 0x07; // 3 bits for Type 1 PCC's DF MCS
         pcc1->reserved = 0;
-    } else { // Data or other control PDU
-        pcc_nrf_phy_type_val = 1; // nRF PHY Type 1 (ETSI PCC Type 2)
+    } else { // Data or other control PDU (e.g. Unicast AssocResp)
+        pcc_nrf_phy_type_val = 1; // nRF PHY Type 1 (ETSI PCC Type 2 for unicast data/control)
         struct nrf_modem_dect_phy_hdr_type_2 *pcc2 = &g_phy_pcc_tx_constructor_buf.hdr_type_2;
-        // Header format 000 = HARQ fields present, 001 = HARQ feedback not requested for this DF
-        // This depends on whether this PDU *expects* a HARQ response from peer.
-        // Assume for data PDUs, HARQ is generally used.
-        pcc2->header_format = 0b000;
-        pcc2->packet_length_type = calculated_pkt_len_type_val;
-        pcc2->packet_length = calculated_packet_len_val;
+        // Default to HARQ fields present (000) unless specific logic determines no HARQ feedback is needed for this DF.
+        // TODO: This could be a parameter or determined by op_type/flow_id if some flows don't use HARQ feedback.
+        pcc2->header_format = 0b000; // Assumes HARQ feedback is expected/managed for this DF
+        pcc2->packet_length_type = calculated_pcc_pkt_len_type_field; // Should be 0 (subslots)
+        pcc2->packet_length = calculated_pcc_packet_len_field;       // N-1 coded
         pcc2->short_network_id = (uint8_t)(ctx->network_id_32bit & 0xFF);
         uint16_t be_tx_short_id = sys_cpu_to_be16(ctx->own_short_rd_id);
         pcc2->transmitter_id_hi = (uint8_t)(be_tx_short_id >> 8);
         pcc2->transmitter_id_lo = (uint8_t)(be_tx_short_id & 0xFF);
         pcc2->transmit_power = ctx->config.default_tx_power_code;
-        pcc2->df_mcs = selected_mcs_val & 0x0F; // 4 bits for Type 2 PCC's DF MCS
+        pcc2->df_mcs = mcs_to_use_for_pcc_calc & 0x0F; // 4 bits for Type 2 PCC's DF MCS
 
         uint16_t be_rx_short_id = sys_cpu_to_be16(target_receiver_short_id);
         pcc2->receiver_id_hi = (uint8_t)(be_rx_short_id >> 8);
         pcc2->receiver_id_lo = (uint8_t)(be_rx_short_id & 0xFF);
-        pcc2->num_spatial_streams = 0; // Default: Single spatial stream
+        pcc2->num_spatial_streams = 0; // Default: Single spatial stream (00 for 1 stream)
 
         bool is_harq_data_op = (op_type >= PENDING_OP_PT_DATA_TX_HARQ0 && op_type <= PENDING_OP_FT_DATA_TX_HARQ_MAX);
         if (is_harq_data_op) {
-            int harq_idx_base = (op_type <= PENDING_OP_PT_DATA_TX_HARQ_MAX) ? PENDING_OP_PT_DATA_TX_HARQ0 : PENDING_OP_FT_DATA_TX_HARQ0;
+            int harq_idx_base = (op_type >= PENDING_OP_FT_DATA_TX_HARQ0) ? PENDING_OP_FT_DATA_TX_HARQ0 : PENDING_OP_PT_DATA_TX_HARQ0;
             int harq_idx = op_type - harq_idx_base;
-            if (harq_idx >=0 && harq_idx < MAX_HARQ_PROCESSES && ctx->harq_tx_processes[harq_idx].is_active) {
+
+            if (harq_idx >= 0 && harq_idx < MAX_HARQ_PROCESSES && ctx->harq_tx_processes[harq_idx].is_active) {
                  pcc2->df_harq_process_num = harq_idx & 0x07; // 3 bits
-                 pcc2->df_new_data_indication = (ctx->harq_tx_processes[harq_idx].tx_attempts == 1) ? 1 : 0;
+                 pcc2->df_new_data_indication = (ctx->harq_tx_processes[harq_idx].tx_attempts == 1) ? 1 : 0; // 1 for new data (first attempt)
                  pcc2->df_redundancy_version = ctx->harq_tx_processes[harq_idx].redundancy_version & 0x03; // 2 bits
             } else {
-                LOG_WRN("PHY_CTRL_TX: HARQ op_type %s but no active/valid HARQ proc %d. Using default HARQ fields.",
+                LOG_WRN("PHY_CTRL_TX: HARQ op_type %s but no active/valid HARQ proc %d. Using default HARQ fields in PCC.",
                         dect_pending_op_to_str(op_type), harq_idx);
                 pcc2->df_new_data_indication = 1; pcc2->df_redundancy_version = 0; pcc2->df_harq_process_num = 0;
             }
-        } else { // For other control messages (e.g., AssocReq, AssocResp, KeepAlive)
-            pcc2->df_new_data_indication = 1; // Typically new data
+        } else { // For other control messages (e.g., AssocReq, AssocResp, KeepAlive) that are not data HARQ processes
+            pcc2->df_new_data_indication = 1; // Typically new data for control messages
             pcc2->df_redundancy_version = 0;  // RV0
-            pcc2->df_harq_process_num = 0;    // Use a default process number or a dedicated one for control
+            pcc2->df_harq_process_num = 0;    // Use a default process number or a dedicated one for control (if any)
+                                              // ETSI implies control messages might not use HARQ in the same way.
         }
+
         // Populate pcc2->feedback if this TX PDU is also carrying HARQ feedback to the peer.
-        // This is done in send_data_mac_sdu_via_phy_internal based on peer_info->pending_feedback_to_send
-        // and passed in via phy_header parameter of nrf_modem_dect_phy_tx_params.
-        // So, g_phy_pcc_tx_constructor_buf.hdr_type_2.feedback should already be populated by the caller if needed.
-        // If not, ensure it's cleared here. For safety:
-        // memset(&pcc2->feedback, 0, sizeof(pcc2->feedback)); // If caller doesn't set it, clear.
-        // pcc2->feedback.format1.format = NRF_MODEM_DECT_PHY_FEEDBACK_FORMAT_NONE; // This is done by send_data_mac_sdu_via_phy_internal
+        // This is determined by the caller (e.g., dect_mac_data_path_service_tx) by checking
+        // the peer_info->pending_feedback_to_send array for the target_receiver_short_id.
+        // For now, assume g_phy_pcc_tx_constructor_buf.hdr_type_2.feedback is pre-populated by caller if needed.
+        // If no feedback to send, it should be set to NRF_MODEM_DECT_PHY_FEEDBACK_FORMAT_NONE (all zeros for format field).
+        // Clearing here if not set by caller (safer default):
+        // if (no_feedback_to_send_flag_from_caller) { // This flag needs to be passed or checked
+        //    memset(&pcc2->feedback, 0, sizeof(pcc2->feedback));
+        //    pcc2->feedback.format1.format = NRF_MODEM_DECT_PHY_FEEDBACK_FORMAT_NONE;
+        // }
+        // Current data_path logic doesn't explicitly pre-populate g_phy_pcc_tx_constructor_buf.hdr_type_2.feedback.
+        // It should. For now, ensuring it's zeroed if not explicitly filled:
+        // NOTE: This memset is already done at the top of the function for the whole g_phy_pcc_tx_constructor_buf
     }
 
     struct nrf_modem_dect_phy_tx_params tx_params = {
@@ -281,13 +328,12 @@ int dect_mac_phy_ctrl_start_tx_assembled(uint16_t carrier,
         .handle = phy_op_handle,
         .network_id = ctx->network_id_32bit,
         .phy_type = pcc_nrf_phy_type_val,
-        .lbt_rssi_threshold_max = use_lbt ? ctx->config.rssi_threshold_min_dbm : 0, // LBT if RSSI < threshold
+        .lbt_rssi_threshold_max = use_lbt ? ctx->config.rssi_threshold_min_dbm : 0,
         .carrier = carrier,
-        .lbt_period = use_lbt ? NRF_MODEM_DECT_LBT_PERIOD_MIN : 0, // ETSI 5.3.3 needs at least this
-                                                                  // TODO: Check if specific ops (RACH) need longer default LBT
-        .phy_header = &g_phy_pcc_tx_constructor_buf, // Pointer to the globally constructed PCC
-        .bs_cqi = NRF_MODEM_DECT_PHY_BS_CQI_NOT_USED, // For separate BS/CQI reporting packets, not this PDU's PCC
-        .data = (pdc_content_len_for_phy > 0) ? g_phy_pdc_tx_constructor_buf_ctrl : NULL, // Pointer to global PDC data
+        .lbt_period = use_lbt ? NRF_MODEM_DECT_LBT_PERIOD_MIN : 0,
+        .phy_header = &g_phy_pcc_tx_constructor_buf,
+        .bs_cqi = NRF_MODEM_DECT_PHY_BS_CQI_NOT_USED,
+        .data = (pdc_content_len_for_phy > 0) ? g_phy_pdc_tx_constructor_buf_ctrl : NULL,
         .data_size = pdc_content_len_for_phy
     };
 
@@ -306,6 +352,8 @@ int dect_mac_phy_ctrl_start_tx_assembled(uint16_t carrier,
     }
     return ret;
 }
+
+
 
 int dect_mac_phy_ctrl_start_rssi_scan(uint16_t carrier, uint32_t duration_modem_units,
                                       enum nrf_modem_dect_phy_rssi_interval reporting_interval,
@@ -387,6 +435,7 @@ pending_op_type_t dect_mac_phy_ctrl_handle_op_complete(const struct nrf_modem_de
 }
 
 void dect_mac_phy_ctrl_calculate_pcc_params(size_t mac_pdc_payload_len_bytes,
+                                           uint8_t mu, uint8_t beta, /* New parameters */
                                            uint8_t *out_packet_length_field,
                                            uint8_t *in_out_selected_mcs_field,
                                            uint8_t *out_packet_length_type_field)
@@ -395,26 +444,66 @@ void dect_mac_phy_ctrl_calculate_pcc_params(size_t mac_pdc_payload_len_bytes,
     if (!out_packet_length_field || !in_out_selected_mcs_field || !out_packet_length_type_field) {
         LOG_ERR("PCC_CALC: NULL output pointers!");
         if(out_packet_length_field) *out_packet_length_field = 0;
-        if(in_out_selected_mcs_field) *in_out_selected_mcs_field = 0;
+        if(in_out_selected_mcs_field) *in_out_selected_mcs_field = 0; // Do not modify input if error
         if(out_packet_length_type_field) *out_packet_length_type_field = 0;
         return;
     }
-    uint32_t pdc_payload_len_bits = mac_pdc_payload_len_bytes * 8;
-    uint8_t num_subslots_needed = 0;
-    bool found_fit = false;
 
-    if (*in_out_selected_mcs_field != 0) {
-        LOG_WRN("PCC_CALC: Simplified! Only MCS0 supported. Forcing MCS0. Requested MCS %u ignored.", *in_out_selected_mcs_field);
-        *in_out_selected_mcs_field = 0;
+    uint32_t pdc_payload_len_bits = (uint32_t)mac_pdc_payload_len_bytes * 8;
+    uint8_t num_subslots_needed = 0; // Actual number of subslots (1-16)
+    bool found_fit = false;
+    uint8_t selected_mcs = *in_out_selected_mcs_field; // Use the input MCS
+
+    const uint16_t (*selected_tbs_table)[MAX_PDSCH_SUB_SLOTS_CTRL] = NULL;
+
+    // Select TBS table based on mu and beta
+    // TODO: Add tables and logic for other mu/beta combinations.
+    if (mu == 1 && beta == 1) {
+        selected_tbs_table = tbs_mu1_beta1_ctrl;
+    } else {
+        LOG_ERR("PCC_CALC: Unsupported mu=%u, beta=%u. Defaulting to mu=1,beta=1 table if available, or error.", mu, beta);
+        // Fallback to mu=1,beta=1 for now if others are not critical path yet,
+        // or strictly error out if mu/beta must be supported.
+        if (tbs_mu1_beta1_ctrl != NULL) { // Check if at least this one is valid
+             selected_tbs_table = tbs_mu1_beta1_ctrl;
+             LOG_WRN("PCC_CALC: Using mu=1,beta=1 TBS as fallback.");
+        } else {
+            LOG_ERR("PCC_CALC: No TBS table available for mu=%u, beta=%u or fallback. Cannot calculate.", mu, beta);
+            *out_packet_length_field = PCC_PACKET_LENGTH_FIELD_MAX_VALUE_CTRL; // Max length, likely problematic
+            *out_packet_length_type_field = 0; // Subslots
+            // *in_out_selected_mcs_field remains unchanged
+            return;
+        }
     }
 
-    if (pdc_payload_len_bytes == 0) {
+    if (selected_mcs > MAX_MCS_INDEX_SUPPORTED_CTRL) {
+        LOG_ERR("PCC_CALC: Requested MCS %u is out of supported range (max %u). Clamping to max supported.",
+                selected_mcs, MAX_MCS_INDEX_SUPPORTED_CTRL);
+        selected_mcs = MAX_MCS_INDEX_SUPPORTED_CTRL;
+        *in_out_selected_mcs_field = selected_mcs; // Update the output
+    }
+
+    if (mac_pdc_payload_len_bytes == 0) {
+        // For a zero-byte PDC payload (e.g., MAC PDU with only PCC for ACK/NACK feedback),
+        // ETSI implies minimum 1 subslot is used.
         num_subslots_needed = 1;
         found_fit = true;
     } else {
-        for (uint8_t j = 1; j < MCS0_MU1_BETA1_TB_J_TABLE_SIZE_CTRL; j++) {
-            if (pdc_payload_len_bits <= mcs0_mu1_beta1_cumulative_bits_pdcch_tb_j_ctrl[j]) {
-                num_subslots_needed = j;
+        for (uint8_t j_idx = 0; j_idx < MAX_PDSCH_SUB_SLOTS_CTRL; j_idx++) {
+            // selected_tbs_table[selected_mcs] gives row for current MCS.
+            // selected_tbs_table[selected_mcs][j_idx] gives Tb for (j_idx+1) subslots.
+            if (selected_tbs_table[selected_mcs][j_idx] == 0 && pdc_payload_len_bits > 0) {
+                // This (MCS, j) combination is not supported or table not fully populated.
+                // If we haven't found a fit yet, continue to see if more subslots help.
+                // If this is the last j_idx and still no fit, then it's an error handled below.
+                if (j_idx == MAX_PDSCH_SUB_SLOTS_CTRL - 1 && !found_fit) {
+                    LOG_WRN("PCC_CALC: TBS entry is 0 for MCS %u at max subslots (%u), payload %u bits. Likely too large.",
+                            selected_mcs, j_idx + 1, pdc_payload_len_bits);
+                }
+                continue;
+            }
+            if (pdc_payload_len_bits <= selected_tbs_table[selected_mcs][j_idx]) {
+                num_subslots_needed = j_idx + 1; // j_idx is 0 to 15, so num_subslots is 1 to 16
                 found_fit = true;
                 break;
             }
@@ -422,22 +511,42 @@ void dect_mac_phy_ctrl_calculate_pcc_params(size_t mac_pdc_payload_len_bytes,
     }
 
     if (!found_fit) {
-        LOG_ERR("PCC_CALC: Payload %zu bytes too large for MCS0 max length. Clamping.", mac_pdc_payload_len_bytes);
-        num_subslots_needed = MCS0_MU1_BETA1_TB_J_TABLE_SIZE_CTRL - 1;
+        LOG_ERR("PCC_CALC: Payload %zu bytes (%u bits) too large for MCS %u even at max %u subslots (TBS: %u bits). Clamping length.",
+                mac_pdc_payload_len_bytes, pdc_payload_len_bits, selected_mcs, MAX_PDSCH_SUB_SLOTS_CTRL,
+                selected_tbs_table[selected_mcs][MAX_PDSCH_SUB_SLOTS_CTRL - 1]);
+        num_subslots_needed = MAX_PDSCH_SUB_SLOTS_CTRL;
+        // TODO: Consider if *in_out_selected_mcs_field should be lowered and recalculation attempted.
+        //       For now, we indicate failure by maxing out slots for the *current* MCS.
+        //       The caller might need to then retry with a lower MCS.
     }
 
-    *out_packet_length_type_field = 0; // 0 for subslots
+    *out_packet_length_type_field = 0; // 0 for subslots (PCC packet_length always refers to subslots for PDC)
 
-    if (num_subslots_needed > PCC_PACKET_LENGTH_FIELD_MAX_UNITS_CTRL) {
-        LOG_ERR("PCC_CALC: Needed %u subslots, PCC field max %u. Clamping.", num_subslots_needed, PCC_PACKET_LENGTH_FIELD_MAX_UNITS_CTRL);
-        *out_packet_length_field = PCC_PACKET_LENGTH_FIELD_MAX_VALUE_CTRL;
+    // PCC packet_length field is (N-1) coded, where N is number of subslots.
+    if (num_subslots_needed > 0 && num_subslots_needed <= MAX_PDSCH_SUB_SLOTS_CTRL) {
+        *out_packet_length_field = num_subslots_needed - 1;
     } else if (num_subslots_needed == 0 && mac_pdc_payload_len_bytes > 0) {
-        LOG_ERR("PCC_CALC: Calculated 0 subslots for non-zero payload. Defaulting to 1.");
-        *out_packet_length_field = 0; // 1 subslot
-    } else {
-        *out_packet_length_field = num_subslots_needed - 1; // N-1 coding
+        // Should have been caught by found_fit logic or TBS entry is 0 case
+        LOG_ERR("PCC_CALC: Calculated 0 subslots for non-zero payload (%zu bytes). Defaulting to 1 subslot.", mac_pdc_payload_len_bytes);
+        *out_packet_length_field = 0; // Represents 1 subslot
+        num_subslots_needed = 1; // For logging
+    } else { // num_subslots_needed > MAX_PDSCH_SUB_SLOTS_CTRL (should be clamped by found_fit logic)
+        LOG_ERR("PCC_CALC: Invalid num_subslots_needed %u. Clamping PCC field to max.", num_subslots_needed);
+        *out_packet_length_field = PCC_PACKET_LENGTH_FIELD_MAX_VALUE_CTRL; // Max field value (15 for 16 subslots)
+        num_subslots_needed = MAX_PDSCH_SUB_SLOTS_CTRL; // For logging
     }
-    LOG_DBG("PCC_CALC: Payload %zuB (%ub), MCS %u -> %u subslots (PCC len_f 0x%X, type %u)",
-            mac_pdc_payload_len_bytes, pdc_payload_len_bits, *in_out_selected_mcs_field,
+
+    LOG_DBG("PCC_CALC: Payload %zuB (%ub), mu %u, beta %u, MCS %u -> %u subslots (PCC len_f 0x%X, type %u)",
+            mac_pdc_payload_len_bytes, pdc_payload_len_bits, mu, beta, selected_mcs,
             num_subslots_needed, *out_packet_length_field, *out_packet_length_type_field);
+}
+
+
+void dect_mac_phy_ctrl_init(void) {
+    // Initialize global buffers if necessary (e.g., zero them out), though they are static.
+    memset(&g_phy_pcc_tx_constructor_buf, 0, sizeof(g_phy_pcc_tx_constructor_buf));
+    memset(g_phy_pdc_tx_constructor_buf_ctrl, 0, sizeof(g_phy_pdc_tx_constructor_buf_ctrl));
+    LOG_INF("DECT MAC PHY Control initialized.");
+    // Note: nrf_modem_dect_phy_init() is called by the application/main after nrf_modem_init()
+    // and after dect_mac_phy_if_init() sets the event handler.
 }

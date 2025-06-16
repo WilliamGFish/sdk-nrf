@@ -183,6 +183,7 @@ int build_user_data_ie_muxed(uint8_t *target_ie_area_buf, size_t target_buf_max_
 int parse_cluster_beacon_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_len,
                                     dect_mac_cluster_beacon_ie_fields_t *out_cb_fields);
 int parse_rach_info_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_len,
+                               uint8_t mu_value_for_ft_beacon, /* New parameter */
                                dect_mac_rach_info_ie_fields_t *out_rach_fields);
 int parse_assoc_req_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_len,
                                dect_mac_assoc_req_ie_t *out_req_fields);

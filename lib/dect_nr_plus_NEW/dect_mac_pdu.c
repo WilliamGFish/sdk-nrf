@@ -326,6 +326,7 @@ int parse_cluster_beacon_ie_payload(const uint8_t *ie_payload, uint16_t ie_paylo
  * @param rach_fields Pointer to the structure holding the RACH Info IE fields to be serialized.
  * @return Length of the serialized payload in bytes, or negative error code.
  */
+
 static int serialize_rach_info_ie_payload(uint8_t *buf, size_t buf_max_len,
                                           const dect_mac_rach_info_ie_fields_t *rach_fields)
 {
@@ -338,20 +339,18 @@ static int serialize_rach_info_ie_payload(uint8_t *buf, size_t buf_max_len,
         LOG_ERR("RACH_SER: Buffer too small (%zu bytes) for RACH IE mandatory part (5 bytes).", buf_max_len);
         return -ENOMEM;
     }
+    if (rach_fields->mu_value_for_ft_beacon == 0 || rach_fields->mu_value_for_ft_beacon > 8) { // Basic validation for mu
+        LOG_ERR("RACH_SER: Invalid mu_value_for_ft_beacon: %u. Assuming mu <= 4 for 8-bit start_subslot.", rach_fields->mu_value_for_ft_beacon);
+        // Default to 8-bit if mu is invalid to prevent issues, or return error.
+        // Forcing a default might be safer if caller doesn't populate mu correctly yet.
+    }
+
 
     memset(buf, 0, buf_max_len); // Initialize buffer to ensure reserved bits are 0
     int bit_offset = 0;
     int ret;
 
     // Octet 0: Flags
-    // Bit 7: Reserved (0)
-    // Bit 6: Repeat Type (0=frames, 1=subslots)
-    // Bit 5: SFN Validity (0=not present, 1=present)
-    // Bit 4: Channel Field (0=current, 1=specific channel field present)
-    // Bit 3: Channel_2 Field (0=same as RACH, 1=specific channel_2 field present for response)
-    // Bit 2: MAX Len type (0=subslots, 1=slots)
-    // Bit 1: DECT_Delay (0=n+HARQ_delay+1, 1=0.5 frames after RACH TX start)
-    // Bit 0: Reserved (0)
     uint8_t flags_octet0 = 0;
     WRITE_BIT(flags_octet0, 6, rach_fields->repeat_type_is_subslots);
     WRITE_BIT(flags_octet0, 5, rach_fields->sfn_validity_present);
@@ -359,101 +358,102 @@ static int serialize_rach_info_ie_payload(uint8_t *buf, size_t buf_max_len,
     WRITE_BIT(flags_octet0, 3, rach_fields->channel2_field_present);
     WRITE_BIT(flags_octet0, 2, rach_fields->max_len_type_is_slots);
     WRITE_BIT(flags_octet0, 1, rach_fields->dect_delay_for_response);
+    // Bits 7 and 0 are reserved (set to 0 by memset)
     ret = write_bits(buf, buf_max_len, bit_offset, flags_octet0, 8);
     if (ret < 0) return ret;
     bit_offset = ret;
 
-    // Octets 1-2 (actually 17 bits total):
+    // Octets 1-2 (conditionally 17 bits total):
     // Start Subslot (9 bits if mu > 4, else 8 bits), Length Type (1 bit), Length (7 bits)
-    // TODO: Actual mu value for the FT needs to be known to select 8 or 9 bits for Start Subslot.
-    // Assuming FT uses mu <= 4 for its beacon RACH info for wider compatibility, so 8 bits for Start Subslot.
-    // If FT's mu (from its capabilities or system config) indicates 9 bits are needed:
-    // uint8_t start_subslot_num_bits = (ctx->phy_caps_for_beacon.mu > 4) ? 9 : 8; // Example
-    uint8_t start_subslot_num_bits = 8; // Simplification: Assume 8 bits for now
-    if (rach_fields->start_subslot_index >= (1 << start_subslot_num_bits) && start_subslot_num_bits == 8) {
-        // If it doesn't fit 8 bits, but we assumed 8, try 9 (if this was a dynamic check)
-        // For now, we stick to the assumption or it's an error in population.
-         LOG_WRN("RACH_SER: Start subslot %u too large for %u bits. Truncating or error.",
-                rach_fields->start_subslot_index, start_subslot_num_bits);
+    uint8_t start_subslot_num_bits = (rach_fields->mu_value_for_ft_beacon > 4 && rach_fields->mu_value_for_ft_beacon <= 8) ? 9 : 8;
+
+    if (rach_fields->start_subslot_index >= (1U << start_subslot_num_bits)) {
+         LOG_WRN("RACH_SER: Start subslot %u too large for %u bits (mu=%u). Clamping/Truncating.",
+                rach_fields->start_subslot_index, start_subslot_num_bits, rach_fields->mu_value_for_ft_beacon);
+        // Allow truncation for now, value will be masked by write_bits.
     }
-
-
     ret = write_bits(buf, buf_max_len, bit_offset, rach_fields->start_subslot_index, start_subslot_num_bits);
-    if (ret < 0) return ret; bit_offset = ret;
+    if (ret < 0) { LOG_ERR("RACH_SER: Write StartSS failed: %d", ret); return ret; }
+    bit_offset = ret;
 
     ret = write_bits(buf, buf_max_len, bit_offset, rach_fields->length_type_is_slots ? 1 : 0, 1);
-    if (ret < 0) return ret; bit_offset = ret;
+    if (ret < 0) { LOG_ERR("RACH_SER: Write LenType failed: %d", ret); return ret; }
+    bit_offset = ret;
 
+    if (rach_fields->num_subslots_or_slots > 0x7F) {
+        LOG_WRN("RACH_SER: num_subslots_or_slots %u exceeds 7-bit field. Clamping.", rach_fields->num_subslots_or_slots);
+    }
     ret = write_bits(buf, buf_max_len, bit_offset, rach_fields->num_subslots_or_slots & 0x7F, 7);
-    if (ret < 0) return ret; bit_offset = ret;
+    if (ret < 0) { LOG_ERR("RACH_SER: Write Length failed: %d", ret); return ret; }
+    bit_offset = ret;
 
-    // Octet 3 (byte index depends on start_subslot_num_bits, write_bits handles this):
-    // Max RACH Length (7 MSBs of this octet), Reserved (1 LSB)
-    uint8_t max_rach_len_octet = (rach_fields->max_rach_pdu_len_units & 0x7F) << 1; // Shift to MSB, LSB is reserved (0)
+    // Byte index for Octet 3 depends on start_subslot_num_bits. write_bits handles bit_offset progression.
+    // Octet related to 'Max RACH Length' (ETSI: Octet 3 if StartSS was 8bit, or part of Octet2+Octet3 if 9bit)
+    if (rach_fields->max_rach_pdu_len_units > 0x7F) {
+        LOG_WRN("RACH_SER: max_rach_pdu_len_units %u exceeds 7-bit field. Clamping.", rach_fields->max_rach_pdu_len_units);
+    }
+    uint8_t max_rach_len_octet = (rach_fields->max_rach_pdu_len_units & 0x7F) << 1; // Shift to MSB 7 bits, LSB is reserved (0)
     ret = write_bits(buf, buf_max_len, bit_offset, max_rach_len_octet, 8);
-    if (ret < 0) return ret; bit_offset = ret;
+    if (ret < 0) { LOG_ERR("RACH_SER: Write MaxRACHLen failed: %d", ret); return ret; }
+    bit_offset = ret;
 
-    // Octet 4: Cwmin_sig (3 MSBs), Cwmax_sig (next 3 bits), Repetition (2 LSBs)
+    // Octet related to 'Cwmin_sig, Cwmax_sig, Repetition'
     uint8_t cw_rep_octet = ((rach_fields->cwmin_sig_code & 0x07) << 5) |
                              ((rach_fields->cwmax_sig_code & 0x07) << 2) |
                              (rach_fields->repetition_code & 0x03);
     ret = write_bits(buf, buf_max_len, bit_offset, cw_rep_octet, 8);
-    if (ret < 0) return ret; bit_offset = ret;
+    if (ret < 0) { LOG_ERR("RACH_SER: Write CW/Rep failed: %d", ret); return ret; }
+    bit_offset = ret;
 
-    // Octet 5: Response Window (8 bits) - value is (actual subslots - 1)
+    // Octet related to 'Response Window'
     ret = write_bits(buf, buf_max_len, bit_offset, rach_fields->response_window_subslots_val_minus_1, 8);
-    if (ret < 0) return ret; bit_offset = ret;
+    if (ret < 0) { LOG_ERR("RACH_SER: Write RespWin failed: %d", ret); return ret; }
+    bit_offset = ret;
 
     // --- Optional fields ---
-    // Ensure byte alignment if next fields are written with sys_put_be16/32 directly.
-    // write_bits handles unaligned writes correctly, so direct sys_put_be16 after write_bits is okay
-    // if the total bits written by write_bits result in a byte-aligned offset.
+    // Ensure byte alignment for the following fields if they are present, if not using write_bits for them.
+    // write_bits handles unaligned writes for individual fields correctly.
+    // If we were to switch to sys_put_be16 for Channel fields, alignment would be needed prior.
 
     if (rach_fields->sfn_validity_present) {
-        if (((bit_offset + 16 -1) / 8) >= buf_max_len) return -ENOMEM; // Check space for 2 bytes
+        // Ensure space for 2 bytes
+        if (((bit_offset + 16 - 1) / 8) >= buf_max_len) { LOG_ERR("RACH_SER: No space for SFN/Validity."); return -ENOMEM; }
         ret = write_bits(buf, buf_max_len, bit_offset, rach_fields->sfn_value, 8);
-        if (ret < 0) return ret; bit_offset = ret;
+        if (ret < 0) { LOG_ERR("RACH_SER: Write SFNVal failed: %d", ret); return ret; }
+        bit_offset = ret;
         ret = write_bits(buf, buf_max_len, bit_offset, rach_fields->validity_frames, 8);
-        if (ret < 0) return ret; bit_offset = ret;
+        if (ret < 0) { LOG_ERR("RACH_SER: Write Validity failed: %d", ret); return ret; }
+        bit_offset = ret;
     }
 
     if (rach_fields->channel_field_present) {
         // Channel (13 MSBs of 16-bit field), Reserved (3 LSBs)
-        if (((bit_offset + 16 -1) / 8) >= buf_max_len) return -ENOMEM;
-        uint16_t chan_field_on_air = (rach_fields->channel_abs_freq_num & 0x1FFF) << 3; // Shift to MSBs, LSBs reserved (0)
-        // write_bits can handle this, or direct sys_put_be16
-        uint8_t *byte_ptr = buf + (bit_offset / 8); // Pointer to current byte
-        if ( (bit_offset % 8) != 0) {
-            LOG_ERR("RACH_SER: Unaligned bit_offset %d before writing Channel field with sys_put_be16. Use write_bits for multi-byte unaligned.", bit_offset);
-            // Fallback to write_bits for safety if unaligned.
-            ret = write_bits(buf, buf_max_len, bit_offset, (chan_field_on_air >> 8) & 0xFF, 8); // MSB of field
-            if (ret < 0) return ret; bit_offset = ret;
-            ret = write_bits(buf, buf_max_len, bit_offset, chan_field_on_air & 0xFF, 8);       // LSB of field
-            if (ret < 0) return ret; bit_offset = ret;
-        } else {
-            sys_put_be16(chan_field_on_air, byte_ptr);
-            bit_offset += 16;
-        }
+        if (((bit_offset + 16 - 1) / 8) >= buf_max_len) { LOG_ERR("RACH_SER: No space for Channel."); return -ENOMEM; }
+        uint16_t chan_field_on_air = (rach_fields->channel_abs_freq_num & 0x1FFF) << 3;
+        // Use write_bits to handle potential unaligned bit_offset start for these 16 bits
+        ret = write_bits(buf, buf_max_len, bit_offset, (chan_field_on_air >> 8) & 0xFF, 8); // MSByte
+        if (ret < 0) { LOG_ERR("RACH_SER: Write Chan MSB failed: %d", ret); return ret; }
+        bit_offset = ret;
+        ret = write_bits(buf, buf_max_len, bit_offset, chan_field_on_air & 0xFF, 8);       // LSByte
+        if (ret < 0) { LOG_ERR("RACH_SER: Write Chan LSB failed: %d", ret); return ret; }
+        bit_offset = ret;
     }
 
     if (rach_fields->channel2_field_present) {
-        if (((bit_offset + 16 -1) / 8) >= buf_max_len) return -ENOMEM;
+        if (((bit_offset + 16 - 1) / 8) >= buf_max_len) { LOG_ERR("RACH_SER: No space for Channel2."); return -ENOMEM; }
         uint16_t chan2_field_on_air = (rach_fields->channel2_abs_freq_num & 0x1FFF) << 3;
-        uint8_t *byte_ptr = buf + (bit_offset / 8);
-        if ( (bit_offset % 8) != 0) {
-             LOG_ERR("RACH_SER: Unaligned bit_offset %d before writing Channel2 field with sys_put_be16.", bit_offset);
-            ret = write_bits(buf, buf_max_len, bit_offset, (chan2_field_on_air >> 8) & 0xFF, 8);
-            if (ret < 0) return ret; bit_offset = ret;
-            ret = write_bits(buf, buf_max_len, bit_offset, chan2_field_on_air & 0xFF, 8);
-            if (ret < 0) return ret; bit_offset = ret;
-        } else {
-            sys_put_be16(chan2_field_on_air, byte_ptr);
-            bit_offset += 16;
-        }
+        ret = write_bits(buf, buf_max_len, bit_offset, (chan2_field_on_air >> 8) & 0xFF, 8); // MSByte
+        if (ret < 0) { LOG_ERR("RACH_SER: Write Chan2 MSB failed: %d", ret); return ret; }
+        bit_offset = ret;
+        ret = write_bits(buf, buf_max_len, bit_offset, chan2_field_on_air & 0xFF, 8);       // LSByte
+        if (ret < 0) { LOG_ERR("RACH_SER: Write Chan2 LSB failed: %d", ret); return ret; }
+        bit_offset = ret;
     }
 
     return (bit_offset + 7) / 8; // Total bytes written
 }
+
+
 
 /**
  * @brief Deserializes the payload of a RACH Info IE.
@@ -465,6 +465,7 @@ static int serialize_rach_info_ie_payload(uint8_t *buf, size_t buf_max_len,
  * @return 0 on success, or a negative error code on failure (e.g., -EMSGSIZE if payload too short).
  */
 int parse_rach_info_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_len,
+                               uint8_t mu_value_for_ft_beacon, /* New parameter */
                                dect_mac_rach_info_ie_fields_t *out_rach_fields)
 {
     if (!ie_payload || !out_rach_fields) {
@@ -476,106 +477,87 @@ int parse_rach_info_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_le
         LOG_ERR("RACH_PARSE: Payload too short (%u bytes) for RACH Info IE mandatory part (5 bytes).", ie_payload_len);
         return -EMSGSIZE;
     }
+    if (mu_value_for_ft_beacon == 0 || mu_value_for_ft_beacon > 8) { // Basic validation for mu
+        LOG_ERR("RACH_PARSE: Invalid mu_value_for_ft_beacon: %u. Assuming mu <= 4 for 8-bit start_subslot.", mu_value_for_ft_beacon);
+    }
+
     memset(out_rach_fields, 0, sizeof(dect_mac_rach_info_ie_fields_t));
+    out_rach_fields->mu_value_for_ft_beacon = mu_value_for_ft_beacon; // Store it
 
     int bit_offset = 0;
-    int remaining_bits = ie_payload_len * 8;
+    int remaining_bits_from_len = ie_payload_len * 8;
+    int *remaining_bits = &remaining_bits_from_len;
 
     // Octet 0: Flags
-    if (remaining_bits < 8) return -EMSGSIZE;
-    uint8_t flags_octet0 = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
+    if (*remaining_bits < 8) return -EMSGSIZE;
+    uint8_t flags_octet0 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
     out_rach_fields->repeat_type_is_subslots = (flags_octet0 >> 6) & 0x01;
     out_rach_fields->sfn_validity_present    = (flags_octet0 >> 5) & 0x01;
     out_rach_fields->channel_field_present   = (flags_octet0 >> 4) & 0x01;
     out_rach_fields->channel2_field_present  = (flags_octet0 >> 3) & 0x01;
     out_rach_fields->max_len_type_is_slots   = (flags_octet0 >> 2) & 0x01;
     out_rach_fields->dect_delay_for_response = (flags_octet0 >> 1) & 0x01;
-    // Bit 0 and 7 are reserved
 
-    // Octets 1-2 (17 bits total usually): Start Subslot (9/8b), Length Type (1b), Length (7b)
-    // TODO: Determine 8 or 9 bits for start_subslot based on sender's mu.
-    //       For now, assume 8 bits as per serializer's simplification.
-    //       A robust solution would need the sender's mu (from its RD Capability IE).
-    uint8_t start_subslot_num_bits = 8; // Simplification: Assume 8 bits from sender for now
-                                        // If it was 9, then (17-8)=9 bits read here, (16-9)=7 bits for next part
-    if (remaining_bits < (start_subslot_num_bits + 1 + 7)) return -EMSGSIZE;
-    out_rach_fields->start_subslot_index  = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, start_subslot_num_bits);
-    out_rach_fields->length_type_is_slots = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 1);
-    out_rach_fields->num_subslots_or_slots= read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 7);
+    // Octets 1-2 (conditionally 17 bits): Start Subslot (9/8b), Length Type (1b), Length (7b)
+    uint8_t start_subslot_num_bits = (mu_value_for_ft_beacon > 4 && mu_value_for_ft_beacon <= 8) ? 9 : 8;
+    if (*remaining_bits < (start_subslot_num_bits + 1 + 7)) {
+        LOG_ERR("RACH_PARSE: Not enough bits for StartSS/LenType/Len (%d needed).", start_subslot_num_bits + 1 + 7);
+        return -EMSGSIZE;
+    }
+    out_rach_fields->start_subslot_index  = read_bits_adv(ie_payload, &bit_offset, remaining_bits, start_subslot_num_bits);
+    out_rach_fields->length_type_is_slots = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 1);
+    out_rach_fields->num_subslots_or_slots= read_bits_adv(ie_payload, &bit_offset, remaining_bits, 7);
 
-    // Octet 3 (byte index depends on previous fields): Max RACH Length (7 MSBs), Reserved (1 LSB)
-    if (remaining_bits < 8) return -EMSGSIZE;
-    uint8_t max_rach_len_octet = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
+    // Octet related to 'Max RACH Length'
+    if (*remaining_bits < 8) { LOG_ERR("RACH_PARSE: Not enough bits for MaxRACHLen octet."); return -EMSGSIZE; }
+    uint8_t max_rach_len_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
     out_rach_fields->max_rach_pdu_len_units = (max_rach_len_octet >> 1) & 0x7F;
 
-    // Octet 4: Cwmin_sig (3 MSBs), Cwmax_sig (next 3 bits), Repetition (2 LSBs)
-    if (remaining_bits < 8) return -EMSGSIZE;
-    uint8_t cw_rep_octet = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
+    // Octet related to 'Cwmin_sig, Cwmax_sig, Repetition'
+    if (*remaining_bits < 8) { LOG_ERR("RACH_PARSE: Not enough bits for CW/Rep octet."); return -EMSGSIZE; }
+    uint8_t cw_rep_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
     out_rach_fields->cwmin_sig_code  = (cw_rep_octet >> 5) & 0x07;
     out_rach_fields->cwmax_sig_code  = (cw_rep_octet >> 2) & 0x07;
     out_rach_fields->repetition_code = cw_rep_octet & 0x03;
 
-    // Octet 5: Response Window (8 bits) - value is (actual subslots - 1)
-    if (remaining_bits < 8) return -EMSGSIZE;
-    out_rach_fields->response_window_subslots_val_minus_1 = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
+    // Octet related to 'Response Window'
+    if (*remaining_bits < 8) { LOG_ERR("RACH_PARSE: Not enough bits for RespWin octet."); return -EMSGSIZE; }
+    out_rach_fields->response_window_subslots_val_minus_1 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
 
     // --- Optional fields ---
     if (out_rach_fields->sfn_validity_present) {
-        if (remaining_bits < 16) return -EMSGSIZE; // Need 2 bytes
-        out_rach_fields->sfn_value       = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
-        out_rach_fields->validity_frames = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
+        if (*remaining_bits < 16) { LOG_ERR("RACH_PARSE: Not enough bits for SFN/Validity fields."); return -EMSGSIZE; }
+        out_rach_fields->sfn_value       = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        out_rach_fields->validity_frames = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
     }
 
     if (out_rach_fields->channel_field_present) {
-        if (remaining_bits < 16) return -EMSGSIZE; // Need 2 bytes
-        // Ensure byte alignment for sys_get_be16 if bit_offset is not on a byte boundary.
-        // read_bits_adv itself is bit-granular. If we read 16 bits with it:
-        if ((bit_offset % 8) != 0) {
-            LOG_WRN("RACH_PARSE: Unaligned bit_offset %d before reading Channel field. Reading bit-wise.", bit_offset);
-            uint8_t msb = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
-            uint8_t lsb = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
-            uint16_t chan_field_on_air = ((uint16_t)msb << 8) | lsb;
-            out_rach_fields->channel_abs_freq_num = (chan_field_on_air >> 3) & 0x1FFF;
-        } else {
-            const uint8_t *byte_ptr = ie_payload + (bit_offset / 8);
-            uint16_t chan_field_on_air = sys_get_be16(byte_ptr);
-            bit_offset += 16;
-            remaining_bits -= 16;
-            out_rach_fields->channel_abs_freq_num = (chan_field_on_air >> 3) & 0x1FFF;
-        }
+        if (*remaining_bits < 16) { LOG_ERR("RACH_PARSE: Not enough bits for Channel field."); return -EMSGSIZE; }
+        uint8_t msb = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        uint8_t lsb = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        uint16_t chan_field_on_air = ((uint16_t)msb << 8) | lsb;
+        out_rach_fields->channel_abs_freq_num = (chan_field_on_air >> 3) & 0x1FFF;
     }
 
     if (out_rach_fields->channel2_field_present) {
-        if (remaining_bits < 16) return -EMSGSIZE;
-        if ((bit_offset % 8) != 0) {
-             LOG_WRN("RACH_PARSE: Unaligned bit_offset %d before reading Channel2 field. Reading bit-wise.", bit_offset);
-            uint8_t msb = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
-            uint8_t lsb = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
-            uint16_t chan2_field_on_air = ((uint16_t)msb << 8) | lsb;
-            out_rach_fields->channel2_abs_freq_num = (chan2_field_on_air >> 3) & 0x1FFF;
-        } else {
-            const uint8_t *byte_ptr = ie_payload + (bit_offset / 8);
-            uint16_t chan2_field_on_air = sys_get_be16(byte_ptr);
-            bit_offset += 16;
-            remaining_bits -= 16; // Should be updated by read_bits_adv if used instead
-            out_rach_fields->channel2_abs_freq_num = (chan2_field_on_air >> 3) & 0x1FFF;
-        }
+        if (*remaining_bits < 16) { LOG_ERR("RACH_PARSE: Not enough bits for Channel2 field."); return -EMSGSIZE; }
+        uint8_t msb = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        uint8_t lsb = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        uint16_t chan2_field_on_air = ((uint16_t)msb << 8) | lsb;
+        out_rach_fields->channel2_abs_freq_num = (chan2_field_on_air >> 3) & 0x1FFF;
     }
 
-    // Final check if we consumed an appropriate number of bytes based on flags
-    // This is tricky because actual length depends on how many optional fields were present.
-    // The `remaining_bits` check throughout helps catch overruns.
-    // If remaining_bits > 0 after all expected optional fields are parsed, there might be more data than expected or parsing error.
-    if (remaining_bits > 0 && remaining_bits < 8) { // Less than a full byte remaining typically indicates an issue or unparsed padding.
+    if (*remaining_bits > 0 && *remaining_bits < 8) {
         LOG_WRN("RACH_PARSE: %d unparsed bits remain at the end of RACH IE payload (len %u).",
-                remaining_bits, ie_payload_len);
-    } else if (remaining_bits >= 8) {
-         LOG_WRN("RACH_PARSE: %d unparsed bits (>=1 byte) remain at the end of RACH IE payload (len %u). Potentially more IEs or error.",
-                remaining_bits, ie_payload_len);
+                *remaining_bits, ie_payload_len);
+    } else if (*remaining_bits >= 8) {
+         LOG_WRN("RACH_PARSE: %d unparsed bits (>=1 byte) remain at the end of RACH IE payload (len %u).",
+                *remaining_bits, ie_payload_len);
     }
 
     return 0;
 }
+
 
 /**
  * @brief Serializes the payload of an Association Request IE.
