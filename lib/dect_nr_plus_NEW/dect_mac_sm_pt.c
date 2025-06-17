@@ -110,20 +110,42 @@ void pt_paging_cycle_timer_expired_action(void)
 void pt_rach_response_window_timer_expired_action(void) {
     dect_mac_context_t* ctx = get_mac_context();
     k_timer_stop(&ctx->rach_context.rach_response_window_timer);
-    LOG_WRN("PT SM: RACH Response Window timer expired. No Association Response from FT 0x%04X.",
-            ctx->role_ctx.pt.target_ft.short_rd_id);
+    if (ctx->state != MAC_STATE_PT_WAIT_ASSOC_RESP && ctx->state != MAC_STATE_PT_ASSOCIATING) {
+        LOG_WRN("PT_RACH_RESP_TIMEOUT: Timer expired in unexpected state %s. Ignoring.", dect_mac_state_to_str(ctx->state));
+        return;
+    }
+
+    LOG_WRN("PT_RACH_RESP_TIMEOUT: No Association Response from FT 0x%04X (L:0x%08X).",
+            ctx->role_ctx.pt.target_ft.short_rd_id, ctx->role_ctx.pt.target_ft.long_rd_id);
 
     ctx->role_ctx.pt.current_assoc_retries++;
-    if (ctx->role_ctx.pt.target_ft.is_valid && ctx->role_ctx.pt.current_assoc_retries < ctx->config.max_assoc_retries) {
-        LOG_INF("PT SM: Retrying association to FT 0x%04X (attempt %u / %u)",
+    if (ctx->role_ctx.pt.target_ft.is_valid && // Still have a target
+        ctx->role_ctx.pt.current_assoc_retries < ctx->config.max_assoc_retries) {
+
+        LOG_INF("PT_RACH_RESP_TIMEOUT: Retrying association to FT 0x%04X (attempt %u / %u).",
                 ctx->role_ctx.pt.target_ft.short_rd_id,
-                ctx->role_ctx.pt.current_assoc_retries + 1, ctx->config.max_assoc_retries);
-        ctx->rach_context.rach_cw_current_idx = ctx->config.rach_cw_min_idx; // Reset CW for new attempt sequence
+                ctx->role_ctx.pt.current_assoc_retries + 1, // +1 for display
+                ctx->config.max_assoc_retries);
+
+        // For a timeout (no response), it's common to increase the contention window
+        // as if it were a collision/LBT busy, or at least not reset it to minimum,
+        // unless the strategy is to always start fresh for a full timeout.
+        // Let's increment CW for timeout as well, assuming channel might be congested.
+        if (ctx->rach_context.rach_cw_current_idx < ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmax_sig_code) {
+            ctx->rach_context.rach_cw_current_idx++;
+        }
+        // If the next attempt is RACH, pt_send_association_request_action will handle LBT and potential further CW increase.
+        // Directly call pt_send_association_request_action to re-attempt.
+        // It will change state to PT_ASSOCIATING or PT_RACH_BACKOFF.
         pt_send_association_request_action();
+
     } else {
-        LOG_ERR("PT SM: Max association retries (%u) for FT 0x%04X or no target. Restarting scan.",
+        LOG_ERR("PT_RACH_RESP_TIMEOUT: Max association retries (%u) for FT 0x%04X or no valid target. Restarting scan.",
                 ctx->config.max_assoc_retries, ctx->role_ctx.pt.target_ft.short_rd_id);
-        dect_mac_sm_pt_start_operation();
+        // Clear target FT info as we're giving up on this one
+        memset(&ctx->role_ctx.pt.target_ft, 0, sizeof(dect_mac_peer_info_t));
+        ctx->role_ctx.pt.target_ft.is_valid = false;
+        dect_mac_sm_pt_start_operation(); // Restart scan to find a new FT
     }
 }
 
@@ -374,29 +396,35 @@ static void pt_handle_phy_op_complete_internal(const struct nrf_modem_dect_phy_o
             }
             break;
 
-        case PENDING_OP_PT_RACH_ASSOC_REQ:
+       case PENDING_OP_PT_RACH_ASSOC_REQ:
             if (event->err == NRF_MODEM_DECT_PHY_SUCCESS) {
                 LOG_INF("PT_SM: Association Request TX successful (Hdl %u). Waiting for Response.", event->handle);
                 dect_mac_change_state(MAC_STATE_PT_WAIT_ASSOC_RESP);
 
-                // Calculate response window duration from RACH params (subslots to ms)
-                uint32_t resp_win_subslots = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.response_window_subslots_val_minus_1 + 1;
-                uint32_t subslot_dur_us = get_subslot_duration_ticks(ctx) * 1000 / NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ;
-                uint32_t resp_win_ms = resp_win_subslots * subslot_dur_us / 1000;
+                // Use response window duration from parsed RACH params
+                uint32_t resp_win_ms = ctx->role_ctx.pt.current_ft_rach_params.response_window_duration_us / 1000;
                 if (resp_win_ms < 10) resp_win_ms = 50; // Minimum sensible timeout
+                if (resp_win_ms == 0 && ctx->config.rach_response_window_ms > 0) { // Fallback if calc was 0
+                    LOG_WRN("PT_SM_RACH_RESP_TMR: Calculated RespWin was 0us, using Kconfig default %ums", ctx->config.rach_response_window_ms);
+                    resp_win_ms = ctx->config.rach_response_window_ms;
+                } else if (resp_win_ms == 0) {
+                    resp_win_ms = 200; // Absolute fallback
+                }
                 if (resp_win_ms > 5000) resp_win_ms = 5000; // Max sensible timeout
 
+                LOG_DBG("PT_SM_RACH_RESP_TMR: Starting RACH response window timer for %u ms.", resp_win_ms);
                 k_timer_start(&ctx->rach_context.rach_response_window_timer, K_MSEC(resp_win_ms), K_NO_WAIT);
 
                 uint32_t phy_rx_op_handle = sys_rand32_get();
-                uint32_t rx_duration_modem_units = modem_us_to_ticks( (resp_win_ms + 50) * 1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ ); // Listen for window + buffer
+                // Listen duration should also be related to response_window_duration_us
+                uint32_t rx_duration_modem_units = modem_us_to_ticks( (resp_win_ms + 50 /*margin*/) * 1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ );
 
                 int ret = dect_mac_phy_ctrl_start_rx(
-                    ctx->role_ctx.pt.target_ft.operating_carrier,
+                    ctx->role_ctx.pt.target_ft.operating_carrier, // Response expected on FT's op carrier
                     rx_duration_modem_units,
-                    NRF_MODEM_DECT_PHY_RX_MODE_SEMICONTINUOUS, // Stop after unicast PDC
+                    NRF_MODEM_DECT_PHY_RX_MODE_SEMICONTINUOUS,
                     phy_rx_op_handle,
-                    ctx->own_short_rd_id, // Expecting response addressed to us
+                    ctx->own_short_rd_id,
                     PENDING_OP_PT_WAIT_ASSOC_RESP);
                 if (ret != 0) {
                     LOG_ERR("PT_SM: Failed to schedule RX for AssocResp: %d. Resp timer will timeout.", ret);
@@ -406,19 +434,59 @@ static void pt_handle_phy_op_complete_internal(const struct nrf_modem_dect_phy_o
                 }
 
             } else if (event->err == NRF_MODEM_DECT_PHY_ERR_LBT_CHANNEL_BUSY) {
-                LOG_WRN("PT_SM: RACH TX LBT busy for AssocReq (Hdl %u). Increasing CW.", event->handle);
+                LOG_WRN("PT_SM: RACH TX LBT busy for AssocReq (Hdl %u). Increasing CW and backing off.", event->handle);
                 dect_mac_change_state(MAC_STATE_PT_RACH_BACKOFF);
-                if (ctx->rach_context.rach_cw_current_idx < ctx->config.rach_cw_max_idx) { // Use config for max index
+
+                // Use CW_MIN/MAX from parsed RACH params for this FT
+                uint16_t current_cw_val;
+                if (ctx->rach_context.rach_cw_current_idx < ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmin_sig_code) {
+                    // This can happen if CW was reset and min_idx from config is lower than FT's min_idx
+                    ctx->rach_context.rach_cw_current_idx = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmin_sig_code;
+                }
+
+                if (ctx->rach_context.rach_cw_current_idx < ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmax_sig_code) {
                     ctx->rach_context.rach_cw_current_idx++;
                 }
-                uint32_t max_backoff_window_val = (1 << ctx->rach_context.rach_cw_current_idx) - 1;
-                uint32_t backoff_slots_to_wait = (max_backoff_window_val > 0) ? (sys_rand32_get() % max_backoff_window_val) : 0;
-                // Convert RACH backoff slots to ms. A RACH slot is often one STF+GI duration.
-                // For simplicity, use a small random delay based on CW index.
-                uint32_t backoff_ms = (backoff_slots_to_wait + 1) * 2; // Example: ~2ms per backoff unit
-                LOG_INF("PT_SM: RACH backoff for %u ms (CW_idx %u, max_val %u, chosen_slots %u)",
-                        backoff_ms, ctx->rach_context.rach_cw_current_idx, max_backoff_window_val, backoff_slots_to_wait);
+                current_cw_val = 8 * (1U << ctx->rach_context.rach_cw_current_idx);
+                // Ensure it does not exceed FT's advertised CW_MAX_VAL (derived from its cwmax_sig_code)
+                if (current_cw_val > ctx->role_ctx.pt.current_ft_rach_params.cw_max_val) {
+                    current_cw_val = ctx->role_ctx.pt.current_ft_rach_params.cw_max_val;
+                }
+
+
+                uint32_t backoff_slots_to_wait = (current_cw_val > 0) ? (sys_rand32_get() % current_cw_val) : 0;
+
+                // ETSI RACH slot duration = STF + GI.
+                // STF = 7 or 9 symbols (N_rep * N_STF_symb_per_rep). GI duration also mu-dependent.
+                // For simplicity, let's use a fixed small unit time per "RACH backoff slot", e.g. ~200us (1 subslot time for mu=1)
+                // This needs to align with how contention slots are actually defined/perceived in the system.
+                // NRF_MODEM_DECT_LBT_PERIOD_MIN is 2 symbols.
+                uint8_t ft_mu = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon;
+                if (ft_mu == 0 || ft_mu > 8) ft_mu = 1;
+                uint32_t ft_base_symbol_duration_ticks = NRF_MODEM_DECT_SYMBOL_DURATION;
+                uint32_t ft_actual_symbol_duration_ticks = ft_base_symbol_duration_ticks;
+                if (ft_mu > 1) ft_actual_symbol_duration_ticks = ft_base_symbol_duration_ticks / (1U << (ft_mu - 1));
+                
+                // Assuming MINIMUM_LBT_PERIOD is a good proxy for a "RACH contention slot time unit"
+                uint32_t rach_contention_slot_ticks = NRF_MODEM_DECT_LBT_PERIOD_MIN; // (2 * base_symbol_duration_ticks)
+                 // If STF length is longer for higher mu, this may need adjustment.
+                 // For example, STF for mu > 1 might be 9 base symbols, so LBT_PERIOD_MIN might be too short.
+                 // Let's use FT's actual subslot duration as a backoff unit for more realism.
+                rach_contention_slot_ticks = ft_actual_symbol_duration_ticks * 5; // One subslot of FT's numerology
+
+
+                uint32_t backoff_duration_ticks = backoff_slots_to_wait * rach_contention_slot_ticks;
+                uint32_t backoff_ms = (backoff_duration_ticks * 1000U) / NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ;
+                if (backoff_ms == 0 && backoff_slots_to_wait > 0) backoff_ms = 1; // Ensure at least 1ms for very short tick counts
+                if (backoff_ms == 0 && backoff_slots_to_wait == 0) backoff_ms = 2; // Min backoff even if 0 slots chosen
+
+                LOG_INF("PT_SM: RACH backoff for %u ms (CW_idx %u -> val %u, chosen_units %u, unit_ticks %u)",
+                        backoff_ms, ctx->rach_context.rach_cw_current_idx, current_cw_val,
+                        backoff_slots_to_wait, rach_contention_slot_ticks);
                 k_timer_start(&ctx->rach_context.rach_backoff_timer, K_MSEC(backoff_ms), K_NO_WAIT);
+
+
+
 
             } else { // Other TX error
                 LOG_ERR("PT_SM: Association Request TX failed (Hdl %u, err %d, %s). Retry/Rescan.",
@@ -1182,8 +1250,18 @@ static void pt_send_association_request_action(void) {
         dect_mac_sm_pt_start_operation();
         return;
     }
-    if (ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.max_rach_pdu_len_units == 0) {
-        LOG_ERR("PT_SM_ASSOC_REQ: Target FT RACH max PDU length is 0. Cannot send. Restarting scan.");
+    // if (ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.max_rach_pdu_len_units == 0) {
+    //     LOG_ERR("PT_SM_ASSOC_REQ: Target FT RACH max PDU length is 0. Cannot send. Restarting scan.");
+    //     dect_mac_sm_pt_start_operation();
+    //     return;
+    // }
+
+    // Max RACH PDU length units from FT's RACH Info IE (N-1 coded)
+    uint8_t ft_max_rach_len_units_n_minus_1 = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.max_rach_pdu_len_units;
+    // Convert N-1 to N. max_rach_pdu_len_units is 7 bits (0-127), so N is 1-128.
+    uint8_t ft_max_rach_len_actual_units = ft_max_rach_len_units_n_minus_1 + 1;
+    if (ft_max_rach_len_actual_units == 0) { // Should not happen if FT sends valid IE
+        LOG_ERR("PT_SM_ASSOC_REQ: Target FT RACH max PDU length is 0 units. Cannot send. Restarting scan.");
         dect_mac_sm_pt_start_operation();
         return;
     }
@@ -1206,21 +1284,86 @@ static void pt_send_association_request_action(void) {
     uint8_t sdu_area_buf[128]; // Estimate max size needed for these two IEs (simplified versions)
     dect_mac_assoc_req_ie_t assoc_req_fields;
     memset(&assoc_req_fields, 0, sizeof(assoc_req_fields));
-    assoc_req_fields.setup_cause_val = 0; // 000 = Initial association (ETSI Table 6.4.2.4-2)
-    assoc_req_fields.number_of_flows_val = 0; // No specific flows requested during initial association
-    assoc_req_fields.ft_mode_capable = false; // This PT device does not also operate as an FT
-    assoc_req_fields.power_const_active = false; // PT has no power constraints to declare to FT
-
     dect_mac_rd_capability_ie_t rd_cap_fields;
     memset(&rd_cap_fields, 0, sizeof(rd_cap_fields));
-    rd_cap_fields.num_phy_capabilities = 0;    // 0 means 1 set (the base set defined by common fields or default PHY)
-    rd_cap_fields.release_version = 1;         // DECT NR+ Release 2 is coded as 1 (see ETSI Part 4 Annex A, A.2.0)
-    rd_cap_fields.supports_group_assignment = false; // Example capability
-    rd_cap_fields.supports_paging = true;            // Example: This PT supports being paged
-    rd_cap_fields.operating_modes_code = 0b00;     // PT mode only (ETSI Table 6.4.3.5-1)
-    rd_cap_fields.supports_mesh = false;           // Example
-    rd_cap_fields.supports_sched_data = true;      // PT wants scheduled data transfer
-    rd_cap_fields.mac_security_modes_code = 0b01;  // PT supports MAC Security Mode 1
+
+
+
+    // assoc_req_fields.setup_cause_val = 0; // 000 = Initial association (ETSI Table 6.4.2.4-2)
+    // assoc_req_fields.number_of_flows_val = 0; // No specific flows requested during initial association
+    // assoc_req_fields.ft_mode_capable = false; // This PT device does not also operate as an FT
+    // assoc_req_fields.power_const_active = false; // PT has no power constraints to declare to FT
+
+
+    // rd_cap_fields.num_phy_capabilities = 0;    // 0 means 1 set (the base set defined by common fields or default PHY)
+    // rd_cap_fields.release_version = 1;         // DECT NR+ Release 2 is coded as 1 (see ETSI Part 4 Annex A, A.2.0)
+    // rd_cap_fields.supports_group_assignment = false; // Example capability
+    // rd_cap_fields.supports_paging = true;            // Example: This PT supports being paged
+    // rd_cap_fields.operating_modes_code = 0b00;     // PT mode only (ETSI Table 6.4.3.5-1)
+    // rd_cap_fields.supports_mesh = false;           // Example
+    // rd_cap_fields.supports_sched_data = true;      // PT wants scheduled data transfer
+    // rd_cap_fields.mac_security_modes_code = 0b01;  // PT supports MAC Security Mode 1
+
+    // --- Populate Association Request IE Fields ---
+    assoc_req_fields.setup_cause_val = ASSOC_CAUSE_INITIAL_ASSOCIATION;
+    assoc_req_fields.power_const_active = false; // PT typically doesn't declare power constraints to FT
+    assoc_req_fields.ft_mode_capable = false;    // Assuming this PT cannot also act as an FT
+    assoc_req_fields.number_of_flows_val = 0;    // Requesting 0 specific flows initially.
+                                                 // FT will allocate default resources.
+                                                 // If specific flows were needed: set to N, populate flow_ids array.
+
+    // HARQ Parameters for the PT (what the PT supports/requests for this link)
+    // These should ideally come from the PT's own capabilities/configuration.
+    assoc_req_fields.harq_params_present = true; // Typically present for initial association.
+    // Example: PT requests 4 TX HARQ processes, and can handle a max re-TX delay coded as 10 (e.g. 20ms)
+    // These codes are from ETSI TS 103 636-4 Table 6.4.2.4-1 -> "Max HARQ Re-TX/RX Delay"
+    // Example: Code 10 could map to 20ms, 11 to 30ms etc. Needs defined mapping.
+    // Let's use some placeholder codes.
+    // TODO: Define mapping for HARQ delay codes to actual ms and use PT's capability for these values.
+    assoc_req_fields.harq_processes_tx_val = CONFIG_DECT_MAC_HARQ_PROCESSES_PT_TX_COUNT_CODE; // e.g., 3 for 4 processes (N-1) -> No, 0-7 for 1-8. Code 3 for 4 processes.
+    assoc_req_fields.max_harq_re_tx_delay_code = CONFIG_DECT_MAC_HARQ_MAX_RETX_DELAY_PT_CODE; // e.g., 10 for 20ms
+    assoc_req_fields.harq_processes_rx_val = CONFIG_DECT_MAC_HARQ_PROCESSES_PT_RX_COUNT_CODE;
+    assoc_req_fields.max_harq_re_rx_delay_code = CONFIG_DECT_MAC_HARQ_MAX_RERX_DELAY_PT_CODE;
+
+    // Flow IDs - not requesting specific flows initially, so number_of_flows_val is 0.
+    // If number_of_flows_val was > 0, populate assoc_req_fields.flow_ids[0..N-1] here.
+
+    // FT Mode Parameters - only if ft_mode_capable is true.
+    assoc_req_fields.ft_beacon_periods_octet_present = false;
+    assoc_req_fields.ft_param_flags_octet_present = false;
+    // If ft_mode_capable=true, these would be populated:
+    // assoc_req_fields.ft_network_beacon_period_code = ...
+    // assoc_req_fields.ft_next_channel_present = ...
+
+    // --- Populate PT's RD Capability IE Fields ---
+    rd_cap_fields.release_version = 1; // ETSI DECT NR+ Release 2 is coded as 1 (see Part 4, A.2.0)
+    rd_cap_fields.num_phy_capabilities = 1; // Indicating one explicit 5-octet set follows.
+                                            // If 0, only Octet 0 and 1 are sent.
+
+    // Octet 1 flags:
+    rd_cap_fields.supports_group_assignment = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_GROUP_ASSIGNMENT);
+    rd_cap_fields.supports_paging = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_PAGING);
+    rd_cap_fields.operating_modes_code = 0b00; // This device is PT only for this association context
+    rd_cap_fields.supports_mesh = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_MESH);
+    rd_cap_fields.supports_sched_data = true; // Assume PT always wants scheduled data
+    rd_cap_fields.mac_security_modes_code = IS_ENABLED(CONFIG_DECT_MAC_SECURITY_ENABLE) ? 0b01 : 0b00; // Supports Mode 1 if enabled
+
+    // Populate the first (and only for now) explicit PHY capability set (phy_variants[0])
+    // These codes should reflect the PT's actual capabilities, possibly from Kconfig or device specifics.
+    // TODO: Populate these from actual PT device capability configuration.
+    dect_mac_phy_capability_set_t *pt_phy_set0 = &rd_cap_fields.phy_variants[0];
+    pt_phy_set0->dlc_service_type_support_code = CONFIG_DECT_MAC_PT_DLC_SERVICE_SUPPORT_CODE; // e.g., 0b101 for Type 0,1,2,3
+    pt_phy_set0->rx_for_tx_diversity_code = CONFIG_DECT_MAC_PT_RX_TX_DIVERSITY_CODE;       // e.g., 0 for 1 antenna, 1 for 2
+    pt_phy_set0->mu_value = CONFIG_DECT_MAC_PT_MU_CODE;                               // e.g., 0 for mu=1 (2^0), 1 for mu=2 (2^1)
+    pt_phy_set0->beta_value = CONFIG_DECT_MAC_PT_BETA_CODE;                             // e.g., 0 for beta=1 (code+1)
+    pt_phy_set0->max_nss_for_rx_code = CONFIG_DECT_MAC_PT_MAX_NSS_RX_CODE;               // e.g., 0 for 1 stream
+    pt_phy_set0->max_mcs_code = CONFIG_DECT_MAC_PT_MAX_MCS_CODE;                         // e.g., 11 for MCS11
+    pt_phy_set0->harq_soft_buffer_size_code = CONFIG_DECT_MAC_PT_HARQ_BUFFER_CODE;       // Code for actual size
+    pt_phy_set0->num_harq_processes_code = CONFIG_DECT_MAC_PT_NUM_HARQ_PROC_CODE;       // e.g., 3 for 8 processes
+    pt_phy_set0->harq_feedback_delay_code = CONFIG_DECT_MAC_PT_HARQ_FEEDBACK_DELAY_CODE; // e.g., 0 for default (2 subslots)
+    pt_phy_set0->supports_dect_delay = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_DECT_DELAY);
+    pt_phy_set0->supports_half_duplex = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_HALF_DUPLEX);
+
 
     int sdu_area_len = build_assoc_req_ies_area(sdu_area_buf, sizeof(sdu_area_buf),
                                                &assoc_req_fields, &rd_cap_fields);

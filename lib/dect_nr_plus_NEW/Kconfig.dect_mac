@@ -161,6 +161,121 @@ config DECT_MAC_PT_PAGING_CYCLE_MS
       for page messages from the FT. This value should ideally be
       negotiated or configured in conjunction with the FT.
 
+config DECT_MAC_HARQ_PROCESSES_PT_TX_COUNT_CODE
+    int "PT Requested HARQ TX Processes Code (0-7 for 1-8 processes)"
+    default 3 # Code 3 = 4 processes (N = code + 1 if 0=1 process, or N=2^code)
+              # ETSI 6.4.3.5: Num HARQ Proc: 0=1, 1=2, 2=4, 3=8. So this should map to 2 (for 4 processes).
+              # Let's assume code 0->1, 1->2, 2->4, 3->8 for HARQ process count field.
+              # If PT wants 4 TX procs, code is 2. If PT wants 8 TX procs, code is 3.
+    range 0 3 # For 1, 2, 4, 8 processes respectively
+    help
+      Code for the number of HARQ TX processes the PT requests/supports.
+      0=>1, 1=>2, 2=>4, 3=>8 processes.
+
+config DECT_MAC_HARQ_MAX_RETX_DELAY_PT_CODE
+    int "PT Max HARQ Re-TX Delay Code (0-31)"
+    default 10 # Example code, maps to a specific ms value via ETSI table
+    range 0 31
+    help
+      Code for the maximum HARQ re-transmission delay the PT can handle for its TX.
+
+config DECT_MAC_HARQ_PROCESSES_PT_RX_COUNT_CODE
+    int "PT Requested HARQ RX Processes Code (0-7 for 1-8 processes)"
+    default 3 # Code 3 => 8 processes (as per ETSI RD Cap IE interpretation)
+    range 0 3
+    help
+      Code for the number of HARQ RX processes the PT requests/supports.
+      0=>1, 1=>2, 2=>4, 3=>8 processes.
+
+config DECT_MAC_HARQ_MAX_RERX_DELAY_PT_CODE
+    int "PT Max HARQ Re-RX Delay Code (0-31)"
+    default 10 # Example code
+    range 0 31
+    help
+      Code for the maximum HARQ re-transmission delay the PT expects for its RX.
+
+config DECT_MAC_PT_DLC_SERVICE_SUPPORT_CODE
+    int "PT DLC Service Type Support Code (0-7)"
+    default 5 # Code 5 = Types 0,1,2,3 supported (ETSI TS 103 636-5 Annex B.1.2)
+    help
+      Code indicating which DLC service types this PT supports.
+      Refer to ETSI TS 103 636-5 Annex B.1.2 for coding.
+
+config DECT_MAC_PT_RX_TX_DIVERSITY_CODE
+    int "PT RX for TX Diversity Antennas Code (0-3)"
+    default 0 # Code 0 = 1 antenna (ETSI TS 103 636-3 Annex B.2)
+    help
+      Code for number of TX diversity antennas supported for reception.
+      0=>1 ant, 1=>2 ant, 2=>4 ant, 3=>8 ant.
+
+config DECT_MAC_PT_MU_CODE
+    int "PT mu (Subcarrier Scaling Factor) Code (0-7)"
+    default 0 # Code 0 => mu = 2^0 = 1 (ETSI TS 103 636-3 Annex B.2)
+    help
+      Code for PT's primary/preferred subcarrier scaling factor mu. mu = 2^code.
+
+config DECT_MAC_PT_BETA_CODE
+    int "PT beta (FFT Scaling Factor) Code (0-15)"
+    default 0 # Code 0 => beta = 1 (code + 1) (ETSI TS 103 636-3 Annex B.2)
+    help
+      Code for PT's primary/preferred FFT scaling factor beta. beta = code + 1.
+
+config DECT_MAC_PT_MAX_NSS_RX_CODE
+    int "PT Max RX Spatial Streams Code (0-3)"
+    default 0 # Code 0 => 1 stream (ETSI TS 103 636-3 Annex B.2)
+    help
+      Code for maximum number of spatial streams PT can receive.
+      0=>1, 1=>2, 2=>4, 3=>8 streams.
+
+config DECT_MAC_PT_MAX_MCS_CODE
+    int "PT Max Supported MCS Index Code (0-11)"
+    default 11 # Code 11 => MCS11 (ETSI TS 103 636-3 Annex B.2)
+    help
+      Code for highest MCS index PT supports for reception.
+
+config DECT_MAC_PT_HARQ_BUFFER_CODE
+    int "PT HARQ Soft Buffer Size Code (0-15)"
+    default 7 # Example: Code 7 might map to 1024000 bytes (ETSI TS 103 636-3 Annex B.2)
+    help
+      Code representing PT's HARQ soft buffer size. Refer to ETSI for mapping.
+
+config DECT_MAC_PT_NUM_HARQ_PROC_CODE # Note: This is same as HARQ_PROCESSES_PT_RX_COUNT_CODE essentially for RD Cap
+    int "PT Number of HARQ Processes Support Code (0-3)"
+    default 3 # Code 3 => 8 processes
+    help
+      Code for number of parallel HARQ processes PT supports. 0=>1, 1=>2, 2=>4, 3=>8.
+
+config DECT_MAC_PT_HARQ_FEEDBACK_DELAY_CODE
+    int "PT HARQ Feedback Delay Code (0-15)"
+    default 0 # Code 0 => 2 subslots (ETSI TS 103 636-3 Annex B.2)
+    help
+      Code for PT's HARQ feedback processing delay.
+
+config DECT_MAC_PT_SUPPORTS_DECT_DELAY
+    bool "PT Supports DECT_Delay for RACH response"
+    default n # Example
+    help
+      PT indicates if it supports the DECT_Delay mechanism for RACH response timing.
+
+config DECT_MAC_PT_SUPPORTS_HALF_DUPLEX
+    bool "PT Supports Half-Duplex operation for RACH/DL"
+    default n # Example
+    help
+      PT indicates if it supports receiving RACH response or scheduled DL on a different
+      channel than its RACH UL transmission.
+
+config DECT_MAC_PT_SUPPORTS_GROUP_ASSIGNMENT
+    bool "PT Supports Group Assignment"
+    default n
+
+config DECT_MAC_PT_SUPPORTS_PAGING
+    bool "PT Supports Paging"
+    default y
+
+config DECT_MAC_PT_SUPPORTS_MESH
+    bool "PT Supports Mesh Operation"
+    default n
+
 endif # DECT_MAC_ROLE_IS_PT
 
 # --- FT (Fixed Termination) Specific Configuration ---
