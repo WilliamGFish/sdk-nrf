@@ -253,42 +253,97 @@ static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluste
 
 
 
-
 static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sfn_zero_anchor_time,
                                             uint8_t sfn_of_anchor_relevance, uint8_t target_sfn_val,
                                             uint16_t target_subslot_idx)
 {
     if (sfn_zero_anchor_time == 0) {
-        LOG_WRN("CALC_TIME: SFN Zero Anchor is 0. Cannot calculate precise target time.");
-        // Return a time slightly in the future as a fallback.
-        return ctx->last_known_modem_time +
-               modem_us_to_ticks(FRAME_DURATION_MS_NOMINAL * 1000,
-                                 NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+        LOG_WRN("CALC_TIME: SFN Zero Anchor is 0. Cannot calculate precise target time. Returning future estimate.");
+        uint32_t fallback_delay_ticks = modem_us_to_ticks(FRAME_DURATION_MS_NOMINAL * 1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+        return (ctx->last_known_modem_time > 0 ? ctx->last_known_modem_time : modem_us_to_ticks(1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ)) + fallback_delay_ticks;
     }
 
-    uint32_t frame_duration_ticks = (uint32_t)FRAME_DURATION_MS_NOMINAL *
-                                    (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
-    uint32_t subslot_duration_ticks = get_subslot_duration_ticks(ctx);
+    uint32_t frame_duration_ticks_val = 0;
+    if (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ > 0) {
+        frame_duration_ticks_val = (uint32_t)FRAME_DURATION_MS_NOMINAL * (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
+    }
+    if (frame_duration_ticks_val == 0) {
+        LOG_ERR("CALC_TIME: Calculated frame_duration_ticks is 0! Cannot calculate target time.");
+        return UINT64_MAX; // Indicate error
+    }
 
-    // Calculate the number of frames between the anchor's SFN and the target SFN,
-    // correctly handling wraparound.
+    // Subslot duration in modem ticks - mu aware
+    // TODO: This 'link_mu' should ideally be a parameter to this function if it's truly generic,
+    // or it should consistently use the mu of the entity FOR WHICH the time is being calculated
+    // (e.g., FT's mu for FT's beacon, target PT's mu for DL schedule TO that PT if their mu can differ).
+    // For now, using ctx->phy_link_params.mu assumes it's the relevant one for the calculation context.
+    uint8_t link_mu = 1; // Default
+    if (ctx->phy_link_params.is_valid && ctx->phy_link_params.mu > 0 && ctx->phy_link_params.mu <= 8) {
+        link_mu = ctx->phy_link_params.mu;
+    } else if (ctx->role == MAC_ROLE_PT && ctx->role_ctx.pt.associated_ft.is_valid &&
+               ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon > 0 &&
+               ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon <= 8) {
+        // If PT is calculating for schedule based on FT's beacon, use FT's mu from RACH params
+        link_mu = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon;
+        LOG_DBG("CALC_TIME: Using FT's mu=%u for subslot duration.", link_mu);
+    } else {
+        LOG_WRN("CALC_TIME: Using default mu=1 for subslot duration calc (ctx mu invalid or not applicable).");
+    }
+
+    uint32_t base_symbol_duration_ticks = NRF_MODEM_DECT_SYMBOL_DURATION;
+    uint32_t actual_symbol_duration_ticks = base_symbol_duration_ticks;
+    if (link_mu > 1) { // Assuming NRF_MODEM_DECT_SYMBOL_DURATION is for mu=1
+         actual_symbol_duration_ticks = base_symbol_duration_ticks / (1U << (link_mu - 1));
+    }
+    uint32_t subslot_duration_ticks_val = actual_symbol_duration_ticks * 5; // 5 OFDM symbols per subslot
+    if (subslot_duration_ticks_val == 0) {
+        LOG_ERR("CALC_TIME: Calculated subslot_duration_ticks is 0 for mu %u! Cannot calculate target time.", link_mu);
+        return UINT64_MAX;
+    }
+
+    uint64_t anchor_relevance_frame_start_time = sfn_zero_anchor_time +
+                                                 ((uint64_t)sfn_of_anchor_relevance * frame_duration_ticks_val);
+
     int16_t sfn_diff = (int16_t)target_sfn_val - (int16_t)sfn_of_anchor_relevance;
-    if (sfn_diff < -128) { // Target SFN has wrapped around relative to anchor SFN
+
+    if (sfn_diff < -128) { // target_sfn_val is "after" sfn_of_anchor_relevance due to SFN wrap
         sfn_diff += 256;
-    } else if (sfn_diff > 128) { // Anchor SFN has wrapped around relative to target SFN
+    } else if (sfn_diff > 128 && target_sfn_val < sfn_of_anchor_relevance) {
+        // This case means target_sfn is in the previous SFN cycle relative to a sfn_of_anchor_relevance
+        // e.g. anchor_sfn=10, target_sfn=250. diff=240. This would push time far in future.
+        // If target_sfn is truly in the past relative to anchor_sfn (but later in the cycle), sfn_diff will be negative.
+        // Example: anchor=10, target_sfn=5. diff=-5. target_frame is 5 frames before anchor_relevance_frame.
+        // Example: anchor=250, target_sfn=245. diff=-5. target_frame is 5 frames before.
+        // The "> 128" only applies if target_sfn_val is ALSO smaller than sfn_of_anchor_relevance, implying anchor wrapped.
         sfn_diff -= 256;
     }
+    // Now, sfn_diff should be the shortest signed distance in frames.
 
-    // The anchor relevance time is the modem time when SFN was sfn_of_anchor_relevance
-    uint64_t anchor_relevance_time = sfn_zero_anchor_time +
-                                     ((uint64_t)sfn_of_anchor_relevance * frame_duration_ticks);
+    uint64_t target_frame_start_time = anchor_relevance_frame_start_time + ((int64_t)sfn_diff * frame_duration_ticks_val);
 
-    uint64_t target_frame_start_time = anchor_relevance_time +
-                                       ((int64_t)sfn_diff * frame_duration_ticks);
+    // Heuristic check: If the calculated target_frame_start_time is significantly before the sfn_zero_anchor_time,
+    // it might imply that the target SFN is in the *next full cycle* of 256 frames from the SFN 0 anchor.
+    // This is more likely if sfn_of_anchor_relevance was small, and target_sfn_val is also small,
+    // but sfn_diff ended up negative (e.g. anchor_sfn=5, target_sfn=2, diff=-3)
+    // AND the result is before sfn_zero_anchor_time.
+    // This condition is tricky and depends on the interpretation of "shortest path".
+    // If target_sfn_val < sfn_of_anchor_relevance, and sfn_diff is calculated as negative:
+    // E.g., anchor SFN=5, target SFN=2. sfn_diff = -3. target_frame_start_time correctly before anchor_relevance_frame.
+    // E.g., anchor SFN=5, target SFN=250 (from previous cycle). sfn_diff would be large positive after initial calc, then -6 via (250-5 = 245 -> 245-256 = -11).
+    // This means target_frame_start is 11 frames before anchor_relevance_frame.
 
-    uint64_t target_subslot_offset_in_frame = (uint64_t)target_subslot_idx * subslot_duration_ticks;
+    // A simpler approach might be: if target_frame_start_time < ctx->last_known_modem_time (for future events)
+    // then add 256*frame_duration_ticks until it's in the future. This is handled by callers.
+    // The current sfn_diff logic should give the frame closest to anchor_relevance_frame.
 
-    return target_frame_start_time + target_subslot_offset_in_frame;
+    uint64_t target_subslot_offset_in_frame_ticks = (uint64_t)target_subslot_idx * subslot_duration_ticks_val;
+    uint64_t final_target_time = target_frame_start_time + target_subslot_offset_in_frame_ticks;
+
+    LOG_DBG("CALC_TIME: AnchorSFN %u @ %llu (SFN0 @ %llu), TargetSFN %u, TargetSS %u (mu %u) => FinalTime %llu",
+            sfn_of_anchor_relevance, anchor_relevance_frame_start_time, sfn_zero_anchor_time,
+            target_sfn_val, target_subslot_idx, link_mu, final_target_time);
+
+    return final_target_time;
 }
 
 
@@ -351,13 +406,31 @@ static void ft_start_beaconing_actions(void) {
     dect_mac_change_state(MAC_STATE_FT_BEACONING);
     LOG_INF("FT SM: Entered BEACONING state on carrier %u.", ctx->role_ctx.ft.operating_carrier);
 
-    ctx->role_ctx.ft.sfn = 0;
-    uint32_t first_beacon_delay_ms = 50;
-    uint64_t current_time_for_anchor = (ctx->last_known_modem_time == 0) ? modem_us_to_ticks(1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ) : ctx->last_known_modem_time;
-    ctx->ft_sfn_zero_modem_time_anchor = current_time_for_anchor + modem_us_to_ticks(first_beacon_delay_ms * 1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
-    ctx->current_sfn_at_anchor_update = 0;
+    ctx->role_ctx.ft.sfn = 0; // FT starts its SFN count from 0
+    uint32_t first_beacon_tx_attempt_delay_ms = 50; // Small delay before trying to send the first beacon
 
-    k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_MSEC(first_beacon_delay_ms), K_MSEC(ctx->config.ft_cluster_beacon_period_ms));
+    // Initialize ft_sfn_zero_modem_time_anchor to 0.
+    // It will be set accurately when the first beacon (SFN 0) is scheduled for transmission
+    // in ft_send_beacon_action, based on its target PHY operation start time.
+    ctx->ft_sfn_zero_modem_time_anchor = 0;
+    // current_sfn_at_anchor_update for FT will effectively be 0 when anchor is first set.
+    // This field is primarily for the PT to know the SFN context of the anchor time it receives.
+    // For the FT, its anchor is *defined* at SFN 0.
+    ctx->current_sfn_at_anchor_update = 0; 
+
+    LOG_DBG("FT_START_BEACONING: SFN anchor will be established with first beacon TX. Initial SFN set to 0.");
+
+    // Start the periodic beacon timer.
+    // The first timer expiry will trigger ft_send_beacon_action, which will then establish the SFN anchor.
+    uint32_t beacon_period_ms = ctx->config.ft_cluster_beacon_period_ms;
+    if (beacon_period_ms == 0) { // Fallback if Kconfig is 0
+        beacon_period_ms = 100;
+        LOG_WRN("FT_START_BEACONING: ft_cluster_beacon_period_ms is 0, using fallback %ums for timer.", beacon_period_ms);
+    }
+    // The first timer event will trigger the first beacon send attempt.
+    k_timer_start(&ctx->role_ctx.ft.beacon_timer, 
+                  K_MSEC(first_beacon_tx_attempt_delay_ms), // Initial delay for the first beacon attempt
+                  K_MSEC(beacon_period_ms));               // Subsequent period
 }
 
 
@@ -462,23 +535,69 @@ static void ft_send_beacon_action(void) {
         return; // Timer will fire again
     }
 
-    uint32_t phy_op_handle = sys_rand32_get();
-    ctx->role_ctx.ft.sfn_for_last_beacon_tx = ctx->role_ctx.ft.sfn;
 
-    // Calculate target start time for this beacon based on SFN
-    uint64_t beacon_target_start_time = calculate_target_modem_time(ctx,
-                                                                  ctx->ft_sfn_zero_modem_time_anchor,
-                                                                  ctx->current_sfn_at_anchor_update, // SFN when anchor was set/updated
-                                                                  ctx->role_ctx.ft.sfn, // Target SFN for this beacon
-                                                                  0); // Beacons are at subslot 0 of the frame
-    
+    uint32_t phy_op_handle = sys_rand32_get();
+    ctx->role_ctx.ft.sfn_for_last_beacon_tx = ctx->role_ctx.ft.sfn; // Record SFN for this beacon attempt
+    uint64_t beacon_target_start_time;
+    uint32_t frame_duration_ticks_val = 0;
+
+    if (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ > 0) {
+        frame_duration_ticks_val = (uint32_t)FRAME_DURATION_MS_NOMINAL * (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
+    }
+    if (frame_duration_ticks_val == 0) {
+        LOG_ERR("FT_BEACON_ACT: Frame duration ticks is zero! Cannot schedule beacon precisely. Skipping.");
+        k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); // Free buffer allocated earlier
+        return; // Timer will fire again
+    }
+
+    if (ctx->ft_sfn_zero_modem_time_anchor == 0) { // First beacon, establish anchor precisely
+        // Schedule this first beacon a bit into the future to allow PHY prep and establish a stable anchor.
+        // An initial delay was already applied by k_timer_start in ft_start_beaconing_actions.
+        // We use current modem time + a small additional scheduling margin for the very first beacon.
+        uint32_t scheduling_margin_ticks = modem_us_to_ticks(2000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); // e.g., 2ms margin
+        uint64_t current_time_estimate = (ctx->last_known_modem_time > 0) ? \
+                                          ctx->last_known_modem_time : \
+                                          modem_us_to_ticks(1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); // Base if no modem time known
+
+        beacon_target_start_time = current_time_estimate + scheduling_margin_ticks;
+        
+        // This beacon is for SFN 0 (ctx->role_ctx.ft.sfn was initialized to 0 for the first beacon)
+        // So, beacon_target_start_time is the modem time of SFN 0's start.
+        ctx->ft_sfn_zero_modem_time_anchor = beacon_target_start_time;
+        // ctx->current_sfn_at_anchor_update is already 0 from ft_start_beaconing_actions
+        LOG_INF("FT_BEACON_ACT: Establishing SFN0 anchor at %llu for SFN %u.",
+                ctx->ft_sfn_zero_modem_time_anchor, ctx->role_ctx.ft.sfn);
+    } else {
+        // Anchor exists, calculate target time for current SFN relative to the SFN 0 anchor.
+        // SFN is ctx->role_ctx.ft.sfn. Beacon is at subslot 0 of this SFN.
+        beacon_target_start_time = ctx->ft_sfn_zero_modem_time_anchor +
+                                   ((uint64_t)ctx->role_ctx.ft.sfn * frame_duration_ticks_val);
+    }
+
+    // Check if calculated target time is too soon (already passed or not enough prep time)
     uint32_t min_prep_time_ticks = modem_us_to_ticks(ctx->phy_latency.idle_to_active_tx_us +
                                                      ctx->phy_latency.scheduled_operation_startup_us,
                                                      NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
     if (ctx->last_known_modem_time > 0 && beacon_target_start_time < (ctx->last_known_modem_time + min_prep_time_ticks)) {
-        LOG_WRN("FT_BEACON_ACT: Target start %llu for SFN %u too soon (current %llu, prep %u). Sending immediate-ish.",
-                beacon_target_start_time, ctx->role_ctx.ft.sfn, ctx->last_known_modem_time, min_prep_time_ticks);
-        beacon_target_start_time = 0; // Request PHY to send as soon as possible
+        LOG_WRN("FT_BEACON_ACT: Target SFN %u start %llu is too soon (current %llu, prep %u). Adjusting to next possible frame.",
+                ctx->role_ctx.ft.sfn, beacon_target_start_time, ctx->last_known_modem_time, min_prep_time_ticks);
+        
+        // Calculate how many full frames into the future from the SFN0 anchor the earliest possible start is
+        uint64_t earliest_possible_start_from_now = ctx->last_known_modem_time + min_prep_time_ticks;
+        uint64_t ticks_from_sfn0_to_earliest_start;
+        if (earliest_possible_start_from_now >= ctx->ft_sfn_zero_modem_time_anchor) {
+            ticks_from_sfn0_to_earliest_start = earliest_possible_start_from_now - ctx->ft_sfn_zero_modem_time_anchor;
+        } else { // Current time is before SFN0 anchor (should not happen if anchor is set)
+            LOG_ERR("FT_BEACON_ACT: Current time before SFN0 anchor during adjustment. Using 0 delay.");
+            ticks_from_sfn0_to_earliest_start = 0; // Fallback
+        }
+
+        uint64_t frames_to_advance_from_sfn0 = (ticks_from_sfn0_to_earliest_start + frame_duration_ticks_val - 1) / frame_duration_ticks_val;
+        
+        ctx->role_ctx.ft.sfn = (uint8_t)(frames_to_advance_from_sfn0 % 256); // New target SFN
+        beacon_target_start_time = ctx->ft_sfn_zero_modem_time_anchor + (frames_to_advance_from_sfn0 * frame_duration_ticks_val);
+        ctx->role_ctx.ft.sfn_for_last_beacon_tx = ctx->role_ctx.ft.sfn; // Update SFN for this beacon
+        LOG_INF("FT_BEACON_ACT: Adjusted target SFN to %u, new start_time %llu.", ctx->role_ctx.ft.sfn, beacon_target_start_time);
     }
 
 
@@ -506,12 +625,19 @@ static void ft_send_beacon_action(void) {
 
 
 
-
-
+/**
+ * @brief Schedules a PHY RX operation for the FT to listen on its advertised RACH resources.
+ *
+ * This function determines the next valid RACH opportunity based on the FT's
+ * current SFN, the SFN anchor, and the RACH parameters (SFN validity, start subslot,
+ * repetition, channel) that the FT advertises in its beacons.
+ * It calculates the precise modem start time and duration for the RX listen window.
+ * If the calculated start time is too soon (i.e., does not allow for PHY preparation latency),
+ * it attempts to advance to the next valid RACH repetition instance.
+ */
 static void ft_schedule_rach_listen_action(void) {
     dect_mac_context_t* ctx = get_mac_context();
 
-    // Only listen for RACH if beaconing or has associated PTs (implies beaconing is active)
     if (ctx->state != MAC_STATE_FT_BEACONING && ctx->state != MAC_STATE_ASSOCIATED) {
         LOG_DBG("FT_RACH_LSN: Not in a state to listen for RACH (%s).", dect_mac_state_to_str(ctx->state));
         return;
@@ -523,7 +649,6 @@ static void ft_schedule_rach_listen_action(void) {
 
     const dect_mac_rach_info_ie_fields_t *rach_adv_fields = &ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields;
 
-    // 1. Determine the RACH operating carrier
     uint16_t rach_carrier = rach_adv_fields->channel_field_present ?
                             rach_adv_fields->channel_abs_freq_num :
                             ctx->role_ctx.ft.operating_carrier;
@@ -532,131 +657,133 @@ static void ft_schedule_rach_listen_action(void) {
         return;
     }
 
-    // 2. Calculate RACH resource length in subslots
-    uint32_t rach_resource_len_subslots = rach_adv_fields->num_subslots_or_slots; // This is N (actual units)
-    if (rach_adv_fields->length_type_is_slots) {
-        // TODO: SUB_SLOTS_PER_ETSI_SLOT should be mu-dependent if ETSI slot definition varies with mu.
-        // ETSI TS 103 636-3 Table 4.3-1: N_slot_symb varies (10,20,40,80). N_slot_subslot is N_slot_symb / 5.
-        // So, yes, mu-dependent. For mu=1, N_slot_subslot = 10/5 = 2. For mu=2, 20/5=4.
-        // Let's assume SUB_SLOTS_PER_ETSI_SLOT from context.h (e.g. 24) is for a specific mu, or we need better logic.
-        // For now, using a fixed value, but this is a key point for mu-awareness.
-        // ETSI 636-3, 4.4: "frame duration (10ms) and slot duration (0.41667ms)" - this implies fixed slot duration in time.
-        // N_slot_subslot = T_slot / T_subslot. T_subslot = 5 * T_symb. T_symb depends on mu.
-        // This implies SUB_SLOTS_PER_ETSI_SLOT is NOT fixed if T_slot_time is fixed.
-        // However, Table 4.3-1 N_slot_subslot IS fixed for each mu.
-        // Recheck: Slot is 0.41667ms. Subslot is 5 symbols.
-        // mu=1, symb=41.6us, subslot=208.3us, slot/subslot = 0.41667ms / 0.20833ms = 2 subslots per slot.
-        // mu=2, symb=20.8us, subslot=104.1us, slot/subslot = 0.41667ms / 0.1041us = 4 subslots per slot.
-        // This means SUB_SLOTS_PER_ETSI_SLOT is indeed mu dependent.
-        uint8_t subslots_per_etsi_slot_val = 2; // Default for mu=1
-        uint8_t ft_mu = 1; // TODO: Get FT's actual operational mu
-        if (ctx->phy_link_params.is_valid) ft_mu = ctx->phy_link_params.mu;
-        if (ft_mu == 1) subslots_per_etsi_slot_val = 2;
-        else if (ft_mu == 2) subslots_per_etsi_slot_val = 4;
-        else if (ft_mu == 4) subslots_per_etsi_slot_val = 8;
-        else if (ft_mu == 8) subslots_per_etsi_slot_val = 16;
-        else {LOG_ERR("FT_RACH_LSN: Invalid mu %u for subslots_per_slot calc.", ft_mu); return;}
+    uint8_t ft_mu = rach_adv_fields->mu_value_for_ft_beacon;
+    if (ft_mu == 0 || ft_mu > 8) {
+        LOG_WRN("FT_RACH_LSN: Invalid mu (%u) in FT's advertised RACH IE. Defaulting to mu=1.", ft_mu);
+        ft_mu = 1;
+    }
+    uint32_t ft_subslot_duration_ticks = get_subslot_duration_ticks_for_mu(ft_mu); // Use mu-aware helper
+    if (ft_subslot_duration_ticks == 0) {
+        LOG_ERR("FT_RACH_LSN: Calculated FT subslot duration is 0 for mu %u. Cannot proceed.", ft_mu);
+        return;
+    }
 
-        rach_resource_len_subslots *= subslots_per_etsi_slot_val;
+    uint32_t rach_resource_len_actual_units = rach_adv_fields->num_subslots_or_slots;
+    uint32_t rach_resource_len_subslots = rach_resource_len_actual_units;
+    if (rach_adv_fields->length_type_is_slots) {
+        uint8_t subslots_per_etsi_slot_for_ft_mu = get_subslots_per_etsi_slot_for_mu(ft_mu); // Use mu-aware helper
+        rach_resource_len_subslots *= subslots_per_etsi_slot_for_ft_mu;
     }
     if (rach_resource_len_subslots == 0) {
         LOG_ERR("FT_RACH_LSN: Advertised RACH resource length is 0 subslots. Cannot listen.");
         return;
     }
 
-    // 3. Determine Target SFN for the next RACH listen window
     uint8_t target_sfn_for_rach;
-    uint8_t current_ft_sfn = ctx->role_ctx.ft.sfn; // The SFN for the *next* frame the FT will be involved in.
+    uint8_t sfn_of_initial_rach_advertisement;
 
     if (rach_adv_fields->sfn_validity_present) {
-        target_sfn_for_rach = rach_adv_fields->sfn_value;
-        // Advance target_sfn_for_rach based on repetition until it's >= current_ft_sfn
-        // And also check validity_frames.
-        // Repetition code: 00=every frame, 01=every 2nd, 10=every 4th, 11=every 8th (from ETSI 6.4.3.4)
-        uint8_t repetition_interval_frames = 1 << rach_adv_fields->repetition_code; // 1, 2, 4, 8
+        sfn_of_initial_rach_advertisement = rach_adv_fields->sfn_value;
+        target_sfn_for_rach = sfn_of_initial_rach_advertisement;
 
-        int16_t sfn_diff_to_curr = (int16_t)target_sfn_for_rach - (int16_t)current_ft_sfn;
-        if (sfn_diff_to_curr < 0) sfn_diff_to_curr += 256; // Handle SFN wrap for difference
+        uint8_t repetition_interval_frames = 1U << rach_adv_fields->repetition_code;
+        if (repetition_interval_frames == 0) { repetition_interval_frames = 1; /* Should not happen with 2-bit code */ }
 
-        if (sfn_diff_to_curr > 0 && (sfn_diff_to_curr % repetition_interval_frames != 0) ) { // target is in future but not on repetition boundary
-            target_sfn_for_rach = (current_ft_sfn + (repetition_interval_frames - (current_ft_sfn % repetition_interval_frames))) & 0xFF;
-             if (target_sfn_for_rach < current_ft_sfn) target_sfn_for_rach += repetition_interval_frames; // Ensure it's future
-             target_sfn_for_rach &= 0xFF;
-        } else if (sfn_diff_to_curr < 0) { // Initial target_sfn_for_rach is in the past
-            target_sfn_for_rach = (current_ft_sfn + (repetition_interval_frames - (current_ft_sfn % repetition_interval_frames))) & 0xFF;
-             if (target_sfn_for_rach < current_ft_sfn) target_sfn_for_rach += repetition_interval_frames;
-             target_sfn_for_rach &= 0xFF;
+        // Advance target_sfn_for_rach until it's at or after current FT SFN, respecting repetition
+        while (1) {
+            int16_t sfn_diff_check = (int16_t)target_sfn_for_rach - (int16_t)ctx->role_ctx.ft.sfn;
+            if (sfn_diff_check > 128) sfn_diff_check -=256; else if (sfn_diff_check < -128) sfn_diff_check += 256;
+            if (sfn_diff_check >= 0) break; // Target is now at or after current SFN
+            target_sfn_for_rach = (target_sfn_for_rach + repetition_interval_frames) & 0xFF;
         }
-        // Now target_sfn_for_rach is the next valid occurrence at or after current_ft_sfn.
-        // Check validity period
-        int16_t frames_from_initial_validity_sfn = (int16_t)target_sfn_for_rach - (int16_t)rach_adv_fields->sfn_value;
+
+        int16_t frames_from_initial_validity_sfn = (int16_t)target_sfn_for_rach - (int16_t)sfn_of_initial_rach_advertisement;
         if (frames_from_initial_validity_sfn < 0) frames_from_initial_validity_sfn += 256;
+
         if (rach_adv_fields->validity_frames != 0xFF && (uint8_t)frames_from_initial_validity_sfn >= rach_adv_fields->validity_frames) {
-            LOG_WRN("FT_RACH_LSN: Advertised RACH validity expired (target SFN %u, initial SFN %u, validity %u frames). Not listening.",
-                    target_sfn_for_rach, rach_adv_fields->sfn_value, rach_adv_fields->validity_frames);
+            LOG_WRN("FT_RACH_LSN: Advertised RACH validity expired for SFN %u. Not listening.", target_sfn_for_rach);
             return;
         }
     } else {
-        // If SFN not present, RACH is valid "now" (relative to beacon that advertised it).
-        // The FT should listen in its SFN cycle immediately following the beacon for RACH.
-        // Repetition implies it occurs every 'repetition_interval_frames' relative to beacon SFN.
-        // This logic might need more careful thought if SFN is not present but repetition is.
-        // For now, if SFN not present, assume listen in current_ft_sfn or next frame.
-        target_sfn_for_rach = current_ft_sfn; // Listen in the SFN matching current beacon period
-                                             // or sfn_for_last_beacon_tx if more appropriate.
+        sfn_of_initial_rach_advertisement = ctx->role_ctx.ft.sfn_for_last_beacon_tx; // RACH is relative to beacon SFN
+        target_sfn_for_rach = ctx->role_ctx.ft.sfn; // Try current SFN first if SFN field not in RACH IE
+        // If repetition code means "every frame relative to beacon", and current sfn is past beacon sfn,
+        // this is already the "next" frame. Validity here is implicit (e.g. next few frames).
     }
 
-
-    // 4. Calculate RACH Listen Start Time using the SFN anchor
     uint64_t rach_listen_start_time = calculate_target_modem_time(ctx,
                                                                   ctx->ft_sfn_zero_modem_time_anchor,
                                                                   ctx->current_sfn_at_anchor_update,
                                                                   target_sfn_for_rach,
                                                                   rach_adv_fields->start_subslot_index);
-
-    // 5. Calculate RACH Listen Duration in modem ticks
-    // Listen for the RACH resource length plus a small margin (e.g., Max RACH PDU TX time from RACH IE)
-    // Plus response window of PT, as PT might still be transmitting if FT is slow to respond.
-    // For now, simple: advertised RACH length + small guard.
+    
     uint32_t listen_duration_subslots = rach_resource_len_subslots + 2; // Listen a bit longer
-    uint32_t listen_duration_modem_units = listen_duration_subslots * get_subslot_duration_ticks(ctx);
+    uint32_t listen_duration_modem_units = listen_duration_subslots * ft_subslot_duration_ticks;
 
-    // Check if calculated start time is too soon
     uint32_t min_prep_time_ticks = modem_us_to_ticks(ctx->phy_latency.idle_to_active_rx_us +
                                                      ctx->phy_latency.scheduled_operation_startup_us,
                                                      NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
-    if (ctx->last_known_modem_time > 0 && rach_listen_start_time < (ctx->last_known_modem_time + min_prep_time_ticks)) {
-        // Attempt to schedule for the *next* repetition cycle if this one is missed
-        // This is complex due to repetition_code (frames vs subslots).
-        // For now, if too soon, log and skip this listen opportunity.
-        LOG_WRN("FT_RACH_LSN: Calculated start time %llu for SFN %u / SS %u too soon (current %llu, prep %u). Skipping this RACH opp.",
-                rach_listen_start_time, target_sfn_for_rach, rach_adv_fields->start_subslot_index,
+    uint8_t initial_target_sfn_for_log = target_sfn_for_rach; // For logging original target
+
+    // Loop to find a suitable future slot if the current one is too soon
+    while (ctx->last_known_modem_time > 0 && rach_listen_start_time < (ctx->last_known_modem_time + min_prep_time_ticks)) {
+        LOG_WRN("FT_RACH_LSN: Target RACH listen SFN %u, SS %u at time %llu is too soon (curr %llu, prep %u). Advancing.",
+                target_sfn_for_rach, rach_adv_fields->start_subslot_index, rach_listen_start_time,
                 ctx->last_known_modem_time, min_prep_time_ticks);
-        return;
+
+        uint8_t repetition_interval_frames = 1U << rach_adv_fields->repetition_code;
+        if (repetition_interval_frames == 0) { repetition_interval_frames = 1; } // Should not happen if rep code 0-3
+
+        // If sfn_validity_present was false, the repetition is relative to the SFN of the beacon that advertised it.
+        // The concept of "sfn_of_initial_rach_advertisement" is critical here.
+        // If SFN field was not in RACH IE, the validity_frames field is also not there.
+        // We assume the repetition_code is still valid for some implicit validity (e.g. a few super_frames).
+        target_sfn_for_rach = (target_sfn_for_rach + repetition_interval_frames) & 0xFF;
+
+        if (rach_adv_fields->sfn_validity_present && rach_adv_fields->validity_frames != 0xFF) {
+            int16_t frames_from_initial_validity_sfn = (int16_t)target_sfn_for_rach - (int16_t)sfn_of_initial_rach_advertisement;
+            if (frames_from_initial_validity_sfn < 0) frames_from_initial_validity_sfn += 256;
+            if ((uint8_t)frames_from_initial_validity_sfn >= rach_adv_fields->validity_frames) {
+                LOG_WRN("FT_RACH_LSN: Next RACH repetition (SFN %u) would exceed validity period. Stopping listen attempts.", target_sfn_for_rach);
+                return;
+            }
+        }
+        rach_listen_start_time = calculate_target_modem_time(ctx,
+                                                              ctx->ft_sfn_zero_modem_time_anchor,
+                                                              ctx->current_sfn_at_anchor_update,
+                                                              target_sfn_for_rach,
+                                                              rach_adv_fields->start_subslot_index);
+        LOG_INF("FT_RACH_LSN: Advanced to next RACH opportunity: SFN %u, new start_time %llu",
+                target_sfn_for_rach, rach_listen_start_time);
     }
+
     if (listen_duration_modem_units == 0) {
-        LOG_ERR("FT_RACH_LSN: Calculated listen duration is 0. Aborting.");
+        LOG_ERR("FT_RACH_LSN: Calculated listen duration is 0 for mu %u. Aborting.", ft_mu);
         return;
     }
 
-    LOG_INF("FT_RACH_LSN: Scheduling RX on RACH C%u for SFN %u, StartSS %u (len %u subslots). RXDur:%u TU, TargetStart:%llu",
-            rach_carrier, target_sfn_for_rach, rach_adv_fields->start_subslot_index, rach_resource_len_subslots,
+    LOG_INF("FT_RACH_LSN: Scheduling RX on RACH C%u for SFN %u (initial calc was SFN %u), StartSS %u (len %u actual units, %u subslots). RXDur:%u TU, TargetStart:%llu",
+            rach_carrier, target_sfn_for_rach, initial_target_sfn_for_log,
+            rach_adv_fields->start_subslot_index,
+            rach_resource_len_actual_units, rach_resource_len_subslots,
             listen_duration_modem_units, rach_listen_start_time);
 
     uint32_t phy_op_handle = sys_rand32_get();
     int ret = dect_mac_phy_ctrl_start_rx(
         rach_carrier,
         listen_duration_modem_units,
-        NRF_MODEM_DECT_PHY_RX_MODE_CONTINUOUS, // Listen for whole window for any RACH attempt
+        NRF_MODEM_DECT_PHY_RX_MODE_CONTINUOUS,
         phy_op_handle,
-        ctx->own_short_rd_id, // Association Request is sent to FT's Short ID
+        ctx->own_short_rd_id,
         PENDING_OP_FT_RACH_RX_WINDOW);
 
     if (ret != 0) {
-        LOG_ERR("FT_SM: Failed to schedule RACH RX window: %d", ret);
-        // Could retry scheduling for next repetition based on repetition_code
+        LOG_ERR("FT_SM: Failed to schedule RACH RX window (SFN %u): %d", target_sfn_for_rach, ret);
     }
 }
+
+
+
 
 
 
