@@ -17,6 +17,13 @@
 
 LOG_MODULE_REGISTER(dect_mac_sm_pt, CONFIG_DECT_MAC_SM_PT_LOG_LEVEL);
 
+#ifndef HPC_RX_WINDOW_SIZE
+#define HPC_RX_WINDOW_SIZE 64
+#endif
+#ifndef HPC_RX_FORWARD_WINDOW_MAX_ADVANCE
+#define HPC_RX_FORWARD_WINDOW_MAX_ADVANCE 1024 // Allow a jump of up to 1024
+#endif
+
 // --- Static Globals for this Module ---
 // Store the PCC associated with an incoming PDC for context
 static struct {
@@ -783,24 +790,103 @@ static void pt_handle_phy_pdc_internal(const struct nrf_modem_dect_phy_pdc_event
                 cleartext_sec_ie_mux_len = mux_hdr_len_sec + ie_len_sec;
                 uint8_t ver, kidx, secivtype_from_ie; uint32_t hpc_from_ie;
                 if (parse_mac_security_info_ie_payload(ie_payload_sec, ie_len_sec, &ver, &kidx, &secivtype_from_ie, &hpc_from_ie) == 0) {
-                    LOG_INF("PT_SM_PDC_SEC (WITH_IE): MAC Sec Info IE from FT 0x%04X: PeerHPC_IE=%u, TrackedHPC=%u, SecIVType=%u",
-                            ft_sender_short_id_from_pcc, hpc_from_ie, active_ft_peer_ctx->hpc, secivtype_from_ie);
-                    // TODO: Implement full HPC windowing and resync request logic here for PT.
-                    // (Similar to FT's logic, updates active_ft_peer_ctx->hpc, highest_rx_peer_hpc,
-                    // and potentially sets ctx->send_mac_sec_info_ie_on_next_tx if FT requested PT's HPC)
-                    if (secivtype_from_ie == SEC_IV_TYPE_MODE1_HPC_PROVIDED) { // FT sends its HPC
-                        if (active_ft_peer_ctx->highest_rx_peer_hpc == 0 || hpc_from_ie > active_ft_peer_ctx->highest_rx_peer_hpc) {
-                            active_ft_peer_ctx->hpc = hpc_from_ie; active_ft_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
-                        } else if (hpc_from_ie < active_ft_peer_ctx->hpc && (active_ft_peer_ctx->hpc - hpc_from_ie) < HPC_RX_WINDOW_SIZE) {
-                             active_ft_peer_ctx->hpc = hpc_from_ie;
-                        } else { pdc_process_ok_for_feedback = false; }
-                    } else if (secivtype_from_ie == SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE) { // FT requests PT's HPC
-                        ctx->send_mac_sec_info_ie_on_next_tx = true; // PT will send its HPC back
-                        if (active_ft_peer_ctx->highest_rx_peer_hpc == 0 || hpc_from_ie > active_ft_peer_ctx->highest_rx_peer_hpc) {
-                            active_ft_peer_ctx->hpc = hpc_from_ie; active_ft_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
+                    // active_ft_peer_ctx is the context for the peer FT.
+                    // hpc_from_ie is the HPC value parsed from the MAC Security Info IE.
+
+                    LOG_INF("PDC_SEC_HPC_PT: RX SecIE from FT 0x%04X. HPC_IE=%u, MyTrackedPeerHPC.hpc=%u, MyTrackedPeerHPC.highest_rx=%u, SecIVType=%u",
+                            ft_sender_short_id_from_pcc,
+                            hpc_from_ie,
+                            active_ft_peer_ctx->hpc, /* Current HPC used for this PDU's IV (might be updated) */
+                            active_ft_peer_ctx->highest_rx_peer_hpc, /* Highest validated HPC from a SecIE */
+                            secivtype_from_ie);
+
+                    bool hpc_accepted_for_iv = false;
+
+                    if (secivtype_from_ie == SEC_IV_TYPE_MODE1_HPC_PROVIDED) {
+                        if (active_ft_peer_ctx->highest_rx_peer_hpc == 0 && hpc_from_ie > 0) { // First valid HPC received
+                            active_ft_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
+                            active_ft_peer_ctx->hpc = hpc_from_ie; // Use this for current PDU
+                            hpc_accepted_for_iv = true;
+                            LOG_DBG("PDC_SEC_HPC_PT: First HPC_PROVIDED %u accepted.", hpc_from_ie);
+                        } else {
+                            uint32_t forward_diff;
+                            if (hpc_from_ie >= active_ft_peer_ctx->highest_rx_peer_hpc) {
+                                forward_diff = hpc_from_ie - active_ft_peer_ctx->highest_rx_peer_hpc;
+                            } else { // hpc_from_ie wrapped around
+                                forward_diff = (UINT32_MAX - active_ft_peer_ctx->highest_rx_peer_hpc) + hpc_from_ie + 1;
+                            }
+
+                            if (forward_diff == 0) { // Same as highest seen
+                                active_ft_peer_ctx->hpc = hpc_from_ie;
+                                hpc_accepted_for_iv = true;
+                                LOG_DBG("PDC_SEC_HPC_PT: HPC_PROVIDED %u matches highest_rx. Accepted.", hpc_from_ie);
+                            } else if (forward_diff > 0 && forward_diff <= HPC_RX_FORWARD_WINDOW_MAX_ADVANCE) {
+                                active_ft_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
+                                active_ft_peer_ctx->hpc = hpc_from_ie;
+                                hpc_accepted_for_iv = true;
+                                LOG_DBG("PDC_SEC_HPC_PT: HPC_PROVIDED %u accepted (forward jump %u). New highest_rx.", hpc_from_ie, forward_diff);
+                            } else if (forward_diff > HPC_RX_FORWARD_WINDOW_MAX_ADVANCE) {
+                                LOG_ERR("PDC_SEC_HPC_PT: HPC_PROVIDED %u rejected. Excessive forward jump %u (max %u).",
+                                        hpc_from_ie, forward_diff, HPC_RX_FORWARD_WINDOW_MAX_ADVANCE);
+                                pdc_process_ok_for_feedback = false;
+                            } else { // hpc_from_ie is "older"
+                                uint32_t backward_diff;
+                                if (active_ft_peer_ctx->highest_rx_peer_hpc >= hpc_from_ie) {
+                                    backward_diff = active_ft_peer_ctx->highest_rx_peer_hpc - hpc_from_ie;
+                                } else { // highest_rx_peer_hpc wrapped relative to hpc_from_ie
+                                    backward_diff = (UINT32_MAX - hpc_from_ie) + active_ft_peer_ctx->highest_rx_peer_hpc + 1;
+                                }
+
+                                if (backward_diff < HPC_RX_WINDOW_SIZE) {
+                                    active_ft_peer_ctx->hpc = hpc_from_ie;
+                                    hpc_accepted_for_iv = true;
+                                    LOG_DBG("PDC_SEC_HPC_PT: HPC_PROVIDED %u accepted (older, but within anti-replay window %u).",
+                                            hpc_from_ie, backward_diff);
+                                } else {
+                                    LOG_ERR("PDC_SEC_HPC_PT: HPC_PROVIDED %u rejected. Too old or outside anti-replay window (diff %u, win %u).",
+                                            hpc_from_ie, backward_diff, HPC_RX_WINDOW_SIZE);
+                                    pdc_process_ok_for_feedback = false;
+                                }
+                            }
                         }
+                    } else if (secivtype_from_ie == SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE) {
+                        // FT is requesting PT's HPC. PT should note this and send its HPC back.
+                        LOG_INF("PDC_SEC_HPC_PT: FT 0x%04X requests PT's HPC, providing its HPC_IE=%u.",
+                                ft_sender_short_id_from_pcc, hpc_from_ie);
+                        // Validate hpc_from_ie from FT for *this current PDU's IV*.
+                        if (active_ft_peer_ctx->highest_rx_peer_hpc == 0 || hpc_from_ie >= active_ft_peer_ctx->highest_rx_peer_hpc ||
+                           (active_ft_peer_ctx->highest_rx_peer_hpc > hpc_from_ie && /* Check for wrap-around if hpc_from_ie is small */
+                            (active_ft_peer_ctx->highest_rx_peer_hpc - hpc_from_ie < HPC_RX_WINDOW_SIZE)) ||
+                           (hpc_from_ie < active_ft_peer_ctx->highest_rx_peer_hpc && /* Check for wrap-around if highest_rx_peer_hpc is small */
+                            (UINT32_MAX - active_ft_peer_ctx->highest_rx_peer_hpc + hpc_from_ie + 1 < HPC_RX_WINDOW_SIZE)) ) {
+                            active_ft_peer_ctx->hpc = hpc_from_ie;
+                            if (hpc_from_ie > active_ft_peer_ctx->highest_rx_peer_hpc || /* Standard update or wrap-around new */
+                                (active_ft_peer_ctx->highest_rx_peer_hpc > 0xFFFFFF00 && hpc_from_ie < 0x000000FF)) { // Heuristic for wrap
+                                active_ft_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
+                            }
+                            hpc_accepted_for_iv = true;
+                        } else {
+                             LOG_WRN("PDC_SEC_HPC_PT: HPC_IE %u with RESYNC_INITIATE from FT is too old vs highest_rx %u. Using highest_rx for IV.",
+                                     hpc_from_ie, active_ft_peer_ctx->highest_rx_peer_hpc);
+                             active_ft_peer_ctx->hpc = active_ft_peer_ctx->highest_rx_peer_hpc; // Fallback for IV
+                             hpc_accepted_for_iv = true; // Still accept PDU if possible
+                        }
+                        // Set flag for PT to send its HPC back to the FT
+                        ctx->send_mac_sec_info_ie_on_next_tx = true;
+                    } else { // Unknown SecIVType
+                        LOG_ERR("PDC_SEC_HPC_PT: Unknown SecIVType %u from FT 0x%04X. Rejecting PDU.",
+                                secivtype_from_ie, ft_sender_short_id_from_pcc);
+                        pdc_process_ok_for_feedback = false;
                     }
-                } else { LOG_ERR("PT_SM_PDC_SEC: Failed to parse MAC Sec Info IE from FT 0x%04X.", ft_sender_short_id_from_pcc); pdc_process_ok_for_feedback = false; }
+
+                    if (!hpc_accepted_for_iv && pdc_process_ok_for_feedback) {
+                        LOG_ERR("PDC_SEC_HPC_PT: HPC_IE %u was not accepted for IV construction. Rejecting PDU.", hpc_from_ie);
+                        pdc_process_ok_for_feedback = false;
+                    }
+
+                } else { LOG_ERR("PT_SM_PDC_SEC: Failed to parse MAC Sec Info IE from FT 0x%04X.", ft_sender_short_id_from_pcc); 
+                    pdc_process_ok_for_feedback = false; 
+                }
 
                 payload_to_decrypt_start = sdu_area_after_common_hdr + cleartext_sec_ie_mux_len;
                 payload_to_decrypt_len = sdu_area_plus_mic_len_in_payload - cleartext_sec_ie_mux_len;
@@ -861,7 +947,7 @@ static void pt_handle_phy_pdc_internal(const struct nrf_modem_dect_phy_pdc_event
         LOG_DBG("PT_SM_PDC: Unsecure PDU from FT 0x%04X.", ft_sender_short_id_from_pcc);
         // sdu_area_for_data_path and sdu_area_len_for_data_path are already set for non-secure
     }
-    
+
 process_feedback_pt_rx_sec_path:
     if (active_ft_peer_ctx && assoc_pcc_event->phy_type == 1 &&
         (link_is_expected_to_be_secure || security_applied_by_sender) ) {
@@ -1689,27 +1775,35 @@ static void pt_send_keep_alive_action(void) {
 
     LOG_INF("PT_SM_KA: Sending Keep Alive to associated FT 0x%04X.", ctx->role_ctx.pt.associated_ft.short_rd_id);
 
-    uint8_t sdu_area_buf[20]; 
+    uint8_t sdu_area_buf[20]; // KeepAlive IE is small, SecIE is 6 bytes.
     size_t current_sdu_area_len = 0;
-    int ie_len_written_val;
+    // int ie_len_written_val; // Declared later
+    size_t len_of_muxed_sec_ie_for_crypto_calc = 0; // Initialize
 
     bool secure_this_pdu = ctx->role_ctx.pt.associated_ft.is_secure && ctx->keys_provisioned;
     bool include_mac_sec_info_ie_for_ka = false;
-    uint8_t sec_iv_type_for_ka_ie = SEC_IV_TYPE_MODE1_HPC_PROVIDED; // Default if sending SecIE
+    uint8_t sec_iv_type_for_ka_ie = SEC_IV_TYPE_MODE1_HPC_PROVIDED; // Default
 
-    // Determine if MAC Sec Info IE is needed and its SecIVType
-    // This check is only relevant if the PDU will be secured and is not a HARQ retransmission.
-    if (secure_this_pdu /* && !is_retransmission_placeholder_ka - KA is always new */) {
-        dect_mac_peer_info_t *assoc_ft_ctx = &ctx->role_ctx.pt.associated_ft;
+    if (secure_this_pdu) {
+        dect_mac_peer_info_t *assoc_ft_ctx = &ctx->role_ctx.pt.associated_ft; // This is the peer (FT)
 
+        // Priority 1: PT needs to request FT's HPC
         if (assoc_ft_ctx->self_needs_to_request_hpc_from_peer) {
+            include_mac_sec_info_ie_for_ka = true;
             sec_iv_type_for_ka_ie = SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE;
-            include_mac_sec_info_ie_for_ka = true;
-        } else if (assoc_ft_ctx->peer_requested_hpc_resync || ctx->send_mac_sec_info_ie_on_next_tx) {
-            sec_iv_type_for_ka_ie = SEC_IV_TYPE_MODE1_HPC_PROVIDED;
-            include_mac_sec_info_ie_for_ka = true;
+            LOG_DBG("PT_KA_SEC: Sending SecIE with HPC_RESYNC_INITIATE to FT 0x%04X.", assoc_ft_ctx->short_rd_id);
         }
+        // Priority 2: FT requested PT's HPC (flag set by PT PDC handler)
+        else if (ctx->send_mac_sec_info_ie_on_next_tx) { // Global flag for PT to send its HPC
+            include_mac_sec_info_ie_for_ka = true;
+            sec_iv_type_for_ka_ie = SEC_IV_TYPE_MODE1_HPC_PROVIDED; // Send own HPC
+            LOG_DBG("PT_KA_SEC: Sending SecIE with HPC_PROVIDED to FT 0x%04X (FT requested or own HPC wrap).", assoc_ft_ctx->short_rd_id);
+        }
+        // Note: assoc_ft_ctx->peer_requested_hpc_resync is a flag *on the peer's context* indicating
+        // that the *peer* (FT) wants to send *its* HPC. This is handled when PT *receives* from FT.
+        // The flag ctx->send_mac_sec_info_ie_on_next_tx is what PT uses to decide to send its own HPC.
     }
+
 
     // 1. MAC Header Type Octet
     dect_mac_header_type_octet_t hdr_type_octet;

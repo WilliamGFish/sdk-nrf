@@ -97,7 +97,7 @@ if DECT_MAC_SECURITY_ENABLE
 
 config DECT_MAC_MASTER_PSK_HEX
     string "Master Pre-Shared Key (32 hex chars for 16 bytes)"
-    default "000102030405060708090A0B0C0D0E0F" // Default for testing
+    default "000102030405060708090A0B0C0D0E0F" 
     help
       The 16-byte master Pre-Shared Key (PSK) as a 32-character hexadecimal string.
       This key is used for the simplified PSK-based key derivation if no advanced
@@ -107,27 +107,34 @@ config DECT_MAC_MASTER_PSK_HEX
       this Kconfig option might be disabled or handled differently.
 
 config DECT_MAC_HPC_RX_WINDOW_SIZE
-    int "HPC Receive Window Size"
+    int "HPC Receive Window Size (Anti-Replay)"
     default 64
+    range 16 256
     help
       Hyper Packet Counter (HPC) receive window size. Defines how many
-      HPC values "behind" the newest known peer HPC are considered valid.
-      Helps accommodate packet reordering or minor desynchronization.
+      HPC values "behind" the newest known valid peer HPC are considered
+      acceptable to accommodate packet reordering or minor desynchronization.
+      A larger window is more tolerant but slightly increases replay risk if not combined
+      with other measures. ETSI does not mandate a size.
 
 config DECT_MAC_HPC_RX_FORWARD_WINDOW_MAX_ADVANCE
     int "HPC Receive Forward Window Maximum Advance"
     default 1024
+    range 128 8192
     help
-      Maximum allowable jump "ahead" for a received HPC value compared to the
-      newest known peer HPC. Prevents accepting extremely large, potentially
-      malicious or erroneous, HPC jumps.
+      Maximum allowable jump "ahead" for a received HPC value (in a MAC Sec Info IE)
+      compared to the newest known valid peer HPC. Helps prevent accepting
+      extremely large, potentially malicious or erroneous, HPC jumps which might
+      invalidate a large portion of the valid HPC space.
 
 config DECT_MAC_MAX_MIC_FAILURES_BEFORE_HPC_RESYNC
     int "Max MIC Failures Before Requesting HPC Resynchronization"
     default 3
+    range 1 10
     help
       Number of consecutive Message Integrity Code (MIC) failures from a peer
-      before this device requests an HPC resynchronization from that peer.
+      before this device requests an HPC resynchronization from that peer by
+      sending a MAC Security Info IE with SecIVType HPC_RESYNC_INITIATE.
 
 endif # DECT_MAC_SECURITY_ENABLE
 

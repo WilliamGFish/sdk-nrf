@@ -62,7 +62,6 @@ void dect_mac_sm_ft_beacon_timer_expired_action(void) {
 }
 
 // --- FT Public Functions ---
-
 void dect_mac_sm_ft_start_operation(void) {
     dect_mac_context_t* ctx = get_mac_context();
     dect_mac_change_state(MAC_STATE_FT_SCANNING);
@@ -1202,23 +1201,157 @@ static void ft_handle_phy_pdc_ft(const struct nrf_modem_dect_phy_pdc_event *pdc_
                     LOG_INF("FT_SM_PDC_SEC (WITH_IE): MAC Sec Info IE from PT 0x%04X: PeerHPC_IE=%u, TrackedHPC=%u, SecIVType=%u",
                             pt_sender_short_id_from_pcc, hpc_from_ie, pt_peer_ctx->hpc, secivtype_from_ie);
                     // TODO: Implement full HPC windowing and resync request logic here.
-                    // This involves updating pt_peer_ctx->hpc, pt_peer_ctx->highest_rx_peer_hpc,
-                    // and potentially setting pt_peer_ctx->peer_requested_hpc_resync or pdc_process_ok_for_feedback = false.
-                    // For now, simplified:
+                    // pt_peer_ctx is the context for the peer (e.g., ctx->role_ctx.ft.connected_pts[peer_slot_idx])
+                    // hpc_from_ie is the HPC value parsed from the MAC Security Info IE.
+
+                    LOG_INF("PDC_SEC_HPC: RX SecIE from Peer 0x%04X. HPC_IE=%u, MyTrackedPeerHPC.hpc=%u, MyTrackedPeerHPC.highest_rx=%u, SecIVType=%u",
+                            pt_sender_short_id_from_pcc, /* or ft_sender_short_id_from_pcc for PT */
+                            hpc_from_ie,
+                            pt_peer_ctx->hpc, /* Current HPC used for this PDU's IV (might be updated) */
+                            pt_peer_ctx->highest_rx_peer_hpc, /* Highest validated HPC from a SecIE */
+                            secivtype_from_ie);
+
+                    bool hpc_accepted_for_iv = false;
+
                     if (secivtype_from_ie == SEC_IV_TYPE_MODE1_HPC_PROVIDED) {
-                        if (pt_peer_ctx->highest_rx_peer_hpc == 0 || hpc_from_ie > pt_peer_ctx->highest_rx_peer_hpc) { // Simplified window
-                            pt_peer_ctx->hpc = hpc_from_ie; pt_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
-                        } else if (hpc_from_ie < pt_peer_ctx->hpc && (pt_peer_ctx->hpc - hpc_from_ie) < HPC_RX_WINDOW_SIZE) {
-                             pt_peer_ctx->hpc = hpc_from_ie; // Accept if within window
-                        } else { /* Out of window - potentially an error */ pdc_process_ok_for_feedback = false; }
-                    } else if (secivtype_from_ie == SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE) { // PT requests FT's HPC
-                        pt_peer_ctx->peer_requested_hpc_resync = true; // FT should send its HPC back
-                        // Still update tracked HPC from this IE if it's valid for this PDU's IV
-                        if (pt_peer_ctx->highest_rx_peer_hpc == 0 || hpc_from_ie > pt_peer_ctx->highest_rx_peer_hpc) {
-                            pt_peer_ctx->hpc = hpc_from_ie; pt_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
-                        } // else: if hpc_from_ie is old, but RESYNC_INITIATE, still honor request.
+                        if (pt_peer_ctx->highest_rx_peer_hpc == 0 && hpc_from_ie > 0) { // First valid HPC received
+                            pt_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
+                            pt_peer_ctx->hpc = hpc_from_ie; // Use this for current PDU
+                            hpc_accepted_for_iv = true;
+                            LOG_DBG("PDC_SEC_HPC: First HPC_PROVIDED %u accepted.", hpc_from_ie);
+
+                            
+
+                        } else {
+                            // Check for forward jump
+                            uint32_t forward_diff;
+                            if (hpc_from_ie >= pt_peer_ctx->highest_rx_peer_hpc) {
+                                forward_diff = hpc_from_ie - pt_peer_ctx->highest_rx_peer_hpc;
+                            } else { // hpc_from_ie wrapped around
+                                forward_diff = (UINT32_MAX - pt_peer_ctx->highest_rx_peer_hpc) + hpc_from_ie + 1;
+                            }
+
+                            if (forward_diff == 0) {
+                                pt_peer_ctx->hpc = hpc_from_ie;
+                                hpc_accepted_for_iv = true;
+                                LOG_DBG("PDC_SEC_HPC: HPC_PROVIDED %u matches highest_rx. Accepted.", hpc_from_ie);
+                            } else if (forward_diff > 0 && forward_diff <= CONFIG_DECT_MAC_HPC_RX_FORWARD_WINDOW_MAX_ADVANCE) {
+                                pt_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
+                                pt_peer_ctx->hpc = hpc_from_ie;
+                                hpc_accepted_for_iv = true;
+                                LOG_DBG("PDC_SEC_HPC: HPC_PROVIDED %u accepted (forward jump %u). New highest_rx.", hpc_from_ie, forward_diff);
+                            } else if (forward_diff > CONFIG_DECT_MAC_HPC_RX_FORWARD_WINDOW_MAX_ADVANCE) {
+                                LOG_ERR("PDC_SEC_HPC: HPC_PROVIDED %u rejected. Excessive forward jump %u (max %d).",
+                                        hpc_from_ie, forward_diff, CONFIG_DECT_MAC_HPC_RX_FORWARD_WINDOW_MAX_ADVANCE);
+                                pdc_process_ok_for_feedback = false;
+                            } else { // hpc_from_ie is "older"
+                                uint32_t backward_diff;
+                                if (pt_peer_ctx->highest_rx_peer_hpc >= hpc_from_ie) {
+                                    backward_diff = pt_peer_ctx->highest_rx_peer_hpc - hpc_from_ie;
+                                } else { 
+                                    backward_diff = (UINT32_MAX - hpc_from_ie) + pt_peer_ctx->highest_rx_peer_hpc + 1;
+                                }
+
+                                if (backward_diff < CONFIG_DECT_MAC_HPC_RX_WINDOW_SIZE) {
+                                    pt_peer_ctx->hpc = hpc_from_ie;
+                                    hpc_accepted_for_iv = true;
+                                    LOG_DBG("PDC_SEC_HPC: HPC_PROVIDED %u accepted (older, but within anti-replay window %u of %d).",
+                                            hpc_from_ie, backward_diff, CONFIG_DECT_MAC_HPC_RX_WINDOW_SIZE);
+                                } else {
+                                    LOG_ERR("PDC_SEC_HPC: HPC_PROVIDED %u rejected. Too old or outside anti-replay window (diff %u, win %d).",
+                                            hpc_from_ie, backward_diff, CONFIG_DECT_MAC_HPC_RX_WINDOW_SIZE);
+                                    pdc_process_ok_for_feedback = false;
+                                }
+                            }
+                        }
+
+                    } else if (secivtype_from_ie == SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE) {
+                        // Peer is requesting our HPC. We should note this and send our HPC back.
+                        // For *this current PDU's IV*, we should still validate the hpc_from_ie.
+                        // The peer sends its *current* HPC when it makes a RESYNC_INITIATE request.
+                        LOG_INF("PDC_SEC_HPC: Peer 0x%04X requests HPC resync, providing its HPC_IE=%u.",
+                                pt_sender_short_id_from_pcc, hpc_from_ie);
+                        
+                        // Validate hpc_from_ie from FT for *this current PDU's IV*.
+                        // Check if newer, or if older but within window (considering wrap-around for older check)
+                        bool use_hpc_from_ie_for_iv = false;
+                        if (pt_peer_ctx->highest_rx_peer_hpc == 0) { // First time or reset
+                            use_hpc_from_ie_for_iv = true;
+                        } else if (hpc_from_ie >= pt_peer_ctx->highest_rx_peer_hpc) { // Newer or same (could be retransmission)
+                            // Check for excessive forward jump only if strictly greater
+                            if (hpc_from_ie > pt_peer_ctx->highest_rx_peer_hpc) {
+                                uint32_t fwd_diff = hpc_from_ie - pt_peer_ctx->highest_rx_peer_hpc;
+                                if (fwd_diff <= CONFIG_DECT_MAC_HPC_RX_FORWARD_WINDOW_MAX_ADVANCE) {
+                                    use_hpc_from_ie_for_iv = true;
+                                } else {
+                                    LOG_WRN("PDC_SEC_HPC: HPC_IE %u with RESYNC_INITIATE has excessive fwd jump. Using highest_rx for IV.", hpc_from_ie);
+                                }
+                            } else { // hpc_from_ie == pt_peer_ctx->highest_rx_peer_hpc
+                                use_hpc_from_ie_for_iv = true;
+                            }
+                        } else { // hpc_from_ie < pt_peer_ctx->highest_rx_peer_hpc (check anti-replay window)
+                            uint32_t back_diff = pt_peer_ctx->highest_rx_peer_hpc - hpc_from_ie;
+                            // This simple subtraction is only okay if no wrap-around of hpc_from_ie has occurred
+                            // A more robust check:
+                            uint32_t effective_backward_diff;
+                            if (pt_peer_ctx->highest_rx_peer_hpc >= hpc_from_ie) {
+                                effective_backward_diff = pt_peer_ctx->highest_rx_peer_hpc - hpc_from_ie;
+                            } else { // highest_rx_peer_hpc wrapped relative to hpc_from_ie
+                                effective_backward_diff = (UINT32_MAX - hpc_from_ie) + pt_peer_ctx->highest_rx_peer_hpc + 1;
+                            }
+                            if (effective_backward_diff < CONFIG_DECT_MAC_HPC_RX_WINDOW_SIZE) {
+                                use_hpc_from_ie_for_iv = true;
+                            } else {
+                                LOG_WRN("PDC_SEC_HPC: HPC_IE %u with RESYNC_INITIATE is too old. Using highest_rx for IV.", hpc_from_ie);
+                            }
+                        }
+
+                        if (use_hpc_from_ie_for_iv) {
+                            pt_peer_ctx->hpc = hpc_from_ie;
+                            // Update highest_rx_peer_hpc only if hpc_from_ie is genuinely newer
+                            if (hpc_from_ie > pt_peer_ctx->highest_rx_peer_hpc ||
+                                (pt_peer_ctx->highest_rx_peer_hpc > 0xFFFFFF00 && hpc_from_ie < 0x000000FF && pt_peer_ctx->highest_rx_peer_hpc !=0) ) { // Heuristic for wrap
+                                pt_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
+                            }
+                            hpc_accepted_for_iv = true;
+                        } else {
+                             // If hpc_from_ie was not accepted for IV (e.g. too old, too far ahead),
+                             // use the last known good one for this PDU's IV.
+                             pt_peer_ctx->hpc = pt_peer_ctx->highest_rx_peer_hpc;
+                             hpc_accepted_for_iv = true; // Still try to process PDU with best guess HPC
+                        }
+
+                            pt_peer_ctx->hpc = hpc_from_ie; // Use this for current PDU
+                            if (hpc_from_ie > pt_peer_ctx->highest_rx_peer_hpc) { // Update highest if newer
+                                pt_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
+                            }
+                            hpc_accepted_for_iv = true;
+                        } else {
+                             LOG_WRN("PDC_SEC_HPC: HPC_IE %u with RESYNC_INITIATE is too old vs highest_rx %u. Using highest_rx for IV.",
+                                     hpc_from_ie, pt_peer_ctx->highest_rx_peer_hpc);
+                             pt_peer_ctx->hpc = pt_peer_ctx->highest_rx_peer_hpc; // Fallback for IV
+                             hpc_accepted_for_iv = true; // Still accept PDU if possible
+                        }
+                        // Set flag for us to send our HPC back
+                        if (ctx->role == MAC_ROLE_FT) { // FT received request from PT
+                            pt_peer_ctx->peer_requested_hpc_resync = true;
+                        } else { // PT received request from FT
+                            ctx->send_mac_sec_info_ie_on_next_tx = true; // Global flag for PT to send its HPC
+                        }
+                    } else { // Unknown SecIVType
+                        LOG_ERR("PDC_SEC_HPC: Unknown SecIVType %u from peer 0x%04X. Rejecting PDU.",
+                                secivtype_from_ie, pt_sender_short_id_from_pcc);
+                        pdc_process_ok_for_feedback = false;
                     }
-                } else { LOG_ERR("FT_SM_PDC_SEC: Failed to parse MAC Sec Info IE from PT 0x%04X.", pt_sender_short_id_from_pcc); pdc_process_ok_for_feedback = false; }
+
+                    if (!hpc_accepted_for_iv && pdc_process_ok_for_feedback) {
+                        // This case should ideally be caught by specific rejection paths above.
+                        LOG_ERR("PDC_SEC_HPC: HPC_IE %u was not accepted for IV construction. Rejecting PDU.", hpc_from_ie);
+                        pdc_process_ok_for_feedback = false;
+                    }
+                } else { LOG_ERR("FT_SM_PDC_SEC: Failed to parse MAC Sec Info IE from PT 0x%04X.", pt_sender_short_id_from_pcc); 
+                         pdc_process_ok_for_feedback = false; 
+                }
 
                 payload_to_decrypt_start = sdu_area_after_common_hdr + cleartext_sec_ie_mux_len;
                 payload_to_decrypt_len = sdu_area_plus_mic_len_in_payload - cleartext_sec_ie_mux_len;
@@ -1264,7 +1397,7 @@ static void ft_handle_phy_pdc_ft(const struct nrf_modem_dect_phy_pdc_event *pdc_
             LOG_ERR("FT_SM_PDC_SEC: MIC FAIL from PT 0x%04X (PSN %u, PeerHPC %u). Discarding.",
                     pt_sender_short_id_from_pcc, received_psn, pt_peer_ctx->hpc);
             pt_peer_ctx->consecutive_mic_failures++;
-            if (pt_peer_ctx->consecutive_mic_failures >= MAX_MIC_FAILURES_BEFORE_HPC_RESYNC) {
+            if (pt_peer_ctx->consecutive_mic_failures >= CONFIG_DECT_MAC_MAX_MIC_FAILURES_BEFORE_HPC_RESYNC) {
                 LOG_WRN("FT_SM_PDC_SEC: Max MIC failures (%u) for PT 0x%04X. Will request HPC resync from PT.",
                         pt_peer_ctx->consecutive_mic_failures, pt_sender_short_id_from_pcc);
                 pt_peer_ctx->self_needs_to_request_hpc_from_peer = true;
@@ -1283,7 +1416,7 @@ static void ft_handle_phy_pdc_ft(const struct nrf_modem_dect_phy_pdc_event *pdc_
         LOG_DBG("FT_SM_PDC: Unsecure PDU from PT 0x%04X.", pt_sender_short_id_from_pcc);
         // sdu_area_for_data_path and sdu_area_len_for_data_path are already set correctly for non-secure case
     }
-    
+
 process_feedback_ft_pdc_secure_rx_path:
     if (pt_peer_ctx && pt_peer_ctx->is_valid && current_pcc_data.phy_type == 1 &&
         (link_is_expected_to_be_secure || security_applied_by_sender) ) {
@@ -1551,32 +1684,45 @@ static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t
 
     // --- SDU Area Construction ---
     int current_sdu_area_offset = 0;
-    int ie_len_written_val; // Renamed to avoid conflict
+    // int ie_len_written_val; // Declared later as needed
     uint8_t temp_ie_payload_buf_resp[64]; // Temp buffer for individual IE payloads
+    size_t len_of_muxed_sec_ie_for_crypto_calc = 0; // Initialize
 
     // Prepend MAC Security Info IE if this response is secured
     if (secure_this_response) {
-        // FT sends its current TX HPC. This is the first time PT learns it for this session.
-        ie_len_written_val = build_mac_security_info_ie_muxed(
-            sdu_area_buf + current_sdu_area_offset, // sdu_area_buf is defined in the function
+        // For an Association Response that establishes security, FT *provides* its current HPC.
+        uint8_t sec_iv_type_for_assoc_resp = SEC_IV_TYPE_MODE1_HPC_PROVIDED;
+        // Check if FT also needs to request PT's HPC (e.g. if PT's AssocReq was unsecure but FT wants secure link)
+        // This is less common for AssocResp; usually, PT initiates HPC sync if needed after this.
+        // For now, FT just provides its HPC.
+
+        int ie_len_sec_info = build_mac_security_info_ie_muxed(
+            sdu_area_buf + current_sdu_area_offset,
             sizeof(sdu_area_buf) - current_sdu_area_offset,
-            0, ctx->current_key_index, // Version 0, FT's current key index for this PT link
-            SEC_IV_TYPE_MODE1_HPC_PROVIDED,
+            0, // Version for SecIE
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].current_key_index_for_peer, // Use key index for this peer
+            sec_iv_type_for_assoc_resp,
             ctx->hpc); // FT's own current global TX HPC
-        if (ie_len_written_val < 0) {
-            LOG_ERR("FT_ASSOC_RESP: Failed to build MAC Sec Info IE for secure response: %d", ie_len_written_val);
-            // Cannot send secured response without it, could send unsecure or fail fully.
-            // For now, fail the operation.
-            return;
+        
+        if (ie_len_sec_info < 0) {
+            LOG_ERR("FT_ASSOC_RESP: Failed to build MAC Sec Info IE for secure response: %d", ie_len_sec_info);
+            return; // Cannot send secured response without it
         }
-        current_sdu_area_offset += ie_len_written_val;
-        len_of_muxed_sec_ie_for_crypto = ie_len_written_val; // Store length of MUXed SecIE
-        LOG_DBG("FT_ASSOC_RESP: Including MAC Sec Info IE (FT_HPC: %u) in secure response.", ctx->hpc);
-        // FT's global send_mac_sec_info_ie_on_next_tx is for its own HPC wrap,
-        // this SecIE is specific to initiating security with this PT.
-        // If global flag was also set, it effectively gets "consumed" by sending this.
-        if(ctx->send_mac_sec_info_ie_on_next_tx) ctx->send_mac_sec_info_ie_on_next_tx = false;
+        current_sdu_area_offset += ie_len_sec_info;
+        len_of_muxed_sec_ie_for_crypto_calc = ie_len_sec_info;
+        LOG_DBG("FT_ASSOC_RESP: Including MAC Sec Info IE (FT_HPC: %u, SecIVType: %u) in secure response.",
+                ctx->hpc, sec_iv_type_for_assoc_resp);
+
+        // If FT's global HPC wrap flag was set, sending this SecIE (which includes current HPC) consumes the flag.
+        if(ctx->send_mac_sec_info_ie_on_next_tx && sec_iv_type_for_assoc_resp == SEC_IV_TYPE_MODE1_HPC_PROVIDED) {
+            ctx->send_mac_sec_info_ie_on_next_tx = false;
+            LOG_DBG("FT_ASSOC_RESP: Cleared global send_mac_sec_info_ie_on_next_tx flag.");
+        }
+        // If FT needed to request PT's HPC (self_needs_to_request_hpc_from_peer for this PT),
+        // and we sent RESYNC_INITIATE, clear that flag. (Not typical for AssocResp from FT).
     }
+
+
 
     // Add Association Response IE
     ie_len_written_val = serialize_assoc_resp_ie_payload(temp_ie_payload_buf_resp, sizeof(temp_ie_payload_buf_resp), &resp_fields);

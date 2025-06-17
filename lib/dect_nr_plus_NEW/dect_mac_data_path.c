@@ -497,13 +497,13 @@ static int send_data_mac_sdu_via_phy_internal(dect_mac_context_t* ctx,
     }
 
 // Determine if MAC Security Info IE needs to be included and the type of SecIV
-    bool send_own_hpc_as_provided_due_to_peer_req_or_self_wrap = false;
-    bool send_hpc_resync_initiate_to_peer = false;
+    uint8_t sec_iv_type_for_current_tx_ie = SEC_IV_TYPE_MODE1_HPC_PROVIDED; // Default if IE is sent
     include_mac_sec_info_ie = false; // Default to false
 
     if (security_active_for_this_pdu && !is_retransmission) {
         dect_mac_peer_info_t *peer_context_for_tx = NULL;
         if (ctx->role == MAC_ROLE_PT) {
+            // For PT, peer_context_for_tx is always its associated_ft
             if (ctx->role_ctx.pt.associated_ft.is_valid && ctx->role_ctx.pt.associated_ft.long_rd_id == receiver_long_id) {
                 peer_context_for_tx = &ctx->role_ctx.pt.associated_ft;
             }
@@ -515,35 +515,40 @@ static int send_data_mac_sdu_via_phy_internal(dect_mac_context_t* ctx,
         }
 
         if (peer_context_for_tx) {
-            // Case 1: We need to request peer's HPC (due to our MIC failures from them)
+            // Priority 1: This node needs to request peer's HPC (due to MIC failures from peer)
             if (peer_context_for_tx->self_needs_to_request_hpc_from_peer) {
-                send_hpc_resync_initiate_to_peer = true;
                 include_mac_sec_info_ie = true;
-                // Flag is cleared *after* successful TX of this PDU (in op_complete or similar)
-                // For now, let's clear it here optimistically. If TX fails, it might get set again.
-                // Better: clear it only if this SecIE with INITIATE is actually sent and PHY op is OK.
-                // For simplicity now, clear it here.
-                // peer_context_for_tx->self_needs_to_request_hpc_from_peer = false; // Moved to after successful send
+                sec_iv_type_for_current_tx_ie = SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE;
+                LOG_DBG("DATA_TX_SEC: Sending SecIE with HPC_RESYNC_INITIATE to peer 0x%04X", peer_context_for_tx->short_rd_id);
             }
-            // Case 2: Peer requested our HPC, or our own HPC wrapped
-            if (peer_context_for_tx->peer_requested_hpc_resync || ctx->send_mac_sec_info_ie_on_next_tx) {
-                send_own_hpc_as_provided_due_to_peer_req_or_self_wrap = true;
+            // Priority 2: Peer requested this node's HPC
+            else if (peer_context_for_tx->peer_requested_hpc_resync) {
                 include_mac_sec_info_ie = true;
-                // Flags cleared after deciding to send
-                // peer_context_for_tx->peer_requested_hpc_resync = false; // Moved to after successful send
-                // ctx->send_mac_sec_info_ie_on_next_tx = false; // Moved to after successful send
+                sec_iv_type_for_current_tx_ie = SEC_IV_TYPE_MODE1_HPC_PROVIDED; // Send own HPC
+                LOG_DBG("DATA_TX_SEC: Sending SecIE with HPC_PROVIDED to peer 0x%04X (peer requested).", peer_context_for_tx->short_rd_id);
             }
-        } else if (ctx->send_mac_sec_info_ie_on_next_tx) { // Global flag for own HPC wrap, even if peer_context not found (e.g. AssocResp)
-            send_own_hpc_as_provided_due_to_peer_req_or_self_wrap = true;
+            // Priority 3: This node's own HPC wrapped (global flag for PT, or FT's general flag)
+            else if (ctx->send_mac_sec_info_ie_on_next_tx) { // This flag is global for PT, or general for FT
+                include_mac_sec_info_ie = true;
+                sec_iv_type_for_current_tx_ie = SEC_IV_TYPE_MODE1_HPC_PROVIDED; // Send own HPC
+                LOG_DBG("DATA_TX_SEC: Sending SecIE with HPC_PROVIDED to peer 0x%04X (own HPC wrap).", peer_context_for_tx->short_rd_id);
+            }
+        } else if (ctx->send_mac_sec_info_ie_on_next_tx) {
+            // This case applies if peer_context_for_tx was NULL (e.g. sending AssocResp to a new PT before full context established)
+            // AND our own HPC wrapped (unlikely for AssocResp, but possible for other control messages if peer context is temp).
             include_mac_sec_info_ie = true;
-            // ctx->send_mac_sec_info_ie_on_next_tx = false; // Moved
+            sec_iv_type_for_current_tx_ie = SEC_IV_TYPE_MODE1_HPC_PROVIDED;
+            LOG_DBG("DATA_TX_SEC: Sending SecIE with HPC_PROVIDED (own HPC wrap, no specific peer context for flags).");
         }
+        // Note: The flags (self_needs_to_request_hpc_from_peer, peer_requested_hpc_resync, send_mac_sec_info_ie_on_next_tx)
+        // should be cleared *after* the successful scheduling of this PDU by dect_mac_phy_ctrl_start_tx_assembled.
+        // This is handled later in this function.
     }
-    // Retransmissions never include MAC Sec Info IE for these purposes
+    // Retransmissions should typically not send a MAC Sec Info IE for HPC sync purposes,
+    // as they use the original HPC/PSN for IV. If an HPC update is needed, it's better with a new PDU.
     if (is_retransmission) {
         include_mac_sec_info_ie = false;
     }
-
 
     if (security_active_for_this_pdu) {
         mac_hdr_type_octet.mac_security = include_mac_sec_info_ie ? MAC_SECURITY_USED_WITH_IE : MAC_SECURITY_USED_NO_IE;
