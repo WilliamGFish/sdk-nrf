@@ -199,6 +199,38 @@ static int ft_get_peer_slot_idx(dect_mac_context_t* ctx, uint16_t pt_short_id) {
 
 
 
+void dect_mac_sm_ft_handle_auth_pdu(uint16_t pt_short_id, const uint8_t *pdu_data, size_t pdu_len)
+{
+    ARG_UNUSED(pdu_data);
+    ARG_UNUSED(pdu_len);
+    dect_mac_context_t* ctx = get_mac_context();
+    int peer_idx = ft_get_peer_slot_idx(ctx, pt_short_id);
+
+    if (peer_idx == -1 || !ctx->role_ctx.ft.connected_pts[peer_idx].is_valid) {
+        LOG_WRN("FT_AUTH_STUB: Received Auth PDU from unknown/invalid PT 0x%04X.", pt_short_id);
+        return;
+    }
+
+    LOG_INF("FT_AUTH_STUB: Received (stubbed) Auth PDU from PT 0x%04X (slot %d, len %zu).",
+            pt_short_id, peer_idx, pdu_len);
+
+    // A real protocol would parse pdu_data and take action.
+    // For example, if PT sent an Auth Response, FT might verify it and then:
+    // if (auth_response_is_valid) {
+    //     ctx->role_ctx.ft.connected_pts[peer_idx].is_secure = true;
+    //     LOG_INF("FT_AUTH_STUB: Authentication with PT 0x%04X complete. Link SECURE.");
+    //     // FT might then send a final "Secure Link Confirm" PDU or start secure data.
+    // } else {
+    //     LOG_WRN("FT_AUTH_STUB: Auth PDU from PT 0x%04X failed validation. Releasing PT.");
+    //     // Release the PT:
+    //     // build_and_send_assoc_release(pt_short_id, ...);
+    //     // clear_peer_slot(peer_idx);
+    // }
+    // Since our current PSK model is FT-driven upon AssocReq, this handler is mostly a placeholder.
+    // The FT already marked the link as secure (or not) in ft_process_association_request_pdu.
+}
+
+
 static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluster_beacon_ie_fields_t *cb_fields) {
     memset(cb_fields, 0, sizeof(dect_mac_cluster_beacon_ie_fields_t));
 

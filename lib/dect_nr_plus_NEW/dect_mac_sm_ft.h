@@ -45,5 +45,15 @@ void dect_mac_sm_ft_handle_event(const struct dect_mac_event_msg *msg);
  */
 void dect_mac_sm_ft_beacon_timer_expired_action(void);
 
+/**
+ * @brief FT handles an incoming authentication-related PDU from a PT.
+ *
+ * @param pt_short_id Short RD ID of the PT sending the PDU.
+ * @param pdu_data Pointer to the authentication PDU payload.
+ * @param pdu_len Length of the payload.
+ */
+void dect_mac_sm_ft_handle_auth_pdu(uint16_t pt_short_id, const uint8_t *pdu_data, size_t pdu_len);
+// --- End of new declaration ---
+
 
 #endif /* DECT_MAC_SM_FT_H__ */

@@ -1648,8 +1648,27 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
         }
 
         // Proceed to "authentication" (simplified PSK key derivation)
-        pt_start_authentication_with_ft_action(ctx); // This changes state to AUTHENTICATING then to ASSOCIATED
-                                                     // and starts KeepAlive timer.
+        // New call to the authentication protocol initiator stub:
+        // Determine if security should be attempted (e.g., based on FT capabilities if parsed, or PT policy)
+        bool attempt_security = IS_ENABLED(CONFIG_DECT_MAC_SECURITY_ENABLE); // Default to try if MAC sec enabled
+        // TODO: A more robust check would be:
+        // if (ft_caps_found && (ft_caps_parsed.mac_security_modes_code & 0b01)) attempt_security = true;
+
+        if (attempt_security) {
+            dect_mac_change_state(MAC_STATE_PT_AUTHENTICATING); // Set state before initiating
+            dect_mac_sm_pt_initiate_authentication_protocol();
+        } else {
+            LOG_INF("PT_SM_ASSOC_RESP: Security not attempted. Moving to ASSOCIATED (unsecure).");
+            // If not attempting security, complete the association as unsecure.
+            ctx->keys_provisioned = false;
+            ctx->role_ctx.pt.associated_ft.is_secure = false;
+            dect_mac_change_state(MAC_STATE_ASSOCIATED);
+            k_timer_start(&ctx->role_ctx.pt.keep_alive_timer, K_MSEC(ctx->config.keep_alive_period_ms), K_MSEC(ctx->config.keep_alive_period_ms));
+            if (IS_ENABLED(CONFIG_DECT_MAC_PT_MOBILITY_ENABLE)) {
+                 k_timer_start(&ctx->role_ctx.pt.mobility_scan_timer, K_MSEC(ctx->config.mobility_scan_interval_ms), K_MSEC(ctx->config.mobility_scan_interval_ms));
+            }
+            ctx->role_ctx.pt.current_assoc_retries = 0;
+        }
 
     } else { // Association Rejected
         LOG_WRN("PT_SM: Association REJECTED by FT 0x%04X. Cause: %u, Timer Code: %u.",
@@ -1922,6 +1941,12 @@ static void pt_start_authentication_with_ft_action(dect_mac_context_t *ctx) {
     }
 }
 
+/**
+ * @brief pt_authentication_complete_action
+ * 
+ * @param ctx 
+ * @param success 
+ */
 static void pt_authentication_complete_action(dect_mac_context_t* ctx, bool success) {
     if (!ctx) {
         LOG_ERR("PT_AUTH_COMPLETE: NULL context provided.");
@@ -1993,6 +2018,52 @@ static void pt_authentication_complete_action(dect_mac_context_t* ctx, bool succ
         }
     }
 }
+
+
+void dect_mac_sm_pt_initiate_authentication_protocol(void)
+{
+    dect_mac_context_t* ctx = get_mac_context();
+    if (ctx->state != MAC_STATE_PT_AUTHENTICATING && ctx->state != MAC_STATE_ASSOCIATED) {
+        // Can be called from ASSOCIATED if re-auth is needed, or SM transitions to AUTHENTICATING first.
+        // For now, assume it's called when appropriate.
+        LOG_WRN("PT_AUTH_STUB: Initiate auth called in unexpected state %s", dect_mac_state_to_str(ctx->state));
+    }
+    LOG_INF("PT_AUTH_STUB: Initiating (stubbed) authentication protocol with FT 0x%04X.",
+            ctx->role_ctx.pt.associated_ft.short_rd_id);
+
+    // For this stub, we directly proceed to the PSK-based key derivation logic.
+    // A real protocol would start sending an Auth Request PDU here.
+    // The pt_start_authentication_with_ft_action already changes state to AUTHENTICATING.
+    // If called from ASSOCIATED, we might need to change state first.
+    if (ctx->state == MAC_STATE_ASSOCIATED) {
+        dect_mac_change_state(MAC_STATE_PT_AUTHENTICATING);
+    }
+    pt_start_authentication_with_ft_action(ctx);
+}
+
+void dect_mac_sm_pt_handle_auth_pdu(const uint8_t *pdu_data, size_t pdu_len)
+{
+    ARG_UNUSED(pdu_data);
+    ARG_UNUSED(pdu_len);
+    dect_mac_context_t* ctx = get_mac_context();
+
+    LOG_INF("PT_AUTH_STUB: Received (stubbed) Auth PDU from FT 0x%04X (len %zu). Processing...",
+            ctx->role_ctx.pt.associated_ft.short_rd_id, pdu_len);
+
+    // A real protocol would parse the PDU and take action.
+    // For this stub, if it were a multi-step protocol, it might call pt_authentication_complete_action
+    // or send another PDU. Since our PSK "protocol" is one-step (local derivation),
+    // this handler might not be directly called by the PSK flow.
+    // If FT *were* to send a confirmation after its own key derivation (it doesn't in PSK model),
+    // this is where PT would process it.
+    // For now, this is a placeholder.
+    if (ctx->state == MAC_STATE_PT_AUTHENTICATING) {
+        // Example: If this PDU signaled success from FT.
+        // pt_authentication_complete_action(ctx, true);
+    }
+}
+
+
 
 
 static void pt_update_mobility_candidate(uint16_t carrier, int16_t rssi, uint32_t long_id, uint16_t short_id)

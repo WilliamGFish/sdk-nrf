@@ -97,11 +97,14 @@ if DECT_MAC_SECURITY_ENABLE
 
 config DECT_MAC_MASTER_PSK_HEX
     string "Master Pre-Shared Key (32 hex chars for 16 bytes)"
-    default "000102030405060708090A0B0C0D0E0F"
+    default "000102030405060708090A0B0C0D0E0F" // Default for testing
     help
-      The 16-byte master Pre-Shared Key (PSK) as a 32-character hex string.
-      This key is used for the simplified PSK-based key derivation.
-      IMPORTANT: For production, this key must be securely provisioned.
+      The 16-byte master Pre-Shared Key (PSK) as a 32-character hexadecimal string.
+      This key is used for the simplified PSK-based key derivation if no advanced
+      authentication protocol is implemented.
+      Example: "00112233445566778899AABBCCDDEEFF"
+      IMPORTANT: For production, this key must be securely provisioned and
+      this Kconfig option might be disabled or handled differently.
 
 config DECT_MAC_HPC_RX_WINDOW_SIZE
     int "HPC Receive Window Size"

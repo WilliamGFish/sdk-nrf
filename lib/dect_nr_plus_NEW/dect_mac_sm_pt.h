@@ -71,5 +71,22 @@ void pt_rach_backoff_timer_expired_action(void);
  */
 void pt_rach_response_window_timer_expired_action(void);
 
+/**
+ * @brief PT initiates the (stubbed) authentication protocol with the associated FT.
+ *
+ * Called after a successful association response if security is desired.
+ * For now, this directly triggers local PSK-based key derivation.
+ * A real implementation would start exchanging authentication PDUs.
+ */
+void dect_mac_sm_pt_initiate_authentication_protocol(void);
+
+/**
+ * @brief PT handles an incoming authentication-related PDU from the FT.
+ *
+ * @param pdu_data Pointer to the authentication PDU payload.
+ * @param pdu_len Length of the payload.
+ */
+void dect_mac_sm_pt_handle_auth_pdu(const uint8_t *pdu_data, size_t pdu_len);
+
 
 #endif /* DECT_MAC_SM_PT_H__ */

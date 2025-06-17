@@ -228,7 +228,32 @@ int dect_mac_core_init(dect_mac_role_t role, uint32_t provisioned_long_rd_id)
     // Example: Hardcode a PSK for demonstration. Replace with secure provisioning.
     const uint8_t example_psk[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f};
     memcpy(ctx->master_psk, example_psk, sizeof(ctx->master_psk));
-    ctx->master_psk_provisioned = true;
+
+    // Load PSK from Kconfig
+    ctx->master_psk_provisioned = false;
+    if (IS_ENABLED(CONFIG_DECT_MAC_SECURITY_ENABLE)) {
+        const char *psk_hex_str = CONFIG_DECT_MAC_MASTER_PSK_HEX;
+        size_t psk_hex_len = strlen(psk_hex_str);
+
+        if (psk_hex_len == 32) { // 16 bytes = 32 hex characters
+            size_t psk_bin_len;
+            int err = hex2bin(psk_hex_str, psk_hex_len, ctx->master_psk, sizeof(ctx->master_psk), &psk_bin_len);
+            if (err == 0 && psk_bin_len == 16) {
+                ctx->master_psk_provisioned = true;
+                LOG_INF("MAC Core: Master PSK loaded from Kconfig.");
+                LOG_HEXDUMP_DBG(ctx->master_psk, sizeof(ctx->master_psk), "PSK Val:");
+            } else {
+                LOG_ERR("MAC Core: Failed to convert Kconfig PSK_HEX (len %zu, err %d, bin_len %zu). Security will be impaired.",
+                        psk_hex_len, err, psk_bin_len);
+            }
+        } else if (psk_hex_len == 0) {
+            LOG_WRN("MAC Core: Kconfig PSK_HEX is empty. No PSK provisioned.");
+        } else {
+            LOG_ERR("MAC Core: Kconfig PSK_HEX has invalid length %zu (expected 32). Security will be impaired.", psk_hex_len);
+        }
+    } else {
+        LOG_INF("MAC Core: MAC Security is disabled. PSK not loaded.");
+    }
 
 
     LOG_INF("MAC Core Context Initialized. PSN=0x%03X, OwnHPC=%u", ctx->psn, ctx->hpc);
