@@ -78,6 +78,10 @@ K_FIFO_DEFINE(g_dlc_internal_mac_rx_fifo);
 K_FIFO_DEFINE(g_dlc_to_app_rx_fifo);
 // FIFO to signal the DLC TX service thread which job index needs retransmission
 K_FIFO_DEFINE(g_dlc_retransmit_signal_fifo);
+// Memory slab for DLC RX delivery items to CVG/App
+#define MAX_DLC_RX_DELIVERY_ITEMS 8 // Example size, tune as needed
+K_MEM_SLAB_DEFINE(g_dlc_rx_delivery_item_slab, sizeof(dlc_rx_delivery_item_t), MAX_DLC_RX_DELIVERY_ITEMS, 4);
+
 
 // --- Forward Declarations ---
 static void dlc_reassembly_timeout_handler(struct k_timer *timer_id);
@@ -246,27 +250,33 @@ static void dlc_rx_thread_entry(void *p1, void *p2, void *p3)
                 goto free_mac_sdu_and_continue_rx_loop;
             }
 
-            size_t payload_len = dlc_pdu_len - dlc_hdr_len_type0;
             const uint8_t *payload_ptr = dlc_pdu + dlc_hdr_len_type0;
-
+            size_t payload_len = dlc_pdu_len - dlc_hdr_len_type0;
+            
             if (payload_len > 0) {
-                mac_sdu_t *cvg_sdu = dect_mac_api_buffer_alloc(K_NO_WAIT);
-                if (cvg_sdu) {
-                    if (payload_len <= sizeof(cvg_sdu->data)) {
-                        memcpy(cvg_sdu->data, payload_ptr, payload_len);
-                        cvg_sdu->len = payload_len;
-                        // cvg_sdu->dlc_service_type = dlc_sdu_service_type_for_cvg; // If struct supports
-                        k_fifo_put(&g_dlc_to_app_rx_fifo, cvg_sdu);
-                        LOG_DBG("DLC_RX: Passed Type 0 SDU (len %zu) to CVG.", payload_len);
+                dlc_rx_delivery_item_t *delivery_item = NULL;
+                if (k_mem_slab_alloc(&g_dlc_rx_delivery_item_slab, (void **)&delivery_item, K_NO_WAIT) == 0) {
+                    mac_sdu_t *cvg_sdu_buf = dect_mac_api_buffer_alloc(K_NO_WAIT); // Buffer for the actual data
+                    if (cvg_sdu_buf) {
+                        if (payload_len <= sizeof(cvg_sdu_buf->data)) {
+                            memcpy(cvg_sdu_buf->data, payload_ptr, payload_len);
+                            cvg_sdu_buf->len = payload_len;
+                            delivery_item->sdu_buf = cvg_sdu_buf;
+                            delivery_item->dlc_service_type = processed_dlc_service_type;
+                            k_fifo_put(&g_dlc_to_app_rx_fifo, delivery_item);
+                            LOG_DBG("DLC_RX: Queued Type 0 SDU (len %zu, svc %u) to CVG.", payload_len, processed_dlc_service_type);
+                        } else {
+                            LOG_ERR("DLC_RX: Type 0 payload (%zu) too large for CVG SDU buffer. Dropping.", payload_len);
+                            dect_mac_api_buffer_free(cvg_sdu_buf);
+                            k_mem_slab_free(&g_dlc_rx_delivery_item_slab, (void**)&delivery_item);
+                        }
                     } else {
-                        LOG_ERR("DLC_RX: Type 0 payload (%zu) too large for CVG SDU buffer. Dropping.", payload_len);
-                        dect_mac_api_buffer_free(cvg_sdu);
+                        LOG_ERR("DLC_RX: Failed to alloc data buffer for CVG delivery (Type0).");
+                        k_mem_slab_free(&g_dlc_rx_delivery_item_slab, (void**)&delivery_item);
                     }
                 } else {
-                    LOG_ERR("DLC_RX: Failed to alloc buffer for CVG delivery (Type0). Payload len %zu dropped.", payload_len);
+                    LOG_ERR("DLC_RX: Failed to alloc delivery item for CVG (Type0). Payload len %zu dropped.", payload_len);
                 }
-            } else {
-                 LOG_DBG("DLC_RX: Type 0 PDU (IE 0x%X) with zero payload length.", ie_type);
             }
         } else if (ie_type == DLC_IE_TYPE_DATA_TYPE_123_NO_ROUTING ||
                    ie_type == DLC_IE_TYPE_DATA_TYPE_123_WITH_ROUTING ||
@@ -297,17 +307,31 @@ static void dlc_rx_thread_entry(void *p1, void *p2, void *p3)
 
                 LOG_DBG("DLC_RX: SN %u COMPLETE SDU (len %zu) received.", sn, segment_payload_len);
                 if (segment_payload_len > 0) {
-                    mac_sdu_t *cvg_sdu = dect_mac_api_buffer_alloc(K_NO_WAIT);
-                    if (cvg_sdu) {
-                         if (segment_payload_len <= sizeof(cvg_sdu->data)) {
-                            memcpy(cvg_sdu->data, segment_payload_ptr, segment_payload_len);
-                            cvg_sdu->len = segment_payload_len;
-                            k_fifo_put(&g_dlc_to_app_rx_fifo, cvg_sdu);
+
+                dlc_rx_delivery_item_t *delivery_item = NULL;
+                if (k_mem_slab_alloc(&g_dlc_rx_delivery_item_slab, (void **)&delivery_item, K_NO_WAIT) == 0) {
+                    mac_sdu_t *cvg_sdu_buf = dect_mac_api_buffer_alloc(K_NO_WAIT);
+                    if (cvg_sdu_buf) {
+                        if (segment_payload_len <= sizeof(cvg_sdu_buf->data)) {
+                            memcpy(cvg_sdu_buf->data, segment_payload_ptr, segment_payload_len);
+                            cvg_sdu_buf->len = segment_payload_len;
+                            delivery_item->sdu_buf = cvg_sdu_buf;
+                            delivery_item->dlc_service_type = processed_dlc_service_type; // This was set based on IE type
+                            k_fifo_put(&g_dlc_to_app_rx_fifo, delivery_item);
+                            LOG_DBG("DLC_RX: Queued COMPLETE SDU (SN %u, len %zu, svc %u) to CVG.", sn, segment_payload_len, processed_dlc_service_type);
                         } else {
-                             LOG_ERR("DLC_RX: COMPLETE SDU SN %u (len %zu) too large for CVG buffer. Dropping.", sn, segment_payload_len);
-                             dect_mac_api_buffer_free(cvg_sdu);
+                            LOG_ERR("DLC_RX: COMPLETE SDU SN %u (len %zu) too large for CVG buffer. Dropping.", sn, segment_payload_len);
+                            dect_mac_api_buffer_free(cvg_sdu_buf);
+                            k_mem_slab_free(&g_dlc_rx_delivery_item_slab, (void**)&delivery_item);
                         }
-                    } else { LOG_ERR("DLC_RX: Failed to alloc buffer for CVG delivery (SN %u COMPLETE).", sn); }
+                    } else {
+                        LOG_ERR("DLC_RX: Failed to alloc data buffer for CVG delivery (SN %u COMPLETE).", sn);
+                        k_mem_slab_free(&g_dlc_rx_delivery_item_slab, (void**)&delivery_item);
+                    }
+                } else {
+                    LOG_ERR("DLC_RX: Failed to alloc delivery item for CVG (SN %u COMPLETE). Payload len %zu dropped.", sn, segment_payload_len);
+                }
+
                 }
                 // If this SN was part of an ongoing reassembly session (e.g., due to out-of-order LAST then COMPLETE), clear it.
                 dlc_reassembly_session_t *existing_session = find_reassembly_session(sn);
@@ -413,19 +437,33 @@ static void dlc_rx_thread_entry(void *p1, void *p2, void *p3)
                 if (all_chunks_received) {
                     LOG_INF("DLC_SAR: Reassembly complete for SN %u, total size %u.",
                             sn, session->total_expected_sdu_len);
-                    mac_sdu_t *cvg_sdu = dect_mac_api_buffer_alloc(K_NO_WAIT);
-                    if (cvg_sdu) {
-                        if (session->total_expected_sdu_len <= sizeof(cvg_sdu->data)) {
-                            memcpy(cvg_sdu->data, session->reassembly_buf, session->total_expected_sdu_len);
-                            cvg_sdu->len = session->total_expected_sdu_len;
-                            // cvg_sdu->dlc_service_type = session->service_type; // If struct supports
-                            k_fifo_put(&g_dlc_to_app_rx_fifo, cvg_sdu);
+
+                    dlc_rx_delivery_item_t *delivery_item = NULL;
+                    if (k_mem_slab_alloc(&g_dlc_rx_delivery_item_slab, (void **)&delivery_item, K_NO_WAIT) == 0) {
+                        mac_sdu_t *cvg_sdu_buf = dect_mac_api_buffer_alloc(K_NO_WAIT);
+                        if (cvg_sdu_buf) {
+                            if (session->total_expected_sdu_len <= sizeof(cvg_sdu_buf->data)) {
+                                memcpy(cvg_sdu_buf->data, session->reassembly_buf, session->total_expected_sdu_len);
+                                cvg_sdu_buf->len = session->total_expected_sdu_len;
+                                delivery_item->sdu_buf = cvg_sdu_buf;
+                                delivery_item->dlc_service_type = session->service_type; // Use service type stored in session
+                                k_fifo_put(&g_dlc_to_app_rx_fifo, delivery_item);
+                                LOG_DBG("DLC_RX: Queued reassembled SDU (SN %u, len %u, svc %u) to CVG.",
+                                        sn, session->total_expected_sdu_len, session->service_type);
+                            } else {
+                                LOG_ERR("DLC_SAR: Reassembled SDU SN %u (len %u) too large for CVG buffer. Dropping.",
+                                        sn, session->total_expected_sdu_len);
+                                dect_mac_api_buffer_free(cvg_sdu_buf);
+                                k_mem_slab_free(&g_dlc_rx_delivery_item_slab, (void**)&delivery_item);
+                            }
                         } else {
-                             LOG_ERR("DLC_SAR: Reassembled SDU SN %u (len %u) too large for CVG buffer. Dropping.",
-                                     sn, session->total_expected_sdu_len);
-                             dect_mac_api_buffer_free(cvg_sdu);
+                            LOG_ERR("DLC_SAR: Failed to alloc data buffer for reassembled SDU SN %u.", sn);
+                            k_mem_slab_free(&g_dlc_rx_delivery_item_slab, (void**)&delivery_item);
                         }
-                    } else { LOG_ERR("DLC_SAR: Failed to alloc buffer for reassembled SDU SN %u.", sn); }
+                    } else {
+                        LOG_ERR("DLC_SAR: Failed to alloc delivery item for reassembled SDU SN %u.", sn);
+                    }
+                    
                     session->is_active = false; k_timer_stop(&session->timeout_timer);
                 } else if (session->is_active) { // Only restart timer if session wasn't just completed
                     k_timer_start(&session->timeout_timer, K_MSEC(DLC_REASSEMBLY_TIMEOUT_MS), K_NO_WAIT);
@@ -474,24 +512,31 @@ static void dlc_tx_service_thread_entry(void *p1, void *p2, void *p3)
         LOG_INF("DLC_ARQ_SVC: Re-transmitting SDU for SN %u (attempt %u).",
                 job->sequence_number, job->retries + 1);
 
-        // Re-send the SDU. The dlc_send_data function will handle segmentation and queuing.
-        // Since this is a retransmission, the SN will be reused, and a new ARQ job will be created.
-        // This is a simplification. A more advanced implementation would have a dedicated
-        // "resend" function that reuses the original SN.
-        // For now, we will treat it as a new send, which will get a new SN.
-        // This means the higher layer (CVG) must handle duplicates.
-        // TODO: Create a dlc_resend_data() that reuses the SN.
-        int err = dlc_send_data(job->service, job->sdu_payload->data, job->sdu_payload->len);
+        int err = dlc_resend_sdu_with_original_sn(job);
         if (err) {
-            LOG_ERR("DLC_ARQ_SVC: Failed to re-queue SDU for SN %u (err %d). Will retry on next timeout.",
+            LOG_ERR("DLC_ARQ_SVC: dlc_resend_sdu_with_original_sn for SN %u failed (err %d). Retrying on next timeout/signal.",
                     job->sequence_number, err);
-            // Restart the timer to try again later.
-            k_timer_start(&job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+            // If resend failed (e.g., MAC queue full), the job remains active, and its timer should still be running
+            // or will be restarted by the MAC layer's NACK if the partial send failed.
+            // If the failure was before any segment was sent, ensure timer is restarted.
+            // For simplicity, if err, assume the timer will eventually fire or another NACK will come.
+            // Or, restart timer here explicitly if queue_dlc_pdu_to_mac returned error.
+            if (!k_timer_remaining_get(&job->timeout_timer)) { // If timer not already running
+                 k_timer_start(&job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+            }
         } else {
-            // The original job is now conceptually replaced by the new one created in dlc_send_data.
-            // Free the original job's resources.
-            dect_mac_api_buffer_free(job->sdu_payload);
-            job->is_active = false;
+            // Resend attempt was successfully queued to MAC.
+            // The ARQ job (job itself) remains active. Its timer (job->timeout_timer)
+            // should have been (re)started by dlc_send_data or dlc_resend_sdu_with_original_sn
+            // after the *last segment* of the retransmission was successfully queued.
+            // The current dlc_resend_sdu_with_original_sn doesn't restart the timer;
+            // it should be restarted by the MAC layer upon ACK/NACK for this retransmission attempt.
+            // Or, more simply, the ARQ job timer is started when the job is created/re-queued for TX.
+            // The dlc_tx_status_cb_handler will stop it on success or signal this thread on MAC failure.
+            // If dlc_resend_sdu_with_original_sn successfully queued all segments,
+            // the job's existing timeout timer (started when job was first created or last NACKed)
+            // will cover this retransmission attempt.
+            LOG_DBG("DLC_ARQ_SVC: Resend for SN %u successfully queued. Awaiting MAC status.", job->sequence_number);
         }
     }
 }
@@ -509,6 +554,131 @@ static void dlc_retransmission_timeout_handler(struct k_timer *timer_id)
         k_fifo_put(&g_dlc_retransmit_signal_fifo, (void *)job_idx);
     }
 }
+
+
+static int dlc_resend_sdu_with_original_sn(dlc_retransmission_job_t *job)
+{
+    if (!job || !job->is_active || !job->sdu_payload) {
+        LOG_ERR("DLC_RESEND: Invalid or inactive job/sdu_payload.");
+        return -EINVAL;
+    }
+
+    dlc_service_type_t service = job->service;
+    const uint8_t *dlc_sdu_payload = job->sdu_payload->data;
+    size_t dlc_sdu_payload_len = job->sdu_payload->len;
+    uint16_t original_sn = job->sequence_number;
+    int err = 0;
+
+    // TODO: Determine if routing header is needed (same as in dlc_send_data)
+    bool routing_header_needed = false;
+    dlc_ie_type_val_t base_ie_type;
+
+    LOG_DBG("DLC_RESEND: Resending SN %u, Svc %d, Len %zu", original_sn, service, dlc_sdu_payload_len);
+
+    // Note: ARQ job timer (job->timeout_timer) should be restarted *after* the last segment
+    // of this retransmission attempt is successfully queued to MAC.
+
+    switch (service) {
+    case DLC_SERVICE_TYPE_2_ARQ: { // Non-segmented ARQ
+        base_ie_type = routing_header_needed ? DLC_IE_TYPE_DATA_TYPE_123_WITH_ROUTING : DLC_IE_TYPE_DATA_TYPE_123_NO_ROUTING;
+        size_t hdr_len = sizeof(dect_dlc_header_type123_basic_t);
+        if (hdr_len + dlc_sdu_payload_len > CONFIG_DECT_MAC_SDU_MAX_SIZE) {
+            LOG_ERR("DLC_RESEND: SDU SN %u too large (%zu) for single MAC PDU. Should not happen for Type 2.",
+                    original_sn, dlc_sdu_payload_len);
+            return -EMSGSIZE; // Should have been caught on initial send
+        }
+        uint8_t hdr_buf[hdr_len];
+        dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t *)hdr_buf, base_ie_type, DLC_SI_COMPLETE_SDU, original_sn);
+        err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload, dlc_sdu_payload_len,
+                                   MAC_FLOW_RELIABLE_DATA, true, original_sn);
+        if (err == 0) { // Successfully re-queued
+            k_timer_start(&job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+            LOG_DBG("DLC_RESEND: SN %u (Type 2) re-queued, ARQ timer started.", original_sn);
+        }
+        break;
+    }
+    case DLC_SERVICE_TYPE_3_SEGMENTATION_ARQ: {
+        base_ie_type = routing_header_needed ? DLC_IE_TYPE_DATA_TYPE_123_WITH_ROUTING : DLC_IE_TYPE_DATA_TYPE_123_NO_ROUTING;
+        size_t sent_len = 0;
+        uint16_t current_segment_offset = 0;
+
+        while (sent_len < dlc_sdu_payload_len) {
+            uint8_t hdr_buf[sizeof(dect_dlc_header_type13_segmented_t)];
+            size_t current_hdr_len;
+            size_t max_payload_for_this_segment;
+            size_t payload_to_send_this_segment;
+            dlc_segmentation_indication_t si;
+            bool is_first_segment = (sent_len == 0);
+            bool is_last_segment_of_sdu = false;
+            bool report_status_for_this_pdu = false;
+
+            if (is_first_segment) {
+                current_hdr_len = sizeof(dect_dlc_header_type123_basic_t);
+                max_payload_for_this_segment = CONFIG_DECT_MAC_SDU_MAX_SIZE - current_hdr_len;
+                if (dlc_sdu_payload_len <= max_payload_for_this_segment) {
+                    si = DLC_SI_COMPLETE_SDU;
+                    payload_to_send_this_segment = dlc_sdu_payload_len;
+                    is_last_segment_of_sdu = true;
+                } else {
+                    si = DLC_SI_FIRST_SEGMENT;
+                    payload_to_send_this_segment = max_payload_for_this_segment;
+                }
+                dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t *)hdr_buf, base_ie_type, si, original_sn);
+            } else { // Middle or Last segment
+                current_hdr_len = sizeof(dect_dlc_header_type13_segmented_t);
+                max_payload_for_this_segment = CONFIG_DECT_MAC_SDU_MAX_SIZE - current_hdr_len;
+                current_segment_offset = sent_len;
+
+                if ((dlc_sdu_payload_len - sent_len) <= max_payload_for_this_segment) {
+                    si = DLC_SI_LAST_SEGMENT;
+                    payload_to_send_this_segment = dlc_sdu_payload_len - sent_len;
+                    is_last_segment_of_sdu = true;
+                } else {
+                    si = DLC_SI_MIDDLE_SEGMENT;
+                    payload_to_send_this_segment = max_payload_for_this_segment;
+                }
+                dlc_hdr_t13_segmented_set((dect_dlc_header_type13_segmented_t *)hdr_buf, base_ie_type, si, original_sn, current_segment_offset);
+            }
+            if (payload_to_send_this_segment == 0 && dlc_sdu_payload_len > 0 && !is_last_segment_of_sdu) {
+                err = -EMSGSIZE; break;
+            }
+            if (payload_to_send_this_segment > (dlc_sdu_payload_len - sent_len) ) {
+                 payload_to_send_this_segment = dlc_sdu_payload_len - sent_len;
+            }
+
+            if (is_last_segment_of_sdu) { // Report status only on the last segment for segmented ARQ
+                report_status_for_this_pdu = true;
+            }
+
+            LOG_DBG("DLC_RESEND_SEG: SN %u, SI %d, Offset %u, SegPyldLen %zu, HdrLen %zu, Report %d",
+                    original_sn, si, (is_first_segment || si == DLC_SI_COMPLETE_SDU) ? 0 : current_segment_offset,
+                    payload_to_send_this_segment, current_hdr_len, report_status_for_this_pdu);
+
+            err = queue_dlc_pdu_to_mac(hdr_buf, current_hdr_len,
+                                       dlc_sdu_payload + sent_len, payload_to_send_this_segment,
+                                       MAC_FLOW_RELIABLE_DATA, report_status_for_this_pdu, original_sn);
+            if (err) {
+                LOG_ERR("DLC_RESEND_SEG: Failed to queue segment for SN %u (err %d). Aborting resend.", original_sn, err);
+                break;
+            }
+            sent_len += payload_to_send_this_segment;
+
+            // Start ARQ job timer after the *last segment* requiring status report is successfully queued.
+            if (report_status_for_this_pdu && err == 0 && arq_job) { // report_status_for_this_pdu is true for last segment of ARQ
+                k_timer_start(&arq_job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+                LOG_DBG("DLC_SEND_SEG: SN %u (Type 3) last segment queued, ARQ timer started.", current_dlc_sn_for_this_sdu);
+            }            
+        }
+        break;
+    }
+    default:
+        LOG_ERR("DLC_RESEND: Cannot resend SDU for service type %d (SN %u).", service, original_sn);
+        return -EINVAL;
+    }
+
+    return err; // Return the status of the last queue_dlc_pdu_to_mac call
+}
+
 
 
 // --- Public API Implementation ---
@@ -644,9 +814,11 @@ int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, si
         uint8_t hdr_buf[hdr_len];
         dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t *)hdr_buf, base_ie_type, DLC_SI_COMPLETE_SDU, current_dlc_sn_for_this_sdu);
         // For Type 2, status report is needed for the ARQ job.
-        err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload, dlc_sdu_payload_len, MAC_FLOW_RELIABLE_DATA, true, current_dlc_sn_for_this_sdu);
-        if (err == 0 && arq_job) {
+        err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload, dlc_sdu_payload_len,
+                                   MAC_FLOW_RELIABLE_DATA, true, current_dlc_sn_for_this_sdu);
+        if (err == 0 && arq_job) { // Successfully queued and ARQ job exists
             k_timer_start(&arq_job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+            LOG_DBG("DLC_SEND_ARQ: SN %u (Type 2) queued, ARQ timer started.", current_dlc_sn_for_this_sdu);
         }
         break;
     }
@@ -725,8 +897,10 @@ int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, si
             }
             sent_len += payload_to_send_this_segment;
 
-            if (is_last_segment_of_sdu && err == 0 && arq_job) { // If it was the last segment and successfully queued
+            // Start ARQ job timer after the *last segment* requiring status report is successfully queued.
+            if (report_status_for_this_pdu && err == 0 && arq_job) { // report_status_for_this_pdu is true for last segment of ARQ
                 k_timer_start(&arq_job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+                LOG_DBG("DLC_SEND_SEG: SN %u (Type 3) last segment queued, ARQ timer started.", current_dlc_sn_for_this_sdu);
             }
         }
         break;
@@ -756,44 +930,48 @@ int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, si
 
 
 int dlc_receive_data(dlc_service_type_t *service_type_out,
-                     uint8_t *app_level_payload_buf,
+                     uint8_t *app_level_payload_buf, // This buffer is for CVG PDU
                      size_t *app_level_payload_len_inout,
                      k_timeout_t timeout)
 {
-    if (!service_type_out || !app_level_payload_buf || !app_level_payload_len_inout || !(*app_level_payload_len_inout > 0) ) {
+    if (!service_type_out || !app_level_payload_buf || !app_level_payload_len_inout || (*app_level_payload_len_inout == 0) ) {
+        LOG_ERR("DLC_RECV: Invalid parameters (NULL ptrs or zero len_inout).");
         return -EINVAL;
     }
 
-    mac_sdu_t *app_sdu_from_dlc_rx_thread = k_fifo_get(&g_dlc_to_app_rx_fifo, timeout);
-    if (!app_sdu_from_dlc_rx_thread) {
+    dlc_rx_delivery_item_t *delivery_item = k_fifo_get(&g_dlc_to_app_rx_fifo, timeout);
+    if (!delivery_item) {
         return -EAGAIN; // Timeout or FIFO empty on K_NO_WAIT
     }
 
-    if (*app_level_payload_len_inout < app_sdu_from_dlc_rx_thread->len) {
-        *app_level_payload_len_inout = app_sdu_from_dlc_rx_thread->len; // Report required size
-        k_fifo_put(&g_dlc_to_app_rx_fifo, app_sdu_from_dlc_rx_thread); // Put it back
-        LOG_WRN("DLC_RECV: App buffer too small (got %u, need %u).",
-                 (uint16_t)*app_level_payload_len_inout, app_sdu_from_dlc_rx_thread->len);
+    if (!delivery_item->sdu_buf) { // Should not happen if item is correctly populated
+        LOG_ERR("DLC_RECV: Delivery item has NULL sdu_buf. Freeing item.");
+        k_mem_slab_free(&g_dlc_rx_delivery_item_slab, (void **)&delivery_item);
+        return -EFAULT; // Internal error
+    }
+
+    mac_sdu_t *sdu_buf = delivery_item->sdu_buf;
+
+    if (*app_level_payload_len_inout < sdu_buf->len) {
+        *app_level_payload_len_inout = sdu_buf->len; // Report required size
+        // Put the item back into the FIFO (at the head for immediate re-processing if caller retries)
+        k_fifo_prepend(&g_dlc_to_app_rx_fifo, delivery_item);
+        LOG_WRN("DLC_RECV: App buffer too small (provided %zu, need %u). Item prepended.",
+                 *app_level_payload_len_inout, sdu_buf->len);
         return -EMSGSIZE;
     }
 
-    *app_level_payload_len_inout = app_sdu_from_dlc_rx_thread->len;
-    memcpy(app_level_payload_buf, app_sdu_from_dlc_rx_thread->data, app_sdu_from_dlc_rx_thread->len);
+    *app_level_payload_len_inout = sdu_buf->len;
+    memcpy(app_level_payload_buf, sdu_buf->data, sdu_buf->len);
+    *service_type_out = delivery_item->dlc_service_type;
 
-    // CRITICAL TODO: Determine the actual service_type_out.
-    // The mac_sdu_t currently doesn't store the service type.
-    // The dlc_rx_thread_entry needs to parse the DLC header of the received PDU
-    // to determine the service type and pass it along with the data.
-    // This likely means g_dlc_to_app_rx_fifo should hold a struct:
-    // typedef struct { mac_sdu_t* sdu_buf; dlc_service_type_t type; } dlc_app_delivery_item_t;
-    // For now, hardcoding.
-    *service_type_out = DLC_SERVICE_TYPE_0_TRANSPARENT; // FIXME
-    LOG_WRN("DLC_RECV: Service type determination is FIXME (defaulting to Transparent).");
-
-
-    LOG_DBG("DLC_RECV: Delivered CVG PDU (len %zu) to application. Service Type (FIXME): %d",
+    LOG_DBG("DLC_RECV: Delivered CVG PDU (len %zu, DLC Svc %u) to application/CVG.",
             *app_level_payload_len_inout, *service_type_out);
-    dect_mac_api_buffer_free(app_sdu_from_dlc_rx_thread);
+
+    // Free the SDU data buffer and the delivery item wrapper
+    dect_mac_api_buffer_free(sdu_buf); // Free the mac_sdu_t buffer
+    k_mem_slab_free(&g_dlc_rx_delivery_item_slab, (void **)&delivery_item); // Free the wrapper
+
     return 0;
 }
 

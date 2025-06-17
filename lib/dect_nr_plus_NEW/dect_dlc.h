@@ -268,7 +268,18 @@ typedef struct {
     uint8_t sequence_number;
 } __attribute__((packed)) dect_dlc_routing_header_t;
 
-/** @} */
+/**
+ * @brief Item structure for the FIFO queue from DLC RX thread to the CVG/Application layer.
+ *
+ * Contains the received/reassembled DLC SDU (which is a CVG PDU) and the
+ * DLC service type that was applicable to its reception/processing by the DLC.
+ */
+typedef struct {
+    void *fifo_reserved; /* For k_fifo internal use */
+    mac_sdu_t *sdu_buf;  /* Buffer containing the CVG PDU (DLC SDU payload) */
+    dlc_service_type_t dlc_service_type; /* The DLC service type of this SDU */
+} dlc_rx_delivery_item_t;
+
 
 /**
  * @brief Initializes the DLC layer.
