@@ -596,90 +596,79 @@ static int send_data_mac_sdu_via_phy_internal(dect_mac_context_t* ctx,
               &assembled_pdu_len_pre_mic);
     if (ret != 0) { LOG_ERR("DATA_TX_INT: Assemble final PDU failed: %d", ret); goto free_slab_and_return_error_tx_sec_path; }
 
-    uint16_t final_tx_pdu_len_for_phy_ctrl = assembled_pdu_len_pre_mic;
+    uint16_t final_tx_pdu_len_for_phy_ctrl = assembled_pdu_len_pre_mic; // Length before MIC
 
     if (security_active_for_this_pdu) {
         uint8_t iv[16];
+        // hpc_for_tx_iv_build and psn_for_this_pdu were determined earlier in this function
         security_build_iv(iv, ctx->own_long_rd_id, receiver_long_id, hpc_for_tx_iv_build, psn_for_this_pdu);
 
-        // MIC calculation: Over (Common Header + Full SDU Area [including MUXed SecIE if present])
-        uint8_t *mic_calc_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t);
-        size_t mic_calc_len = sizeof(common_hdr) + current_sdu_area_len;
+        // MIC Calculation: Covers MAC Common Header + entire MAC SDU Area (cleartext).
+        // full_mac_pdu_for_phy[0] is MAC Hdr Type.
+        // Common Header starts at full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t).
+        // MAC SDU Area starts after Common Header.
+        // assembled_pdu_len_pre_mic is (sizeof(MAC Hdr Type) + common_hdr_len + current_sdu_area_len).
+        uint8_t *mic_calculation_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t);
+        size_t mic_calculation_length = common_hdr_len + current_sdu_area_len;
 
-        if (assembled_pdu_len_pre_mic + 5 > CONFIG_DECT_MAC_PDU_MAX_SIZE) {
-            ret = -ENOMEM; LOG_ERR("DATA_TX_INT: No space for MIC in PDU."); goto free_slab_and_return_error_tx_sec_path;
+        if ((assembled_pdu_len_pre_mic + 5) > CONFIG_DECT_MAC_PDU_MAX_SIZE) { // Check space for MIC
+            LOG_ERR("DATA_TX_INT: Not enough space in PDU buffer for MIC.");
+            ret = -ENOMEM;
+            goto free_slab_and_return_error_tx_sec_path;
         }
         uint8_t *mic_location_ptr = full_mac_pdu_for_phy + assembled_pdu_len_pre_mic;
-        ret = security_calculate_mic(mic_calc_start_ptr, mic_calc_len, session_integrity_key, mic_location_ptr);
-        if (ret != 0) { LOG_ERR("DATA_TX_INT: MIC calculation failed: %d", ret); goto free_slab_and_return_error_tx_sec_path; }
+        ret = security_calculate_mic(mic_calculation_start_ptr, mic_calculation_length,
+                                   session_integrity_key, mic_location_ptr);
+        if (ret != 0) {
+            LOG_ERR("DATA_TX_INT: MIC calculation failed: %d", ret);
+            goto free_slab_and_return_error_tx_sec_path;
+        }
+        final_tx_pdu_len_for_phy_ctrl = assembled_pdu_len_pre_mic + 5; // Update length to include MIC
 
-        // Encryption (aligned with ETSI Figure 6.3.1-1)
-        uint8_t *encrypt_start_ptr;
-        size_t encrypt_len;
-        size_t common_hdr_actual_len = sizeof(common_hdr); // common_hdr is dect_mac_unicast_header_t
+        // Encryption:
+        uint8_t *encryption_start_ptr;
+        size_t encryption_length;
 
         if (mac_hdr_type_octet.mac_security == MAC_SECURITY_USED_WITH_IE) {
-            // If SecIE is present, Common Header AND MUXed SecIE are cleartext.
-            // Encryption starts AFTER the MUXed MAC Security Info IE.
-            // muxed_sec_ie_actual_len_in_sdu_area is the length of (MUX_hdr_for_SecIE + SecIE_payload).
-            encrypt_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
-                                common_hdr_actual_len + muxed_sec_ie_actual_len_in_sdu_area;
-            // Encrypt (Rest of SDU Area (e.g., MUXed User Data) + MIC)
-            encrypt_len = (current_sdu_area_len - muxed_sec_ie_actual_len_in_sdu_area) + 5;
-        } else { // MAC_SECURITY_USED_NO_IE (or MAC_SECURITY_NONE, though `security_active_for_this_pdu` catches NONE)
-            // Common Header is cleartext.
-            // Encryption starts AFTER the MAC Common Header.
-            encrypt_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
-                                common_hdr_actual_len;
-            // Encrypt (Full SDU Area (e.g., MUXed User Data) + MIC)
-            encrypt_len = current_sdu_area_len + 5;
-        }
-
-        if (encrypt_len > 0) { // Only encrypt if there's something to encrypt (at least MIC)
-            if ((encrypt_start_ptr + encrypt_len) > (full_mac_pdu_for_phy + assembled_pdu_len_pre_mic + 5) ||
-                 encrypt_start_ptr < full_mac_pdu_for_phy) { // Basic boundary check
-                 LOG_ERR("DATA_TX_INT: Encryption range error. Start %p, Len %zu. PDU End %p",
-                         encrypt_start_ptr, encrypt_len, full_mac_pdu_for_phy + assembled_pdu_len_pre_mic + 5);
-                 ret = -EINVAL; goto free_slab_and_return_error_tx_sec_path;
+            // Encrypt: (Rest of MAC SDU Area, i.e., SDU Area - MUXed SecIE) + MIC
+            // MUXed SecIE itself is cleartext.
+            // muxed_sec_ie_actual_len_in_sdu_area should be the length of the MUXed SecIE.
+            if (muxed_sec_ie_actual_len_in_sdu_area == 0 && include_mac_sec_info_ie) {
+                LOG_ERR("DATA_TX_INT: MAC_SECURITY_USED_WITH_IE but muxed_sec_ie_len is 0!");
+                // This indicates an error in how muxed_sec_ie_actual_len_in_sdu_area was set.
+                // For safety, fall back to encrypting entire SDU area + MIC, though this is not ideal.
+                encryption_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) + common_hdr_len;
+                encryption_length = current_sdu_area_len + 5; // Encrypt full SDU Area + MIC
+            } else {
+                encryption_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
+                                       common_hdr_len + muxed_sec_ie_actual_len_in_sdu_area;
+                encryption_length = (current_sdu_area_len - muxed_sec_ie_actual_len_in_sdu_area) + 5; // (Rest of SDU Area) + MIC
             }
-            ret = security_crypt_payload(encrypt_start_ptr, encrypt_len, session_cipher_key, iv, true /*encrypt*/);
-            if (ret != 0) { LOG_ERR("DATA_TX_INT: Encryption failed: %d", ret); goto free_slab_and_return_error_tx_sec_path; }
-        }
-        final_tx_pdu_len_for_phy_ctrl = assembled_pdu_len_pre_mic + 5; // Total length including MIC
-        // Encryption:
-        uint8_t *encrypt_start_ptr;
-        size_t encrypt_len;
-        size_t common_hdr_actual_len = sizeof(common_hdr); // Assuming common_hdr is dect_mac_unicast_header_t
-
-        if (include_mac_sec_info_ie) { // MAC_SECURITY_USED_WITH_IE was set
-            // Common Header and MUXed MAC Sec Info IE are cleartext.
-            // Encrypt (Rest of SDU Area (e.g. MUXed User Data IE) + MIC).
-            encrypt_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
-                                common_hdr_actual_len + muxed_sec_ie_actual_len_in_sdu_area; // After SecIE
-            encrypt_len = (current_sdu_area_len - muxed_sec_ie_actual_len_in_sdu_area) + 5; // (Rest of SDU Area + MIC)
-        } else { // MAC_SECURITY_USED_NO_IE
-            // Common Header is cleartext.
-            // Encrypt (SDU Area (which is MUXed UserData IE(s)) + MIC)
-            encrypt_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
-                                common_hdr_actual_len; // Start encryption *after* the Common Header
-            encrypt_len = current_sdu_area_len + 5;    // (Full SDU Area + MIC)
+        } else { // MAC_SECURITY_USED_NO_IE (or MAC_SECURITY_NONE, but caught by security_active_for_this_pdu)
+            // Encrypt: Entire MAC SDU Area + MIC
+            encryption_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) + common_hdr_len;
+            encryption_length = current_sdu_area_len + 5; // Full SDU Area + MIC
         }
 
-        if (encrypt_len > 0) {
+        if (encryption_length > 0) {
             // Boundary check for encryption
-            uint8_t* pdu_buffer_end = full_mac_pdu_for_phy + final_tx_pdu_len_for_phy_ctrl; // End of PDU including MIC
-            if (encrypt_start_ptr < full_mac_pdu_for_phy || (encrypt_start_ptr + encrypt_len) > pdu_buffer_end) {
+            uint8_t* pdu_buffer_end_with_mic = full_mac_pdu_for_phy + final_tx_pdu_len_for_phy_ctrl;
+            if (encryption_start_ptr < full_mac_pdu_for_phy || (encryption_start_ptr + encryption_length) > pdu_buffer_end_with_mic) {
                  LOG_ERR("DATA_TX_INT: Encryption range error. Start %p, Len %zu. PDU Range %p - %p",
-                         encrypt_start_ptr, encrypt_len, full_mac_pdu_for_phy, pdu_buffer_end);
+                         encryption_start_ptr, encryption_length, full_mac_pdu_for_phy, pdu_buffer_end_with_mic);
                  ret = -EINVAL; goto free_slab_and_return_error_tx_sec_path;
             }
-            ret = security_crypt_payload(encrypt_start_ptr, encrypt_len, session_cipher_key, iv, true /*encrypt*/);
-            if (ret != 0) { LOG_ERR("DATA_TX_INT: Encryption failed: %d", ret); goto free_slab_and_return_error_tx_sec_path; }
-        }        
-        LOG_DBG("DATA_TX_INT: Secured PDU. Final len %u. Mode: %s",
-                final_tx_pdu_len_for_phy_ctrl, include_mac_sec_info_ie ? "WITH_SEC_IE" : "NO_SEC_IE");
+            ret = security_crypt_payload(encryption_start_ptr, encryption_length, session_cipher_key, iv, true /*encrypt*/);
+            if (ret != 0) {
+                LOG_ERR("DATA_TX_INT: Encryption failed: %d", ret);
+                goto free_slab_and_return_error_tx_sec_path;
+            }
+        }
+        LOG_DBG("DATA_TX_INT: Secured PDU. Final len %u. Mode: %s, MUXedSecIELen: %zu",
+                final_tx_pdu_len_for_phy_ctrl,
+                (mac_hdr_type_octet.mac_security == MAC_SECURITY_USED_WITH_IE) ? "WITH_SEC_IE" : "NO_SEC_IE",
+                muxed_sec_ie_actual_len_in_sdu_area);
     }
-
 
     pending_op_type_t op_type_for_phy = (ctx->role == MAC_ROLE_PT) ? PENDING_OP_PT_DATA_TX_HARQ0 : PENDING_OP_FT_DATA_TX_HARQ0;
     op_type_for_phy = (pending_op_type_t)((int)op_type_for_phy + harq_proc_idx);

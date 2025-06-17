@@ -1644,46 +1644,64 @@ static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t
               &assembled_pdu_len_pre_mic);
     if (ret != 0) { LOG_ERR("FT_ASSOC_RESP: Assemble PDU failed for PT 0x%04X: %d", pt_short_rd_id,ret); k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return; }
 
-    uint16_t final_tx_pdu_len = assembled_pdu_len_pre_mic;
-
     // --- Apply Security if active ---
-    if (secure_this_response) {
+    uint16_t final_tx_pdu_len = assembled_pdu_len_pre_mic; // Length before MIC
+
+    if (secure_this_response) { // secure_this_response was set earlier based on policy and key availability
         uint8_t iv[16];
+        // ctx->hpc and ctx->psn are FT's own current TX HPC/PSN
         security_build_iv(iv, ctx->own_long_rd_id, pt_long_rd_id, ctx->hpc, ctx->psn);
 
-        uint8_t *mic_calc_start = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t);
-        size_t mic_calc_len = sizeof(common_hdr) + sdu_area_len_cleartext;
+        // MIC Calculation: Covers MAC Common Header + entire MAC SDU Area (cleartext).
+        uint8_t *mic_calculation_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t);
+        size_t mic_calculation_length = sizeof(common_hdr) + sdu_area_len_cleartext; // common_hdr is dect_mac_unicast_header_t
 
-        if (assembled_pdu_len_pre_mic + 5 > CONFIG_DECT_MAC_PDU_MAX_SIZE) { LOG_ERR("FT_ASSOC_RESP: No space for MIC for PT 0x%04X.", pt_short_rd_id); k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return; }
-        uint8_t *mic_location = full_mac_pdu_for_phy + assembled_pdu_len_pre_mic;
-        ret = security_calculate_mic(mic_calc_start, mic_calc_len, ctx->role_ctx.ft.peer_integrity_keys[peer_slot_idx], mic_location);
-        if (ret != 0) { LOG_ERR("FT_ASSOC_RESP: MIC calc failed for PT 0x%04X: %d", pt_short_rd_id, ret); k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return; }
-
-        
-        // Encryption: (Common Header and MUXed MAC Sec Info IE are cleartext)
-        uint8_t *encrypt_start_ptr;
-        size_t encrypt_len;
-        size_t common_hdr_actual_len_assoc = sizeof(common_hdr);
-
-        // len_of_muxed_sec_ie_for_crypto was calculated when SecIE was built
-        encrypt_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
-                            common_hdr_actual_len_assoc + len_of_muxed_sec_ie_for_crypto;
-        // Encrypt (Rest of SDU Area (AssocResp IE, RDCap IE, ResAlloc IE) + MIC)
-        encrypt_len = (sdu_area_len_cleartext - len_of_muxed_sec_ie_for_crypto) + 5;
-        // <<<< END OF THE SPECIFIC BLOCK YOU PROVIDED >>>>
-
-        if (encrypt_len > 0) {
-            uint8_t* pdu_buffer_end_assoc = full_mac_pdu_for_phy + assembled_pdu_len_pre_mic + 5;
-            if ( (encrypt_start_ptr < full_mac_pdu_for_phy) || ((encrypt_start_ptr + encrypt_len) > pdu_buffer_end_assoc) ) {
-                 LOG_ERR("FT_ASSOC_RESP: Encryption range error for PT 0x%04X. Start:%p Len:%zu End:%p PDU_End:%p",
-                        pt_short_rd_id, encrypt_start_ptr, encrypt_len, encrypt_start_ptr + encrypt_len, pdu_buffer_end_assoc);
-                 k_mem_slab_free(&g_mac_s_slab, (void**)&full_mac_pdu_for_phy_slab); return;
-            }
-             ret = security_crypt_payload(encrypt_start_ptr, encrypt_len, ctx->role_ctx.ft.peer_cipher_keys[peer_slot_idx], iv, true);
-             if (ret != 0) { LOG_ERR("FT_ASSOC_RESP: Encryption failed for PT 0x%04X: %d", pt_short_rd_id, ret); k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return; }
+        if ((assembled_pdu_len_pre_mic + 5) > CONFIG_DECT_MAC_PDU_MAX_SIZE) {
+            LOG_ERR("FT_ASSOC_RESP: No space for MIC for PT 0x%04X.", pt_short_rd_id);
+            k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return;
+        }
+        uint8_t *mic_location_ptr = full_mac_pdu_for_phy + assembled_pdu_len_pre_mic;
+        ret = security_calculate_mic(mic_calculation_start_ptr, mic_calculation_length,
+                                   ctx->role_ctx.ft.peer_integrity_keys[peer_slot_idx], mic_location_ptr);
+        if (ret != 0) {
+            LOG_ERR("FT_ASSOC_RESP: MIC calc failed for PT 0x%04X: %d", pt_short_rd_id, ret);
+            k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return;
         }
         final_tx_pdu_len = assembled_pdu_len_pre_mic + 5;
-        LOG_INF("FT_ASSOC_RESP: Secured Association Response for PT 0x%04X. Final len %u.", pt_short_rd_id, final_tx_pdu_len);
+
+        // Encryption:
+        uint8_t *encryption_start_ptr;
+        size_t encryption_length;
+        // len_of_muxed_sec_ie_for_crypto_calc was determined when sdu_area_buf was populated
+
+        if (hdr_type_octet.mac_security == MAC_SECURITY_USED_WITH_IE) {
+            // Encrypt: (Rest of MAC SDU Area, i.e., SDU Area - MUXed SecIE) + MIC
+            encryption_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
+                                   sizeof(common_hdr) + len_of_muxed_sec_ie_for_crypto_calc;
+            encryption_length = (sdu_area_len_cleartext - len_of_muxed_sec_ie_for_crypto_calc) + 5;
+        } else { // MAC_SECURITY_USED_NO_IE (or MAC_SECURITY_NONE, but secure_this_response is true)
+            // This case (secure_this_response=true but mac_security!=MAC_SECURITY_USED_WITH_IE)
+            // implies MAC_SECURITY_USED_NO_IE.
+            encryption_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) + sizeof(common_hdr);
+            encryption_length = sdu_area_len_cleartext + 5;
+        }
+
+        if (encryption_length > 0) {
+            uint8_t* pdu_buffer_end_with_mic = full_mac_pdu_for_phy + final_tx_pdu_len;
+            if (encryption_start_ptr < full_mac_pdu_for_phy || (encryption_start_ptr + encryption_length) > pdu_buffer_end_with_mic ) {
+                 LOG_ERR("FT_ASSOC_RESP: Encryption range error for PT 0x%04X. Start:%p Len:%zu PDU_End:%p",
+                        pt_short_rd_id, encryption_start_ptr, encryption_length, pdu_buffer_end_with_mic);
+                 k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return;
+            }
+             ret = security_crypt_payload(encryption_start_ptr, encryption_length,
+                                          ctx->role_ctx.ft.peer_cipher_keys[peer_slot_idx], iv, true /*encrypt*/);
+             if (ret != 0) {
+                 LOG_ERR("FT_ASSOC_RESP: Encryption failed for PT 0x%04X: %d", pt_short_rd_id, ret);
+                 k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return;
+             }
+        }
+        LOG_INF("FT_ASSOC_RESP: Secured Association Response for PT 0x%04X. Final len %u. MUXSecIELen: %zu",
+                pt_short_rd_id, final_tx_pdu_len, len_of_muxed_sec_ie_for_crypto_calc);
     }
 
     // --- Schedule TX ---

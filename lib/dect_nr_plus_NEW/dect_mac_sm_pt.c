@@ -1788,60 +1788,64 @@ static void pt_send_keep_alive_action(void) {
         return;
     }
 
-    uint16_t final_tx_pdu_len = assembled_pdu_len_pre_mic;
-
     // 5. Apply Security if active
-    if (secure_this_pdu) {
+    uint16_t final_tx_pdu_len = assembled_pdu_len_pre_mic; // Length before MIC
+
+    if (secure_this_pdu) { // secure_this_pdu was set earlier based on link state
         uint8_t iv[16];
+        // current_hpc_for_iv and current_psn_for_tx were determined earlier
         security_build_iv(iv, ctx->own_long_rd_id, ctx->role_ctx.pt.associated_ft.long_rd_id,
                           current_hpc_for_iv, current_psn_for_tx);
 
-        uint8_t *mic_calc_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t);
-        size_t mic_calc_len = sizeof(common_hdr) + current_sdu_area_len;
+        // MIC Calculation: Covers MAC Common Header + entire MAC SDU Area (cleartext).
+        uint8_t *mic_calculation_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t);
+        size_t mic_calculation_length = sizeof(common_hdr) + current_sdu_area_len;
 
-        if (assembled_pdu_len_pre_mic + 5 > CONFIG_DECT_MAC_PDU_MAX_SIZE) {
+        if ((assembled_pdu_len_pre_mic + 5) > CONFIG_DECT_MAC_PDU_MAX_SIZE) {
             LOG_ERR("PT_SM_KA: No space for MIC in PDU.");
-            k_mem_slab_free(&g_mac_s_slab, (void**)&full_mac_pdu_for_phy_slab);
-            return;
+            k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return;
         }
         uint8_t *mic_location_ptr = full_mac_pdu_for_phy + assembled_pdu_len_pre_mic;
-        ret = security_calculate_mic(mic_calc_start_ptr, mic_calc_len, ctx->integrity_key, mic_location_ptr);
+        ret = security_calculate_mic(mic_calculation_start_ptr, mic_calculation_length,
+                                   ctx->integrity_key, mic_location_ptr);
         if (ret != 0) {
             LOG_ERR("PT_SM_KA: MIC calculation failed: %d", ret);
-            k_mem_slab_free(&g_mac_s_slab, (void**)&full_mac_pdu_for_phy_slab);
-            return;
-        }
-
-        uint8_t *encrypt_start_ptr;
-        size_t encrypt_len;
-        size_t common_hdr_actual_len_ka = sizeof(common_hdr);
-
-        if (include_mac_sec_info_ie_for_ka) {
-            encrypt_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
-                                common_hdr_actual_len_ka + len_of_muxed_sec_ie_for_crypto_calc;
-            encrypt_len = (current_sdu_area_len - len_of_muxed_sec_ie_for_crypto_calc) + 5;
-        } else {
-            encrypt_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
-                                common_hdr_actual_len_ka;
-            encrypt_len = current_sdu_area_len + 5;
-        }
-
-        if (encrypt_len > 0) {
-             uint8_t* pdu_buffer_end_ka = full_mac_pdu_for_phy + assembled_pdu_len_pre_mic + 5;
-             if (encrypt_start_ptr < full_mac_pdu_for_phy || (encrypt_start_ptr + encrypt_len) > pdu_buffer_end_ka ) {
-                 LOG_ERR("PT_SM_KA: Encryption range error. Start %p + Len %zu > PDU End %p",
-                         encrypt_start_ptr, encrypt_len, pdu_buffer_end_ka);
-                 k_mem_slab_free(&g_mac_s_slab, (void**)&full_mac_pdu_for_phy_slab); return;
-             }
-             ret = security_crypt_payload(encrypt_start_ptr, encrypt_len, ctx->cipher_key, iv, true /*encrypt*/);
-             if (ret != 0) {
-                 LOG_ERR("PT_SM_KA: Encryption failed: %d", ret);
-                 k_mem_slab_free(&g_mac_s_slab, (void**)&full_mac_pdu_for_phy_slab); return;
-             }
+            k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return;
         }
         final_tx_pdu_len = assembled_pdu_len_pre_mic + 5;
-        LOG_DBG("PT_SM_KA: Keep Alive PDU secured. Final len %u. Mode: %s",
-                final_tx_pdu_len, include_mac_sec_info_ie_for_ka ? "WITH_SEC_IE" : "NO_SEC_IE");
+
+        // Encryption:
+        uint8_t *encryption_start_ptr;
+        size_t encryption_length;
+        // len_of_muxed_sec_ie_for_crypto_calc was determined when sdu_area_buf was populated
+
+        if (hdr_type_octet.mac_security == MAC_SECURITY_USED_WITH_IE) { // i.e. include_mac_sec_info_ie_for_ka was true
+            // Encrypt: (Rest of MAC SDU Area, i.e., SDU Area - MUXed SecIE) + MIC
+            encryption_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
+                                   sizeof(common_hdr) + len_of_muxed_sec_ie_for_crypto_calc;
+            encryption_length = (current_sdu_area_len - len_of_muxed_sec_ie_for_crypto_calc) + 5; // (Rest of SDU Area) + MIC
+        } else { // MAC_SECURITY_USED_NO_IE
+            encryption_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) + sizeof(common_hdr);
+            encryption_length = current_sdu_area_len + 5; // Full SDU Area + MIC
+        }
+
+        if (encryption_length > 0) {
+             uint8_t* pdu_buffer_end_with_mic = full_mac_pdu_for_phy + final_tx_pdu_len;
+             if (encryption_start_ptr < full_mac_pdu_for_phy || (encryption_start_ptr + encryption_length) > pdu_buffer_end_with_mic ) {
+                 LOG_ERR("PT_SM_KA: Encryption range error. Start %p + Len %zu > PDU End %p",
+                         encryption_start_ptr, encryption_length, pdu_buffer_end_with_mic);
+                 k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return;
+             }
+             ret = security_crypt_payload(encryption_start_ptr, encryption_length, ctx->cipher_key, iv, true /*encrypt*/);
+             if (ret != 0) {
+                 LOG_ERR("PT_SM_KA: Encryption failed: %d", ret);
+                 k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return;
+             }
+        }
+        LOG_DBG("PT_SM_KA: Keep Alive PDU secured. Final len %u. Mode: %s, MUXSecIELen: %zu",
+                final_tx_pdu_len,
+                (hdr_type_octet.mac_security == MAC_SECURITY_USED_WITH_IE) ? "WITH_SEC_IE" : "NO_SEC_IE",
+                len_of_muxed_sec_ie_for_crypto_calc);
     }
 
     // 6. Schedule TX
