@@ -84,16 +84,17 @@ typedef enum {
  * The DLC SDU (which is CVG PDU or CVG PDU + DLC Routing Header) immediately follows.
  */
 typedef struct {
-    uint8_t ie_type_val_reserved; // Bits 7-4: IE Type, Bits 3-0: Reserved
+    uint8_t ie_type_val_reserved; // Bits 7-4: IE Type, Bits 3-0: Reserved (must be 0)
 } __attribute__((packed)) dect_dlc_header_type0_t;
 
 // Helper to set/get fields for dect_dlc_header_type0_t
 static inline void dlc_hdr_type0_set(dect_dlc_header_type0_t *hdr, dlc_ie_type_val_t type) {
-    hdr->ie_type_val_reserved = ((uint8_t)type & 0x0F) << 4; // Reserved bits are 0
+    hdr->ie_type_val_reserved = ((uint8_t)type & 0x0F) << 4; // Ensures LSB 4 bits are 0
 }
 static inline dlc_ie_type_val_t dlc_hdr_type0_get_type(const dect_dlc_header_type0_t *hdr) {
     return (dlc_ie_type_val_t)((hdr->ie_type_val_reserved >> 4) & 0x0F);
 }
+
 
 
 /**
@@ -104,8 +105,8 @@ static inline dlc_ie_type_val_t dlc_hdr_type0_get_type(const dect_dlc_header_typ
  * Octet 2: [SN_ls8b (8b)]
  */
 typedef struct {
-    uint8_t ie_type_si_sn_msb;
-    uint8_t sequence_number_lsb;
+    uint8_t ie_type_si_sn_msb;   // Octet 1: IE Type(4b)|SI(2b)|SN_ms2b(2b)
+    uint8_t sequence_number_lsb; // Octet 2: SN_ls8b(8b)
 } __attribute__((packed)) dect_dlc_header_type123_basic_t;
 
 // Helpers for dect_dlc_header_type123_basic_t
@@ -113,9 +114,10 @@ static inline void dlc_hdr_t123_basic_set(dect_dlc_header_type123_basic_t *hdr, 
                                          dlc_segmentation_indication_t si, uint16_t sn_10bit) {
     hdr->ie_type_si_sn_msb = (((uint8_t)type & 0x0F) << 4) |
                              (((uint8_t)si & 0x03) << 2) |
-                             ((uint8_t)((sn_10bit >> 8) & 0x03));
-    hdr->sequence_number_lsb = (uint8_t)(sn_10bit & 0xFF);
+                             ((uint8_t)((sn_10bit >> 8) & 0x03)); // SN ms2b
+    hdr->sequence_number_lsb = (uint8_t)(sn_10bit & 0xFF);     // SN ls8b
 }
+
 static inline dlc_ie_type_val_t dlc_hdr_t123_basic_get_type(const dect_dlc_header_type123_basic_t *hdr) {
     return (dlc_ie_type_val_t)((hdr->ie_type_si_sn_msb >> 4) & 0x0F);
 }
@@ -134,9 +136,9 @@ static inline uint16_t dlc_hdr_t123_basic_get_sn(const dect_dlc_header_type123_b
  * Octets 3-4: Segmentation Offset (Big Endian on air)
  */
 typedef struct {
-    uint8_t ie_type_si_sn_msb;
-    uint8_t sequence_number_lsb;
-    uint16_t segmentation_offset_be; // Big Endian
+    uint8_t ie_type_si_sn_msb;        // Octet 1
+    uint8_t sequence_number_lsb;      // Octet 2
+    uint16_t segmentation_offset_be;  // Octets 3-4: Big Endian on air
 } __attribute__((packed)) dect_dlc_header_type13_segmented_t;
 
 // Helpers for dect_dlc_header_type13_segmented_t (setters similar to basic, plus offset)
@@ -148,6 +150,7 @@ static inline void dlc_hdr_t13_segmented_set(dect_dlc_header_type13_segmented_t 
     hdr->sequence_number_lsb = (uint8_t)(sn_10bit & 0xFF);
     hdr->segmentation_offset_be = sys_cpu_to_be16(seg_offset);
 }
+
 // Getters for type, SI, SN are same as basic.
 static inline uint16_t dlc_hdr_t13_segmented_get_offset(const dect_dlc_header_type13_segmented_t *hdr) {
     return sys_be16_to_cpu(hdr->segmentation_offset_be);

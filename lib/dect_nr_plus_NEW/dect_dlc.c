@@ -36,18 +36,39 @@ typedef struct {
 
 static dlc_retransmission_job_t retransmission_jobs[MAX_DLC_RETRANSMISSION_JOBS];
 
+#define DLC_REASSEMBLY_CHUNK_SIZE 64 // Size of each chunk tracked by the bitmap
+#define DLC_MAX_REASSEMBLY_CHUNKS (DLC_REASSEMBLY_BUF_SIZE / DLC_REASSEMBLY_CHUNK_SIZE)
+#if DLC_MAX_REASSEMBLY_CHUNKS > 64
+    #warning "DLC_MAX_REASSEMBLY_CHUNKS > 64; bitmap logic needs extension (e.g., array of uint64_t)"
+    // For simplicity, we'll use a single uint64_t, limiting to 64 chunks.
+    // This implies DLC_REASSEMBLY_BUF_SIZE <= 64 * 64 = 4096.
+    #define DLC_BITMAP_TYPE uint64_t
+    #define MAX_BITMAP_TRACKABLE_CHUNKS 64
+#elif DLC_MAX_REASSEMBLY_CHUNKS > 32
+    #define DLC_BITMAP_TYPE uint64_t
+    #define MAX_BITMAP_TRACKABLE_CHUNKS 64
+#else
+    #define DLC_BITMAP_TYPE uint32_t
+    #define MAX_BITMAP_TRACKABLE_CHUNKS 32
+#endif
+#if DLC_MAX_REASSEMBLY_CHUNKS == 0
+#error "DLC_REASSEMBLY_CHUNK_SIZE is too large for DLC_REASSEMBLY_BUF_SIZE"
+#endif
+
 
 typedef struct {
     bool is_active;
     uint16_t sequence_number;       // SN of the DLC SDU (CVG PDU) being reassembled
     uint8_t reassembly_buf[DLC_REASSEMBLY_BUF_SIZE];
-    size_t current_len;             // Current total length of data in reassembly_buf (may have gaps)
-    size_t expected_total_len;      // Expected total length if known (e.g. from first segment if supported)
-    uint32_t received_segments_map; // Bitmap for tracking received segments for a given SN
-    struct k_timer timeout_timer;   // Renamed from "timeout" to avoid conflict
+    DLC_BITMAP_TYPE received_chunk_bitmap; // Bitmap to track received chunks
+    uint16_t total_expected_sdu_len;  // Total length of the SDU once known (from LAST segment or future SLI)
+    uint16_t highest_offset_received; // Highest byte offset written to, to estimate current reassembled size
+    uint8_t num_expected_chunks;     // Calculated once total_expected_sdu_len is known
+    struct k_timer timeout_timer;
     dlc_service_type_t service_type;// Service type of the SDU being reassembled
-    // uint32_t source_rd_id;       // If needed to distinguish sessions from multiple MAC peers
+    // uint32_t source_rd_id;       // If needed for multi-peer
 } dlc_reassembly_session_t;
+
 
 static dlc_reassembly_session_t reassembly_sessions[MAX_DLC_REASSEMBLY_SESSIONS];
 
@@ -118,14 +139,14 @@ static dlc_reassembly_session_t* allocate_reassembly_session(uint16_t sequence_n
             dlc_reassembly_session_t *session = &reassembly_sessions[i];
             session->is_active = true;
             session->sequence_number = sequence_number;
-            session->current_len = 0;
-            // A more robust bitmap would be dynamically sized or use a bitmask array.
-            // For now, a simple bitmap assuming the SDU is not excessively large.
-            memset(session->reassembly_buf, 0, DLC_REASSEMBLY_BUF_SIZE);
-            session->received_segments_map = 0; // Clear the bitmap
-            session->expected_total_len = 0; // Unknown until last segment arrives
+            session->service_type = service;
+            memset(session->reassembly_buf, 0, DLC_REASSEMBLY_BUF_SIZE); // Clear buffer
+            session->received_chunk_bitmap = 0;       // Clear bitmap
+            session->total_expected_sdu_len = 0;      // Unknown until last segment or SLI
+            session->highest_offset_received = 0;
+            session->num_expected_chunks = 0;         // Unknown until total_expected_sdu_len is set
             k_timer_start(&session->timeout_timer, K_MSEC(DLC_REASSEMBLY_TIMEOUT_MS), K_NO_WAIT);
-            LOG_DBG("DLC_SAR: Allocated reassembly session %d for SN %u.", i, sequence_number);
+            LOG_DBG("DLC_SAR: Allocated reassembly session %d for SN %u, Svc %u.", i, sequence_number, service);
             return session;
         }
     }
@@ -179,6 +200,9 @@ K_THREAD_DEFINE(g_dlc_tx_service_thread_id, CONFIG_DECT_DLC_TX_SERVICE_THREAD_ST
                 dlc_tx_service_thread_entry, NULL, NULL, NULL,
                 CONFIG_DECT_DLC_TX_SERVICE_THREAD_PRIORITY, 0, 0);
 
+
+
+
 static void dlc_rx_thread_entry(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
@@ -187,11 +211,15 @@ static void dlc_rx_thread_entry(void *p1, void *p2, void *p3)
     while (1) {
         mac_sdu_t *mac_sdu = k_fifo_get(&g_dlc_internal_mac_rx_fifo, K_FOREVER);
         if (!mac_sdu) {
+            // This should not happen with K_FOREVER unless k_fifo_init failed,
+            // or if the FIFO is being terminated, which is not the case here.
+            LOG_ERR("DLC_RX_THREAD: k_fifo_get returned NULL with K_FOREVER. Critical error.");
+            k_sleep(K_MSEC(1000)); // Avoid busy loop on critical error
             continue;
         }
 
         if (mac_sdu->len == 0) {
-            LOG_WRN("DLC_RX_THREAD: Received empty MAC SDU from MAC layer.");
+            LOG_WRN("DLC_RX_THREAD: Received empty MAC SDU from MAC layer. Discarding.");
             dect_mac_api_buffer_free(mac_sdu);
             continue;
         }
@@ -199,120 +227,207 @@ static void dlc_rx_thread_entry(void *p1, void *p2, void *p3)
         const uint8_t *dlc_pdu = mac_sdu->data;
         size_t dlc_pdu_len = mac_sdu->len;
         dlc_ie_type_val_t ie_type = (dlc_ie_type_val_t)((dlc_pdu[0] >> 4) & 0x0F);
+        
+        // Placeholder for service type to pass to CVG.
+        // Actual service type (0-3) might be inferred from configuration or future PDU fields.
+        dlc_service_type_t dlc_sdu_service_type_for_cvg = DLC_SERVICE_TYPE_0_TRANSPARENT; // Default
 
-        // --- Handle Transparent Service (Type 0) ---
         if (ie_type == DLC_IE_TYPE_DATA_TYPE_0_NO_ROUTING ||
-            ie_type == DLC_IE_TYPE_DATA_TYPE_0_WITH_ROUTING) { // TODO: Add Ext Hdr case
-            if (dlc_pdu_len < sizeof(dect_dlc_header_type0_t)) {
-                LOG_ERR("DLC_RX: Type 0 PDU too short (%zu).", dlc_pdu_len);
-            } else {
-                size_t payload_len = dlc_pdu_len - sizeof(dect_dlc_header_type0_t);
-                if (payload_len > 0) {
-                    mac_sdu_t *app_sdu = dect_mac_api_buffer_alloc(K_NO_WAIT);
-                    if (app_sdu) {
-                        memcpy(app_sdu->data, dlc_pdu + sizeof(dect_dlc_header_type0_t), payload_len);
-                        app_sdu->len = payload_len;
-                        // TODO: Use delivery_item struct to pass service type
-                        k_fifo_put(&g_dlc_to_app_rx_fifo, app_sdu);
+            ie_type == DLC_IE_TYPE_DATA_TYPE_0_WITH_ROUTING ||
+            ie_type == DLC_IE_TYPE_DATA_TYPE_0_EXT_HDR) { // Handle Type 0 with/without routing/ext
+            
+            dlc_sdu_service_type_for_cvg = DLC_SERVICE_TYPE_0_TRANSPARENT;
+            size_t dlc_hdr_len_type0 = sizeof(dect_dlc_header_type0_t);
+            // TODO: If _EXT_HDR, need to parse extension header to find start of CVG PDU.
+            // For now, assume no extension header payload for Type 0 if _EXT_HDR is used.
+
+            if (dlc_pdu_len < dlc_hdr_len_type0) {
+                LOG_ERR("DLC_RX: Type 0 PDU (IE 0x%X) too short (%zu < %zu).", ie_type, dlc_pdu_len, dlc_hdr_len_type0);
+                goto free_mac_sdu_and_continue_rx_loop;
+            }
+
+            size_t payload_len = dlc_pdu_len - dlc_hdr_len_type0;
+            const uint8_t *payload_ptr = dlc_pdu + dlc_hdr_len_type0;
+
+            if (payload_len > 0) {
+                mac_sdu_t *cvg_sdu = dect_mac_api_buffer_alloc(K_NO_WAIT);
+                if (cvg_sdu) {
+                    if (payload_len <= sizeof(cvg_sdu->data)) {
+                        memcpy(cvg_sdu->data, payload_ptr, payload_len);
+                        cvg_sdu->len = payload_len;
+                        // cvg_sdu->dlc_service_type = dlc_sdu_service_type_for_cvg; // If struct supports
+                        k_fifo_put(&g_dlc_to_app_rx_fifo, cvg_sdu);
+                        LOG_DBG("DLC_RX: Passed Type 0 SDU (len %zu) to CVG.", payload_len);
                     } else {
-                        LOG_ERR("DLC_RX: Failed to alloc buffer for app delivery.");
-                    }
-                }
-            }
-        }
-        // --- Handle Segmented/ARQ Services (Type 1, 2, 3) ---
-        else if (ie_type == DLC_IE_TYPE_DATA_TYPE_123_NO_ROUTING ||
-                   ie_type == DLC_IE_TYPE_DATA_TYPE_123_WITH_ROUTING) { // TODO: Add Ext Hdr case
-
-            const dect_dlc_header_type123_basic_t *hdr = (const dect_dlc_header_type123_basic_t*)dlc_pdu;
-            dlc_segmentation_indication_t si = dlc_hdr_t123_basic_get_si(hdr);
-            uint16_t sn = dlc_hdr_t123_basic_get_sn(hdr);
-            const uint8_t *payload_ptr;
-            size_t payload_len;
-            size_t header_len;
-            uint16_t seg_offset = 0;
-
-            if (si == DLC_SI_COMPLETE_SDU || si == DLC_SI_FIRST_SEGMENT) {
-                header_len = sizeof(dect_dlc_header_type123_basic_t);
-            } else { // MIDDLE or LAST segment
-                header_len = sizeof(dect_dlc_header_type13_segmented_t);
-                seg_offset = dlc_hdr_t13_segmented_get_offset((const dect_dlc_header_type13_segmented_t*)hdr);
-            }
-
-            if (dlc_pdu_len < header_len) {
-                LOG_ERR("DLC_RX: Segmented PDU too short for header (SI=%d, len=%zu, hdr_len=%zu)", si, dlc_pdu_len, header_len);
-                dect_mac_api_buffer_free(mac_sdu);
-                continue;
-            }
-            payload_ptr = dlc_pdu + header_len;
-            payload_len = dlc_pdu_len - header_len;
-
-            // --- Reassembly Logic ---
-            if (si == DLC_SI_COMPLETE_SDU) {
-                if (payload_len > 0) {
-                    mac_sdu_t *app_sdu = dect_mac_api_buffer_alloc(K_NO_WAIT);
-                    if (app_sdu) {
-                        memcpy(app_sdu->data, payload_ptr, payload_len);
-                        app_sdu->len = payload_len;
-                        // TODO: Use delivery_item struct to pass service type
-                        k_fifo_put(&g_dlc_to_app_rx_fifo, app_sdu);
-                    } else { LOG_ERR("DLC_RX: Failed to alloc buffer for complete SDU."); }
-                }
-            } else { // Segmented PDU
-                dlc_reassembly_session_t *session = find_reassembly_session(sn);
-                if (!session && si == DLC_SI_FIRST_SEGMENT) {
-                    session = allocate_reassembly_session(sn);
-                }
-
-                if (!session) {
-                    LOG_WRN("DLC_RX: No active reassembly session for SN %u and this is not a FIRST segment (SI=%d). Dropping.", sn, si);
-                    dect_mac_api_buffer_free(mac_sdu);
-                    continue;
-                }
-
-                // Check for buffer overflow before memcpy
-                if (seg_offset + payload_len > DLC_REASSEMBLY_BUF_SIZE) {
-                    LOG_ERR("DLC_SAR: Segment for SN %u (offset %u, len %zu) would overflow reassembly buffer. Discarding session.",
-                            sn, seg_offset, payload_len);
-                    session->is_active = false;
-                    k_timer_stop(&session->timeout_timer);
-                    dect_mac_api_buffer_free(mac_sdu);
-                    continue;
-                }
-
-                // Copy segment payload into the reassembly buffer
-                memcpy(session->reassembly_buf + seg_offset, payload_ptr, payload_len);
-                session->current_len += payload_len; // Simple accumulation for now
-                // TODO: A more robust approach would use a bitmap to track received chunks.
-                // For now, we rely on receiving the last segment to know the total length.
-
-                if (si == DLC_SI_LAST_SEGMENT) {
-                    session->expected_total_len = seg_offset + payload_len;
-                    LOG_DBG("DLC_SAR: Received LAST segment for SN %u. Expected total len: %zu, current len: %zu",
-                            sn, session->expected_total_len, session->current_len);
-
-                    // Simplified check: assume if we got the last segment, we got everything.
-                    // A bitmap check would be required here for a robust implementation.
-                    if (session->current_len == session->expected_total_len) {
-                        LOG_INF("DLC_SAR: Reassembly complete for SN %u, total size %zu.",
-                                sn, session->expected_total_len);
-
-                        mac_sdu_t *app_sdu = dect_mac_api_buffer_alloc(K_NO_WAIT);
-                        if (app_sdu) {
-                            memcpy(app_sdu->data, session->reassembly_buf, session->expected_total_len);
-                            app_sdu->len = session->expected_total_len;
-                            k_fifo_put(&g_dlc_to_app_rx_fifo, app_sdu);
-                        } else {
-                            LOG_ERR("DLC_SAR: Failed to alloc buffer for reassembled SDU.");
-                        }
-                        session->is_active = false; // Free the session
-                        k_timer_stop(&session->timeout_timer);
-                    } else {
-                         LOG_WRN("DLC_SAR: Received LAST segment for SN %u, but size mismatch (exp %zu, got %zu). Waiting for timeout.",
-                                 sn, session->expected_total_len, session->current_len);
+                        LOG_ERR("DLC_RX: Type 0 payload (%zu) too large for CVG SDU buffer. Dropping.", payload_len);
+                        dect_mac_api_buffer_free(cvg_sdu);
                     }
                 } else {
-                    // It was a FIRST or MIDDLE segment, just restart the timer to keep session alive.
+                    LOG_ERR("DLC_RX: Failed to alloc buffer for CVG delivery (Type0). Payload len %zu dropped.", payload_len);
+                }
+            } else {
+                 LOG_DBG("DLC_RX: Type 0 PDU (IE 0x%X) with zero payload length.", ie_type);
+            }
+        } else if (ie_type == DLC_IE_TYPE_DATA_TYPE_123_NO_ROUTING ||
+                   ie_type == DLC_IE_TYPE_DATA_TYPE_123_WITH_ROUTING ||
+                   ie_type == DLC_IE_TYPE_DATA_TYPE_123_EXT_HDR) {
+
+            // TODO: Determine actual service type (1 or 3 for SAR) based on context or ARQ flags if any in PDU
+            dlc_service_type_t session_service_type = DLC_SERVICE_TYPE_1_SEGMENTATION; // Default for SAR
+            // if (pdu_indicates_arq_service) session_service_type = DLC_SERVICE_TYPE_3_SEGMENTATION_ARQ;
+            dlc_sdu_service_type_for_cvg = session_service_type;
+
+
+            const dect_dlc_header_type123_basic_t *hdr_basic = (const dect_dlc_header_type123_basic_t*)dlc_pdu;
+            dlc_segmentation_indication_t si = dlc_hdr_t123_basic_get_si(hdr_basic);
+            uint16_t sn = dlc_hdr_t123_basic_get_sn(hdr_basic);
+            const uint8_t *segment_payload_ptr;
+            size_t segment_payload_len;
+            size_t dlc_hdr_len;
+            uint16_t segment_offset = 0;
+
+            // TODO: If _EXT_HDR, need to parse extension header first to find where DLC SDU (segment) starts.
+            // For now, assume dlc_pdu points to start of actual DLC data header.
+
+            if (si == DLC_SI_COMPLETE_SDU) {
+                dlc_hdr_len = sizeof(dect_dlc_header_type123_basic_t);
+                if (dlc_pdu_len < dlc_hdr_len) { LOG_ERR("DLC_RX: SN %u COMPLETE SDU too short for header.", sn); goto free_mac_sdu_and_continue_rx_loop; }
+                segment_payload_ptr = dlc_pdu + dlc_hdr_len;
+                segment_payload_len = dlc_pdu_len - dlc_hdr_len;
+
+                LOG_DBG("DLC_RX: SN %u COMPLETE SDU (len %zu) received.", sn, segment_payload_len);
+                if (segment_payload_len > 0) {
+                    mac_sdu_t *cvg_sdu = dect_mac_api_buffer_alloc(K_NO_WAIT);
+                    if (cvg_sdu) {
+                         if (segment_payload_len <= sizeof(cvg_sdu->data)) {
+                            memcpy(cvg_sdu->data, segment_payload_ptr, segment_payload_len);
+                            cvg_sdu->len = segment_payload_len;
+                            k_fifo_put(&g_dlc_to_app_rx_fifo, cvg_sdu);
+                        } else {
+                             LOG_ERR("DLC_RX: COMPLETE SDU SN %u (len %zu) too large for CVG buffer. Dropping.", sn, segment_payload_len);
+                             dect_mac_api_buffer_free(cvg_sdu);
+                        }
+                    } else { LOG_ERR("DLC_RX: Failed to alloc buffer for CVG delivery (SN %u COMPLETE).", sn); }
+                }
+                // If this SN was part of an ongoing reassembly session (e.g., due to out-of-order LAST then COMPLETE), clear it.
+                dlc_reassembly_session_t *existing_session = find_reassembly_session(sn);
+                if (existing_session) {
+                    LOG_WRN("DLC_RX: SN %u COMPLETE SDU received while reassembly session was active. Clearing session.", sn);
+                    existing_session->is_active = false; k_timer_stop(&existing_session->timeout_timer);
+                }
+            } else { // Segmented PDU (FIRST, MIDDLE, LAST)
+                if (si == DLC_SI_FIRST_SEGMENT) {
+                    dlc_hdr_len = sizeof(dect_dlc_header_type123_basic_t);
+                    segment_offset = 0; // First segment always starts at offset 0
+                } else { // MIDDLE or LAST segment
+                    dlc_hdr_len = sizeof(dect_dlc_header_type13_segmented_t);
+                    if (dlc_pdu_len < dlc_hdr_len) { // Check before accessing offset from potentially short PDU
+                        LOG_ERR("DLC_RX: SN %u Segmented PDU (SI %d) too short for its header type (len %zu < %zu).",
+                                sn, si, dlc_pdu_len, dlc_hdr_len);
+                        goto free_mac_sdu_and_continue_rx_loop;
+                    }
+                    segment_offset = dlc_hdr_t13_segmented_get_offset((const dect_dlc_header_type13_segmented_t*)dlc_pdu);
+                }
+
+                if (dlc_pdu_len < dlc_hdr_len) { LOG_ERR("DLC_RX: SN %u Segment (SI %d) too short for any header.", sn, si); goto free_mac_sdu_and_continue_rx_loop; }
+                segment_payload_ptr = dlc_pdu + dlc_hdr_len;
+                segment_payload_len = dlc_pdu_len - dlc_hdr_len;
+
+                LOG_DBG("DLC_RX: SN %u Segment (SI %d, Offset %u, SegLen %zu) received.", sn, si, segment_offset, segment_payload_len);
+
+                dlc_reassembly_session_t *session = find_reassembly_session(sn);
+                if (!session && si == DLC_SI_FIRST_SEGMENT) {
+                    session = allocate_reassembly_session(sn, session_service_type);
+                } else if (!session) {
+                    LOG_WRN("DLC_RX: SN %u Segment (SI %d, Offset %u) without active session or not FIRST. Dropping.", sn, si, segment_offset);
+                    goto free_mac_sdu_and_continue_rx_loop;
+                }
+                if (!session) { /* allocate_reassembly_session failed */ goto free_mac_sdu_and_continue_rx_loop; }
+
+                if ((segment_offset + segment_payload_len) > DLC_REASSEMBLY_BUF_SIZE) {
+                    LOG_ERR("DLC_SAR: SN %u Segment (Offset %u, Len %zu) would overflow reassembly buffer (%u). Discarding session.",
+                            sn, segment_offset, segment_payload_len, DLC_REASSEMBLY_BUF_SIZE);
+                    session->is_active = false; k_timer_stop(&session->timeout_timer);
+                    goto free_mac_sdu_and_continue_rx_loop;
+                }
+                if (segment_payload_len > 0) { // Only copy and update bitmap if there's payload
+                    memcpy(session->reassembly_buf + segment_offset, segment_payload_ptr, segment_payload_len);
+
+                    uint16_t start_chunk_idx = segment_offset / DLC_REASSEMBLY_CHUNK_SIZE;
+                    uint16_t end_chunk_idx_exclusive = (segment_offset + segment_payload_len + DLC_REASSEMBLY_CHUNK_SIZE - 1) / DLC_REASSEMBLY_CHUNK_SIZE;
+                    
+                    for (uint16_t i = start_chunk_idx; i < end_chunk_idx_exclusive && i < MAX_BITMAP_TRACKABLE_CHUNKS; i++) {
+                        session->received_chunk_bitmap |= (1ULL << i);
+                    }
+                    if (segment_offset + segment_payload_len > session->highest_offset_received) {
+                        session->highest_offset_received = segment_offset + segment_payload_len;
+                    }
+                }
+
+
+                if (si == DLC_SI_LAST_SEGMENT) {
+                    session->total_expected_sdu_len = segment_offset + segment_payload_len;
+                    if (session->total_expected_sdu_len > DLC_REASSEMBLY_BUF_SIZE) {
+                         LOG_ERR("DLC_SAR: SN %u LAST segment implies total_len %u > buf_size %u. Corrupted? Discarding session.",
+                                 sn, session->total_expected_sdu_len, DLC_REASSEMBLY_BUF_SIZE);
+                         session->is_active = false; k_timer_stop(&session->timeout_timer);
+                         goto free_mac_sdu_and_continue_rx_loop;
+                    }
+                    if (DLC_REASSEMBLY_CHUNK_SIZE > 0) { // Avoid division by zero if chunk size is misconfigured
+                        session->num_expected_chunks = (session->total_expected_sdu_len + DLC_REASSEMBLY_CHUNK_SIZE - 1) / DLC_REASSEMBLY_CHUNK_SIZE;
+                        if (session->num_expected_chunks > MAX_BITMAP_TRACKABLE_CHUNKS) {
+                            LOG_ERR("DLC_SAR: SN %u SDU needs %u chunks, but bitmap only tracks %u. SDU too large for current chunk/bitmap config.",
+                                    sn, session->num_expected_chunks, MAX_BITMAP_TRACKABLE_CHUNKS);
+                            session->is_active = false; k_timer_stop(&session->timeout_timer);
+                            goto free_mac_sdu_and_continue_rx_loop;
+                        }
+                    } else {
+                        LOG_ERR("DLC_SAR: DLC_REASSEMBLY_CHUNK_SIZE is 0. Cannot calculate expected chunks.");
+                        session->is_active = false; k_timer_stop(&session->timeout_timer);
+                        goto free_mac_sdu_and_continue_rx_loop;
+                    }
+                    LOG_DBG("DLC_SAR: SN %u LAST segment. Total SDU len: %u, NumExpectedChunks: %u",
+                            sn, session->total_expected_sdu_len, session->num_expected_chunks);
+                }
+
+                bool all_chunks_received = false;
+                if (session->total_expected_sdu_len > 0 && session->num_expected_chunks > 0) {
+                    DLC_BITMAP_TYPE expected_bitmap_val = (session->num_expected_chunks >= MAX_BITMAP_TRACKABLE_CHUNKS) ?
+                                                          ((DLC_BITMAP_TYPE)-1) : // All bits set for the type
+                                                          ((1ULL << session->num_expected_chunks) - 1);
+                    if ((session->received_chunk_bitmap & expected_bitmap_val) == expected_bitmap_val) {
+                        // Additional check: ensure highest_offset_received matches total_expected_sdu_len
+                        // This helps catch cases where bitmap might be full due to overlapping segments but actual data length is less.
+                        if (session->highest_offset_received == session->total_expected_sdu_len) {
+                            all_chunks_received = true;
+                        } else {
+                            LOG_WRN("DLC_SAR: SN %u bitmap full, but highest_offset %u != total_expected %u. Waiting.",
+                                    sn, session->highest_offset_received, session->total_expected_sdu_len);
+                        }
+                    }
+                } else if (si == DLC_SI_LAST_SEGMENT && session->total_expected_sdu_len == 0) {
+                    // Case: LAST segment with zero payload, and it's the only segment.
+                    all_chunks_received = true;
+                }
+
+                if (all_chunks_received) {
+                    LOG_INF("DLC_SAR: Reassembly complete for SN %u, total size %u.",
+                            sn, session->total_expected_sdu_len);
+                    mac_sdu_t *cvg_sdu = dect_mac_api_buffer_alloc(K_NO_WAIT);
+                    if (cvg_sdu) {
+                        if (session->total_expected_sdu_len <= sizeof(cvg_sdu->data)) {
+                            memcpy(cvg_sdu->data, session->reassembly_buf, session->total_expected_sdu_len);
+                            cvg_sdu->len = session->total_expected_sdu_len;
+                            // cvg_sdu->dlc_service_type = session->service_type; // If struct supports
+                            k_fifo_put(&g_dlc_to_app_rx_fifo, cvg_sdu);
+                        } else {
+                             LOG_ERR("DLC_SAR: Reassembled SDU SN %u (len %u) too large for CVG buffer. Dropping.",
+                                     sn, session->total_expected_sdu_len);
+                             dect_mac_api_buffer_free(cvg_sdu);
+                        }
+                    } else { LOG_ERR("DLC_SAR: Failed to alloc buffer for reassembled SDU SN %u.", sn); }
+                    session->is_active = false; k_timer_stop(&session->timeout_timer);
+                } else if (session->is_active) { // Only restart timer if session wasn't just completed
                     k_timer_start(&session->timeout_timer, K_MSEC(DLC_REASSEMBLY_TIMEOUT_MS), K_NO_WAIT);
                 }
             }
@@ -320,9 +435,11 @@ static void dlc_rx_thread_entry(void *p1, void *p2, void *p3)
             LOG_WRN("DLC_RX_THREAD: Unknown or unsupported DLC IE Type: 0x%X", ie_type);
         }
 
+free_mac_sdu_and_continue_rx_loop:
         dect_mac_api_buffer_free(mac_sdu);
     }
 }
+
 
 /**
  * @brief DLC ARQ Retransmission Thread.
@@ -428,25 +545,41 @@ int dect_dlc_init(void)
     return 0;
 }
 
+
 int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, size_t dlc_sdu_payload_len)
 {
     if (dlc_sdu_payload == NULL && dlc_sdu_payload_len > 0) {
+        LOG_ERR("DLC_SEND: NULL payload with non-zero length %zu.", dlc_sdu_payload_len);
         return -EINVAL;
     }
-    if (dlc_sdu_payload_len > CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE) {
-        LOG_ERR("DLC_SEND: DLC SDU payload too large: %zu (max %d)",
-                dlc_sdu_payload_len, CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE);
+    // Assuming CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE_CONFIG is defined in Kconfig or a header
+    // This represents the max size of the *original* SDU the DLC layer can accept.
+    // Individual segments sent to MAC must fit CONFIG_DECT_MAC_SDU_MAX_SIZE.
+    #ifndef CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE_CONFIG
+    #define CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE_CONFIG (4096) // Example fallback
+    LOG_WRN("DLC_SEND: CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE_CONFIG not defined, using %d", CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE_CONFIG);
+    #endif
+
+    if (dlc_sdu_payload_len > CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE_CONFIG) {
+        LOG_ERR("DLC_SEND: Original DLC SDU payload too large: %zu (max %d)",
+                dlc_sdu_payload_len, CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE_CONFIG);
         return -EMSGSIZE;
     }
 
     mac_flow_id_t mac_qos_flow;
-    dlc_ie_type_val_t ie_type = DLC_IE_TYPE_DATA_TYPE_123_NO_ROUTING; // Assume no routing.
+    // TODO: Determine if routing header is needed based on higher layer or destination.
+    // If routing_header_needed is true, the dlc_sdu_payload itself would be (RoutingHdr + CVG_PDU)
+    // or this layer would prepend a DLC routing header. For now, assume dlc_sdu_payload is CVG_PDU.
+    bool routing_header_needed = false; // Placeholder for now
+    dlc_ie_type_val_t base_ie_type; // Base IE type without extension bit
     int err = 0;
     bool needs_dlc_arq = (service == DLC_SERVICE_TYPE_2_ARQ || service == DLC_SERVICE_TYPE_3_SEGMENTATION_ARQ);
+    uint16_t current_dlc_sn_for_this_sdu = 0; // To store the SN for this SDU
 
-    // Get a new sequence number for any service that uses it
     if (service != DLC_SERVICE_TYPE_0_TRANSPARENT) {
+        // For services 1, 2, 3, assign/increment a 10-bit sequence number
         dlc_tx_sequence_number = (dlc_tx_sequence_number + 1) & 0x03FF;
+        current_dlc_sn_for_this_sdu = dlc_tx_sequence_number;
     }
 
     dlc_retransmission_job_t *arq_job = NULL;
@@ -460,114 +593,167 @@ int dlc_send_data(dlc_service_type_t service, const uint8_t *dlc_sdu_payload, si
         }
 
         if (job_idx == -1) {
-            LOG_ERR("DLC_SEND_ARQ: No free retransmission jobs available. Dropping SDU.");
-            return -ENOBUFS;
+            LOG_ERR("DLC_SEND_ARQ: No free retransmission jobs available. Dropping SDU SN %u.", current_dlc_sn_for_this_sdu);
+            return -ENOBUFS; // Or some other error indicating resource exhaustion
         }
 
         arq_job = &retransmission_jobs[job_idx];
-        arq_job->sdu_payload = dect_mac_api_buffer_alloc(K_NO_WAIT);
+        // Allocate buffer for the ARQ job to store the original SDU
+        arq_job->sdu_payload = dect_mac_api_buffer_alloc(K_NO_WAIT); // Use mac_sdu_t for convenience
         if (!arq_job->sdu_payload) {
-            LOG_ERR("DLC_SEND_ARQ: Failed to allocate buffer for re-TX job. Dropping SDU.");
+            LOG_ERR("DLC_SEND_ARQ: Failed to allocate buffer for re-TX job SN %u. Dropping SDU.", current_dlc_sn_for_this_sdu);
             return -ENOMEM;
+        }
+        if (dlc_sdu_payload_len > sizeof(arq_job->sdu_payload->data)){
+            LOG_ERR("DLC_SEND_ARQ: SDU too large for ARQ job buffer. SN %u", current_dlc_sn_for_this_sdu);
+            dect_mac_api_buffer_free(arq_job->sdu_payload);
+            arq_job->sdu_payload = NULL;
+            return -EMSGSIZE;
         }
 
         memcpy(arq_job->sdu_payload->data, dlc_sdu_payload, dlc_sdu_payload_len);
         arq_job->sdu_payload->len = dlc_sdu_payload_len;
         arq_job->is_active = true;
-        arq_job->sequence_number = dlc_tx_sequence_number;
+        arq_job->sequence_number = current_dlc_sn_for_this_sdu;
         arq_job->retries = 0;
         arq_job->service = service;
-        k_timer_start(&arq_job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+        // Timer is started after the (last) segment is successfully queued to MAC
     }
 
     switch (service) {
     case DLC_SERVICE_TYPE_0_TRANSPARENT: {
+        base_ie_type = routing_header_needed ? DLC_IE_TYPE_DATA_TYPE_0_WITH_ROUTING : DLC_IE_TYPE_DATA_TYPE_0_NO_ROUTING;
+        // TODO: Add handling for DLC_IE_TYPE_DATA_TYPE_0_EXT_HDR if extension header is needed
         size_t hdr_len = sizeof(dect_dlc_header_type0_t);
         uint8_t hdr_buf[hdr_len];
-        dlc_hdr_type0_set((dect_dlc_header_type0_t *)hdr_buf, DLC_IE_TYPE_DATA_TYPE_0_NO_ROUTING);
+        dlc_hdr_type0_set((dect_dlc_header_type0_t *)hdr_buf, base_ie_type);
+        // For Type 0, no DLC ARQ, so no status report needed for the DLC layer itself.
         err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload, dlc_sdu_payload_len, MAC_FLOW_BEST_EFFORT, false, 0);
         break;
     }
     case DLC_SERVICE_TYPE_2_ARQ: {
+        base_ie_type = routing_header_needed ? DLC_IE_TYPE_DATA_TYPE_123_WITH_ROUTING : DLC_IE_TYPE_DATA_TYPE_123_NO_ROUTING;
+        // TODO: Add handling for DLC_IE_TYPE_DATA_TYPE_123_EXT_HDR if extension header is needed
         size_t hdr_len = sizeof(dect_dlc_header_type123_basic_t);
         if (hdr_len + dlc_sdu_payload_len > CONFIG_DECT_MAC_SDU_MAX_SIZE) {
+            LOG_ERR("DLC_SEND_ARQ: SDU (SN %u) too large (%zu) for single MAC PDU (max %d for payload). Type 2 does not segment.",
+                    current_dlc_sn_for_this_sdu, dlc_sdu_payload_len, CONFIG_DECT_MAC_SDU_MAX_SIZE - (int)hdr_len);
             err = -EMSGSIZE;
             break;
         }
         uint8_t hdr_buf[hdr_len];
-        dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t *)hdr_buf, ie_type, DLC_SI_COMPLETE_SDU, dlc_tx_sequence_number);
-        err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload, dlc_sdu_payload_len, MAC_FLOW_RELIABLE_DATA, true, dlc_tx_sequence_number);
+        dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t *)hdr_buf, base_ie_type, DLC_SI_COMPLETE_SDU, current_dlc_sn_for_this_sdu);
+        // For Type 2, status report is needed for the ARQ job.
+        err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload, dlc_sdu_payload_len, MAC_FLOW_RELIABLE_DATA, true, current_dlc_sn_for_this_sdu);
+        if (err == 0 && arq_job) {
+            k_timer_start(&arq_job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+        }
         break;
     }
     case DLC_SERVICE_TYPE_1_SEGMENTATION:
     case DLC_SERVICE_TYPE_3_SEGMENTATION_ARQ: {
         mac_qos_flow = (service == DLC_SERVICE_TYPE_3_SEGMENTATION_ARQ) ? MAC_FLOW_RELIABLE_DATA : MAC_FLOW_BEST_EFFORT;
+        base_ie_type = routing_header_needed ? DLC_IE_TYPE_DATA_TYPE_123_WITH_ROUTING : DLC_IE_TYPE_DATA_TYPE_123_NO_ROUTING;
+        // TODO: Add handling for DLC_IE_TYPE_DATA_TYPE_123_EXT_HDR if extension header is needed
+
         size_t sent_len = 0;
+        uint16_t current_segment_offset = 0;
+
         while (sent_len < dlc_sdu_payload_len) {
-            uint8_t hdr_buf[sizeof(dect_dlc_header_type13_segmented_t)];
-            size_t hdr_len;
-            size_t payload_this_segment;
+            uint8_t hdr_buf[sizeof(dect_dlc_header_type13_segmented_t)]; // Max possible DLC header for segments
+            size_t current_hdr_len;
+            size_t max_payload_for_this_segment;
+            size_t payload_to_send_this_segment;
             dlc_segmentation_indication_t si;
-            uint16_t seg_offset = 0;
-            bool is_last_segment = false;
+            bool is_first_segment = (sent_len == 0);
+            bool is_last_segment_of_sdu = false; // Flag to track if this is the final segment
+            bool report_status_for_this_pdu = false;
 
-            if (sent_len == 0) {
-                hdr_len = sizeof(dect_dlc_header_type123_basic_t);
-            } else {
-                hdr_len = sizeof(dect_dlc_header_type13_segmented_t);
-                seg_offset = sent_len;
-            }
-
-            payload_this_segment = CONFIG_DECT_MAC_SDU_MAX_SIZE - hdr_len;
-            if (sent_len + payload_this_segment >= dlc_sdu_payload_len) {
-                payload_this_segment = dlc_sdu_payload_len - sent_len;
-                si = (sent_len == 0) ? DLC_SI_COMPLETE_SDU : DLC_SI_LAST_SEGMENT;
-                is_last_segment = true;
-            } else {
-                si = (sent_len == 0) ? DLC_SI_FIRST_SEGMENT : DLC_SI_MIDDLE_SEGMENT;
-            }
-
-            if (si == DLC_SI_COMPLETE_SDU) {
-                hdr_len = sizeof(dect_dlc_header_type123_basic_t);
-                dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t*)hdr_buf, ie_type, si, dlc_tx_sequence_number);
-            } else if (si == DLC_SI_FIRST_SEGMENT) {
-                dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t*)hdr_buf, ie_type, si, dlc_tx_sequence_number);
-            } else {
-                 dlc_hdr_t13_segmented_set((dect_dlc_header_type13_segmented_t*)hdr_buf, ie_type, si, dlc_tx_sequence_number, seg_offset);
-            }
-
-            bool report_status_for_this_segment = needs_dlc_arq && is_last_segment;
-            
-            err = queue_dlc_pdu_to_mac(hdr_buf, hdr_len, dlc_sdu_payload + sent_len, payload_this_segment,
-                                       mac_qos_flow, report_status_for_this_segment, dlc_tx_sequence_number);
-            if (err) {
-                LOG_ERR("DLC_SEND_SEG: Failed to queue segment (err %d). Aborting send of SN %u.", err, dlc_tx_sequence_number);
-                if (arq_job) {
-                    k_timer_stop(&arq_job->timeout_timer);
-                    dect_mac_api_buffer_free(arq_job->sdu_payload);
-                    arq_job->is_active = false;
+            if (is_first_segment) {
+                current_hdr_len = sizeof(dect_dlc_header_type123_basic_t); // 2 bytes
+                max_payload_for_this_segment = CONFIG_DECT_MAC_SDU_MAX_SIZE - current_hdr_len;
+                if (dlc_sdu_payload_len <= max_payload_for_this_segment) {
+                    si = DLC_SI_COMPLETE_SDU;
+                    payload_to_send_this_segment = dlc_sdu_payload_len;
+                    is_last_segment_of_sdu = true;
+                } else {
+                    si = DLC_SI_FIRST_SEGMENT;
+                    payload_to_send_this_segment = max_payload_for_this_segment;
                 }
+                dlc_hdr_t123_basic_set((dect_dlc_header_type123_basic_t *)hdr_buf, base_ie_type, si, current_dlc_sn_for_this_sdu);
+            } else { // Middle or Last segment
+                current_hdr_len = sizeof(dect_dlc_header_type13_segmented_t); // 4 bytes
+                max_payload_for_this_segment = CONFIG_DECT_MAC_SDU_MAX_SIZE - current_hdr_len;
+                current_segment_offset = sent_len; // Offset is where the current segment starts in original SDU
+
+                if ((dlc_sdu_payload_len - sent_len) <= max_payload_for_this_segment) {
+                    si = DLC_SI_LAST_SEGMENT;
+                    payload_to_send_this_segment = dlc_sdu_payload_len - sent_len;
+                    is_last_segment_of_sdu = true;
+                } else {
+                    si = DLC_SI_MIDDLE_SEGMENT;
+                    payload_to_send_this_segment = max_payload_for_this_segment;
+                }
+                dlc_hdr_t13_segmented_set((dect_dlc_header_type13_segmented_t *)hdr_buf, base_ie_type, si, current_dlc_sn_for_this_sdu, current_segment_offset);
+            }
+
+            if (payload_to_send_this_segment == 0 && dlc_sdu_payload_len > 0 && !is_last_segment_of_sdu) {
+                LOG_ERR("DLC_SEND_SEG: Max payload for segment is 0. MAC SDU size %d too small for headers (len %zu). SDU SN %u.",
+                        CONFIG_DECT_MAC_SDU_MAX_SIZE, current_hdr_len, current_dlc_sn_for_this_sdu);
+                err = -EMSGSIZE;
                 break;
             }
-            sent_len += payload_this_segment;
+             if (payload_to_send_this_segment > (dlc_sdu_payload_len - sent_len) ) {
+                 payload_to_send_this_segment = dlc_sdu_payload_len - sent_len;
+            }
+
+            // For ARQ services (Type 3), request MAC status report only for the last segment of the SDU
+            if (needs_dlc_arq && is_last_segment_of_sdu) {
+                report_status_for_this_pdu = true;
+            }
+
+            LOG_DBG("DLC_SEND_SEG: SN %u, SI %d, Offset %u, SegPyldLen %zu, HdrLen %zu, Report %d",
+                    current_dlc_sn_for_this_sdu, si, (is_first_segment || si == DLC_SI_COMPLETE_SDU) ? 0 : current_segment_offset,
+                    payload_to_send_this_segment, current_hdr_len, report_status_for_this_pdu);
+
+            err = queue_dlc_pdu_to_mac(hdr_buf, current_hdr_len,
+                                       dlc_sdu_payload + sent_len, payload_to_send_this_segment,
+                                       mac_qos_flow, report_status_for_this_pdu, current_dlc_sn_for_this_sdu);
+            if (err) {
+                LOG_ERR("DLC_SEND_SEG: Failed to queue segment (err %d). Aborting send of SN %u.", err, current_dlc_sn_for_this_sdu);
+                break; 
+            }
+            sent_len += payload_to_send_this_segment;
+
+            if (is_last_segment_of_sdu && err == 0 && arq_job) { // If it was the last segment and successfully queued
+                k_timer_start(&arq_job->timeout_timer, K_MSEC(DLC_RETRANSMISSION_TIMEOUT_MS), K_NO_WAIT);
+            }
         }
         break;
     }
     default:
         LOG_ERR("DLC_SEND: Unknown DLC service type %d", service);
-        if (arq_job) { arq_job->is_active = false; dect_mac_api_buffer_free(arq_job->sdu_payload); } // Cleanup
-        return -EINVAL;
+        err = -EINVAL; // Set error if not already set by a failed segmentation
+        break;
     }
 
-    if (err && arq_job) {
-        LOG_WRN("DLC_SEND: Cleaning up ARQ job for SN %u due to send error %d.", dlc_tx_sequence_number, err);
-        k_timer_stop(&arq_job->timeout_timer);
-        dect_mac_api_buffer_free(arq_job->sdu_payload);
+    if (err && arq_job) { // If any error occurred during sending/segmentation for an ARQ service
+        LOG_WRN("DLC_SEND: Cleaning up ARQ job for SN %u due to send error %d.", current_dlc_sn_for_this_sdu, err);
+        k_timer_stop(&arq_job->timeout_timer); // Stop timer if it was started
+        if (arq_job->sdu_payload) { // Check if buffer was allocated
+            dect_mac_api_buffer_free(arq_job->sdu_payload);
+            arq_job->sdu_payload = NULL;
+        }
         arq_job->is_active = false;
+    } else if (!err && arq_job && service == DLC_SERVICE_TYPE_2_ARQ) {
+        // For non-segmented ARQ (Type 2), timer was started if queue_dlc_pdu_to_mac was successful.
+        // No explicit action here, already handled in its case.
     }
 
     return err;
 }
+
+
 
 int dlc_receive_data(dlc_service_type_t *service_type_out,
                      uint8_t *app_level_payload_buf,
