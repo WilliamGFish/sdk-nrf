@@ -197,24 +197,62 @@ static int ft_get_peer_slot_idx(dect_mac_context_t* ctx, uint16_t pt_short_id) {
     return -1;
 }
 
+
+
 static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluster_beacon_ie_fields_t *cb_fields) {
     memset(cb_fields, 0, sizeof(dect_mac_cluster_beacon_ie_fields_t));
+
     cb_fields->sfn = ctx->role_ctx.ft.sfn;
-    cb_fields->tx_power_present = true;
-    cb_fields->clusters_max_tx_power_code = ctx->config.default_tx_power_code;
-    cb_fields->power_constraints_active = false;
+    cb_fields->tx_power_present = true; // FT should always advertise its max TX power for the cluster
+    cb_fields->clusters_max_tx_power_code = ctx->config.default_tx_power_code; // Or a specific cluster max
+    cb_fields->power_constraints_active = false; // Example: FT has no constraints to impose on PTs via this
+
+    // Frame Offset: If FT's transmission is offset from SFN boundary. Assume 0 for now.
     cb_fields->frame_offset_present = false;
-    cb_fields->frame_offset_is_16bit = false;
+    // cb_fields->frame_offset_is_16bit = (ctx->phy_link_params.mu > 4); // Requires mu storage
+    // cb_fields->frame_offset_value = ctx->role_ctx.ft.frame_offset_subslots; // If used
+
+    // Next Cluster Channel / Time To Next (for multi-frequency FTs or handover hints - advanced)
     cb_fields->next_channel_present = false;
     cb_fields->time_to_next_present = false;
-    // TODO: Map from ctx->config.*_ms to ETSI codes for these period fields
-    // Example: if(ctx->config.ft_network_beacon_period_ms == 1000) cb_fields->network_beacon_period_code = 3;
-    cb_fields->network_beacon_period_code = 3; // Placeholder for 1000 ms
-    cb_fields->cluster_beacon_period_code = 2; // Placeholder for 100 ms
-    cb_fields->count_to_trigger_code = 7;    // 8 times
-    cb_fields->rel_quality_code = 2;         // 6dB
-    cb_fields->min_quality_code = 1;         // 3dB
+    // cb_fields->next_cluster_channel_val = ...;
+    // cb_fields->time_to_next_us = ...;
+
+    // Convert ms periods from Kconfig to ETSI codes
+    // ETSI Table 6.4.2.2-1: Network Beacon Period
+    // Codes: 0=50ms, 1=100ms, 2=500ms, 3=1000ms, 4=1500ms, 5=2000ms, 6=4000ms. Others reserved.
+    // Mapping Kconfig to codes (example, needs full mapping based on ETSI codes)
+    if (ctx->config.ft_network_beacon_period_ms <= 50) cb_fields->network_beacon_period_code = 0;
+    else if (ctx->config.ft_network_beacon_period_ms <= 100) cb_fields->network_beacon_period_code = 1;
+    else if (ctx->config.ft_network_beacon_period_ms <= 500) cb_fields->network_beacon_period_code = 2;
+    else if (ctx->config.ft_network_beacon_period_ms <= 1000) cb_fields->network_beacon_period_code = 3;
+    // ... add other mappings ...
+    else cb_fields->network_beacon_period_code = 3; // Default to 1000ms code if no match
+
+    // ETSI Table 6.4.2.2-1: Cluster Beacon Period
+    // Codes: 0=10ms, 1=50ms, 2=100ms, ... 6=4000ms, 7=8000ms, 8=16000ms, 9=32000ms. Others reserved.
+    if (ctx->config.ft_cluster_beacon_period_ms <= 10) cb_fields->cluster_beacon_period_code = 0;
+    else if (ctx->config.ft_cluster_beacon_period_ms <= 50) cb_fields->cluster_beacon_period_code = 1;
+    else if (ctx->config.ft_cluster_beacon_period_ms <= 100) cb_fields->cluster_beacon_period_code = 2;
+    // ... add other mappings ...
+    else cb_fields->cluster_beacon_period_code = 2; // Default to 100ms code
+
+    // These are typically PT parameters, but FT can signal defaults/recommendations
+    cb_fields->count_to_trigger_code = 7; // Example: 8 beacons (ETSI Table 6.4.2.3-1 maps codes)
+    cb_fields->rel_quality_code = 2;      // Example: 6dB (codes 0-3 for 0,3,6,9 dB)
+    cb_fields->min_quality_code = 1;      // Example: 3dB
+
+    // Current Cluster Channel (ETSI Table 6.4.2.3-1): This field is only present IF Next Cluster Channel is present
+    // AND the next channel is different from the current one.
+    // Since we set next_channel_present = false, this field is implicitly not included
+    // as per ETSI Figure 6.4.2.3-1.
+    // If next_channel_present was true, logic to set current_cluster_channel_val would be here.
 }
+
+
+
+
+
 
 static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sfn_zero_anchor_time,
                                             uint8_t sfn_of_anchor_relevance, uint8_t target_sfn_val,
@@ -322,12 +360,23 @@ static void ft_start_beaconing_actions(void) {
     k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_MSEC(first_beacon_delay_ms), K_MSEC(ctx->config.ft_cluster_beacon_period_ms));
 }
 
+
+
+
+
 static void ft_send_beacon_action(void) {
     dect_mac_context_t* ctx = get_mac_context();
     if (ctx->state != MAC_STATE_FT_BEACONING) {
         LOG_WRN("FT SM: Beacon TX attempt, but not in BEACONING state (%s). Aborting.",
                 dect_mac_state_to_str(ctx->state));
-        k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_MSEC(ctx->config.ft_cluster_beacon_period_ms), K_NO_WAIT);
+        // Restart timer with a sensible period if it was stopped or for next attempt
+        // Ensure ft_cluster_beacon_period_ms is not zero to avoid K_MSEC(0) which might be K_NO_WAIT
+        uint32_t beacon_period_ms = ctx->config.ft_cluster_beacon_period_ms;
+        if (beacon_period_ms == 0) {
+            beacon_period_ms = 100; // Fallback default if config is 0
+            LOG_WRN("FT_BEACON_ACT: ft_cluster_beacon_period_ms is 0, using fallback %ums", beacon_period_ms);
+        }
+        k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_MSEC(beacon_period_ms), K_MSEC(beacon_period_ms));
         return;
     }
 
@@ -335,40 +384,67 @@ static void ft_send_beacon_action(void) {
     int sdu_area_len;
 
     dect_mac_cluster_beacon_ie_fields_t cb_fields;
-    populate_cb_fields_from_ctx(ctx, &cb_fields);
+    populate_cb_fields_from_ctx(ctx, &cb_fields); // Populates cb_fields based on current FT context
 
-    // Ensure advertised RACH params are current
-    ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields.channel_abs_freq_num = ctx->role_ctx.ft.operating_carrier;
-    ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields.channel_field_present = true;
-    // Populate other RACH IE fields from ft.advertised_rach_params if they can change dynamically
-    // For now, assume they are set correctly in ft_context_t when core_init or DCS runs.
+    // Pointer to the RACH Info IE fields that the FT will advertise.
+    // This structure is part of the FT's context and should be updated by DCS/configuration.
+    dect_mac_rach_info_ie_fields_t *rach_adv_fields = &ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields;
+    
+    // Ensure mu_value_for_ft_beacon is set correctly based on FT's operational mu.
+    // This 'mu' should reflect the numerology the FT is currently operating with and advertising.
+    // It should be stored in the MAC context, e.g., ctx->phy_link_params.mu (assuming such a field exists and is valid).
+    // TODO: Ensure ctx->phy_link_params.mu (or equivalent for FT's own PHY config) is correctly initialized/updated.
+    uint8_t ft_operational_mu = 1; // Default/Placeholder if not found in context for FT's own mu
+    if (ctx->phy_link_params.is_valid && ctx->phy_link_params.mu > 0 && ctx->phy_link_params.mu <= 8) { // Example check
+        ft_operational_mu = ctx->phy_link_params.mu;
+    } else {
+        LOG_WRN("FT_BEACON_ACT: FT operational mu not available or invalid in context (is_valid:%d, mu:%d). Defaulting to mu=1 for RACH IE.",
+                ctx->phy_link_params.is_valid, ctx->phy_link_params.mu);
+        // Consider if this warning should be an error or if defaulting is acceptable.
+    }
+    rach_adv_fields->mu_value_for_ft_beacon = ft_operational_mu;
+    LOG_DBG("FT_BEACON_ACT: Setting RACH IE mu_value_for_ft_beacon to %u for beacon SFN %u",
+            ft_operational_mu, ctx->role_ctx.ft.sfn);
+
+    // Ensure other critical RACH params like operating channel are also up-to-date before serialization.
+    // This should have been set by ft_select_operating_carrier_and_start_beaconing or similar config logic.
+    if (rach_adv_fields->channel_abs_freq_num != ctx->role_ctx.ft.operating_carrier || !rach_adv_fields->channel_field_present) {
+        LOG_INF("FT_BEACON_ACT: Updating RACH IE channel to current FT operating_carrier %u.", ctx->role_ctx.ft.operating_carrier);
+        rach_adv_fields->channel_abs_freq_num = ctx->role_ctx.ft.operating_carrier;
+        rach_adv_fields->channel_field_present = true; // RACH typically on op channel
+    }
+    // Other fields like start_subslot_index, num_subslots_or_slots, repetition_code, validity_frames,
+    // response_window_subslots_val_minus_1, cwmin_sig_code, cwmax_sig_code, etc.,
+    // are assumed to be correctly populated in ctx->role_ctx.ft.advertised_rach_params
+    // by dect_mac_core_init or by the DCS logic (ft_select_operating_carrier_and_start_beaconing).
 
     sdu_area_len = build_beacon_sdu_area_content(mac_sdu_area_buf, sizeof(mac_sdu_area_buf),
                                                 &cb_fields,
-                                                &ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields);
+                                                rach_adv_fields); // Pass pointer to the (now updated) struct
     if (sdu_area_len < 0) {
         LOG_ERR("FT SM: Failed to build beacon SDU area content: %d", sdu_area_len);
-        k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_MSEC(ctx->config.ft_cluster_beacon_period_ms), K_NO_WAIT);
+        // Timer will fire again as it's periodic.
         return;
     }
 
     dect_mac_header_type_octet_t hdr_type_octet;
-    hdr_type_octet.version = 0;
-    hdr_type_octet.mac_security = MAC_SECURITY_NONE;
+    hdr_type_octet.version = 0; // ETSI TS 103 636-4 Release 2
+    hdr_type_octet.mac_security = MAC_SECURITY_NONE; // Beacons often unsecure for initial discovery
+                                                    // TODO: Add logic for secured beacons if needed
     hdr_type_octet.mac_header_type = MAC_COMMON_HEADER_TYPE_BEACON;
 
     dect_mac_beacon_header_t common_beacon_hdr;
+    // Network ID: MS24 bits from context, LSB part is in PHY Control Channel (PCC)
     common_beacon_hdr.network_id_ms24[0] = (uint8_t)((ctx->network_id_32bit >> 24) & 0xFF);
     common_beacon_hdr.network_id_ms24[1] = (uint8_t)((ctx->network_id_32bit >> 16) & 0xFF);
     common_beacon_hdr.network_id_ms24[2] = (uint8_t)((ctx->network_id_32bit >> 8) & 0xFF);
     common_beacon_hdr.transmitter_long_rd_id_be = sys_cpu_to_be32(ctx->own_long_rd_id);
 
     uint8_t *full_mac_pdu_for_phy_slab = NULL;
-    int ret = k_mem_slab_alloc(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab, K_NO_WAIT);
+    int ret = k_mem_slab_alloc(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab, K_MSEC(10)); // Timeout for buffer
     if(ret != 0 || full_mac_pdu_for_phy_slab == NULL) {
-        LOG_ERR("FT SM: Failed to alloc PDU buf for beacon TX: %d", ret);
-        k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_MSEC(ctx->config.ft_cluster_beacon_period_ms), K_NO_WAIT);
-        return;
+        LOG_ERR("FT SM: Failed to alloc PDU buf for beacon TX: %d. Skipping this beacon.", ret);
+        return; // Timer will fire again
     }
     uint8_t * const full_mac_pdu_for_phy = full_mac_pdu_for_phy_slab;
 
@@ -383,26 +459,37 @@ static void ft_send_beacon_action(void) {
     if (ret != 0) {
         LOG_ERR("FT SM: Failed to assemble final beacon PDU: %d", ret);
         k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab);
-        k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_MSEC(ctx->config.ft_cluster_beacon_period_ms), K_NO_WAIT);
-        return;
+        return; // Timer will fire again
     }
 
     uint32_t phy_op_handle = sys_rand32_get();
     ctx->role_ctx.ft.sfn_for_last_beacon_tx = ctx->role_ctx.ft.sfn;
 
-    uint64_t beacon_target_start_time = calculate_target_modem_time(ctx, ctx->ft_sfn_zero_modem_time_anchor,
-                                                                  0, /* Assume anchor is for SFN 0 */
-                                                                  ctx->role_ctx.ft.sfn, 0 /* Beacon at subslot 0 */);
-    if (beacon_target_start_time < ctx->last_known_modem_time + modem_us_to_ticks(ctx->phy_latency.idle_to_active_tx_us, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ)) {
-        LOG_WRN("FT_BEACON: Target start %llu for SFN %u too soon. Sending immediate.", beacon_target_start_time, ctx->role_ctx.ft.sfn);
-        beacon_target_start_time = 0;
+    // Calculate target start time for this beacon based on SFN
+    uint64_t beacon_target_start_time = calculate_target_modem_time(ctx,
+                                                                  ctx->ft_sfn_zero_modem_time_anchor,
+                                                                  ctx->current_sfn_at_anchor_update, // SFN when anchor was set/updated
+                                                                  ctx->role_ctx.ft.sfn, // Target SFN for this beacon
+                                                                  0); // Beacons are at subslot 0 of the frame
+    
+    uint32_t min_prep_time_ticks = modem_us_to_ticks(ctx->phy_latency.idle_to_active_tx_us +
+                                                     ctx->phy_latency.scheduled_operation_startup_us,
+                                                     NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+    if (ctx->last_known_modem_time > 0 && beacon_target_start_time < (ctx->last_known_modem_time + min_prep_time_ticks)) {
+        LOG_WRN("FT_BEACON_ACT: Target start %llu for SFN %u too soon (current %llu, prep %u). Sending immediate-ish.",
+                beacon_target_start_time, ctx->role_ctx.ft.sfn, ctx->last_known_modem_time, min_prep_time_ticks);
+        beacon_target_start_time = 0; // Request PHY to send as soon as possible
     }
+
 
     ret = dect_mac_phy_ctrl_start_tx_assembled(
         ctx->role_ctx.ft.operating_carrier,
         full_mac_pdu_for_phy, cleartext_pdu_len,
-        0xFFFF, true, phy_op_handle, PENDING_OP_FT_BEACON,
-        false, beacon_target_start_time);
+        0xFFFF, /* target_receiver_short_id for beacon is broadcast */
+        true,   /* is_beacon = true */
+        phy_op_handle, PENDING_OP_FT_BEACON,
+        false,  /* use_lbt = false for beacons (typically on dedicated resources or FT manages CCA) */
+        beacon_target_start_time);
 
     k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab);
 
@@ -412,9 +499,14 @@ static void ft_send_beacon_action(void) {
         LOG_INF("FT SM: Beacon SFN %u TX scheduled on C%u (Hdl %u), TargetStart %llu",
                 ctx->role_ctx.ft.sfn, ctx->role_ctx.ft.operating_carrier, phy_op_handle, beacon_target_start_time);
     }
+    // Increment SFN for the next beacon period.
     ctx->role_ctx.ft.sfn = (ctx->role_ctx.ft.sfn + 1) & 0xFF;
-    // Periodic timer will re-trigger ft_beacon_timer_expired_action.
+    // The periodic timer will re-trigger ft_beacon_timer_expired_action for the next beacon.
 }
+
+
+
+
 
 static void ft_schedule_rach_listen_action(void) {
     dect_mac_context_t* ctx = get_mac_context();
