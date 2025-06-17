@@ -1083,6 +1083,8 @@ static void ft_handle_phy_pcc_ft(const struct nrf_modem_dect_phy_pcc_event *pcc_
     } else { LOG_WRN("FT_SM_PCC: Invalid PCC status %d. TID:%u.", pcc_event->header_status, pcc_event->transaction_id); }
 }
 
+
+
 static void ft_handle_phy_pdc_ft(const struct nrf_modem_dect_phy_pdc_event *pdc_event) {
     dect_mac_context_t* ctx = get_mac_context();
     uint8_t mac_pdc_payload_copy[CONFIG_DECT_MAC_PDU_MAX_SIZE];
@@ -1153,138 +1155,135 @@ static void ft_handle_phy_pdc_ft(const struct nrf_modem_dect_phy_pdc_event *pdc_
     sdu_area_after_common_hdr = common_hdr_start_in_payload + common_hdr_actual_len;
     sdu_area_plus_mic_actual_len = pdu_content_len - common_hdr_actual_len;
 
+    // These pointers will be adjusted after security processing
+    uint8_t *sdu_area_for_data_path = sdu_area_after_common_hdr;
+    size_t sdu_area_len_for_data_path = sdu_area_plus_mic_len_in_payload;
+
     if (security_applied_by_sender) {
-        if (!link_is_expected_to_be_secure) {
-            LOG_WRN("FT_SM_PDC_SEC: Secured PDU from PT 0x%04X (slot %d), but link not marked secure. Discarding.",
-                    pt_sender_short_id_from_pcc, peer_slot_idx);
-            return;
+        if (!link_is_expected_to_be_secure || !pt_peer_ctx) { // pt_peer_ctx should be valid if link_is_expected_to_be_secure
+            LOG_WRN("FT_SM_PDC_SEC: Secured PDU from PT 0x%04X, but no valid secure context/peer_ctx. Discarding.",
+                    pt_sender_short_id_from_pcc);
+            return; // Cannot process security without keys/context
         }
-        if (sdu_area_plus_mic_actual_len < 5 /*MIC_LEN*/) {
-             LOG_ERR("FT_SM_PDC_SEC: Secured PDU from PT 0x%04X too short for MIC. SDUArea+MIC len %zu. Discarding.",
-                    pt_sender_short_id_from_pcc, sdu_area_plus_mic_actual_len);
+        if (sdu_area_plus_mic_len_in_payload < 5 /*MIC_LEN*/) {
+             LOG_ERR("FT_SM_PDC_SEC: Secured PDU from PT 0x%04X too short for MIC (SDUArea+MIC len %zu). Discarding.",
+                    pt_sender_short_id_from_pcc, sdu_area_plus_mic_len_in_payload);
              return;
         }
 
         const dect_mac_unicast_header_t *uch_ptr = (const dect_mac_unicast_header_t *)common_hdr_start_in_payload;
         uint16_t received_psn = ((uch_ptr->sequence_num_high_reset_rsv >> 4) & 0x0F) << 8 | uch_ptr->sequence_num_low;
-        uint32_t pt_tx_long_id = sys_be32_to_cpu(uch_ptr->transmitter_long_rd_id_be);
+        uint32_t pt_tx_long_id_from_hdr = sys_be32_to_cpu(uch_ptr->transmitter_long_rd_id_be);
 
-        if (pt_tx_long_id != pt_peer_ctx->long_rd_id) {
+        if (pt_tx_long_id_from_hdr != pt_peer_ctx->long_rd_id) {
             LOG_WRN("FT_SM_PDC_SEC: Secured PDU LongID 0x%08X mismatch for PT 0x%04X (expected 0x%08X). Discarding.",
-                    pt_tx_long_id, pt_sender_short_id_from_pcc, pt_peer_ctx->long_rd_id);
+                    pt_tx_long_id_from_hdr, pt_sender_short_id_from_pcc, pt_peer_ctx->long_rd_id);
             return;
         }
 
-        uint8_t iv[16];
-        security_build_iv(iv, pt_tx_long_id, ctx->own_long_rd_id,
-                          pt_peer_ctx->hpc, // Use FT's tracked HPC for this PT
-                          received_psn);
-
-        uint8_t *part_to_decrypt_start;
-        size_t part_to_decrypt_len;
-        size_t muxed_sec_ie_total_len_parsed = 0;
-
-        uint8_t *decryption_input_buffer_start; // Renamed for clarity
-        size_t decryption_input_len;         // Renamed for clarity
-        // size_t muxed_sec_ie_total_len_parsed = 0; // Already declared earlier
+        uint8_t *payload_to_decrypt_start = NULL;
+        size_t payload_to_decrypt_len = 0;
+        size_t cleartext_sec_ie_mux_len = 0; // Length of the MUXed MAC Sec Info IE (if present and cleartext)
 
         if (mac_hdr_type_octet.mac_security == MAC_SECURITY_USED_WITH_IE) {
-            // Common Header and MUXed MAC Sec Info IE are cleartext.
-            // First, parse the cleartext MAC Sec Info IE from the start of the SDU Area.
-            uint8_t ie_type; uint16_t ie_len; const uint8_t *ie_payload;
-            int mux_hdr_len = parse_mac_mux_header(sdu_area_after_common_hdr, sdu_area_plus_mic_actual_len,
-                                                   &ie_type, &ie_len, &ie_payload);
+            // Parse the MUXed MAC Security Info IE first (it's cleartext)
+            uint8_t ie_type_sec; uint16_t ie_len_sec; const uint8_t *ie_payload_sec;
+            int mux_hdr_len_sec = parse_mac_mux_header(sdu_area_after_common_hdr, sdu_area_plus_mic_len_in_payload,
+                                                       &ie_type_sec, &ie_len_sec, &ie_payload_sec);
 
-            if (mux_hdr_len > 0 && ie_type == IE_TYPE_MAC_SECURITY_INFO) {
-                if (sdu_area_plus_mic_actual_len < (size_t)mux_hdr_len + ie_len + 5 /*min rest of SDU area + MIC*/) {
+            if (mux_hdr_len_sec > 0 && ie_type_sec == IE_TYPE_MAC_SECURITY_INFO) {
+                if (sdu_area_plus_mic_len_in_payload < (size_t)mux_hdr_len_sec + ie_len_sec + 5 /*MIC*/) {
                     LOG_ERR("FT_SM_PDC_SEC: PDU too short for parsed SecIE + rest + MIC. Discarding.");
                     pdc_process_ok_for_feedback = false; goto process_feedback_ft_pdc_secure_rx_path;
                 }
-                muxed_sec_ie_total_len_parsed = mux_hdr_len + ie_len; // Store total length of MUXed SecIE
+                cleartext_sec_ie_mux_len = mux_hdr_len_sec + ie_len_sec;
                 uint8_t ver, kidx, secivtype_from_ie; uint32_t hpc_from_ie;
-                if (parse_mac_security_info_ie_payload(ie_payload, ie_len, &ver, &kidx, &secivtype_from_ie, &hpc_from_ie) == 0) {
-                    // ... (Full HPC windowing and resync request handling logic from previous step for SEC_IV_TYPE_MODE1_PROVIDED and SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE) ...
-                    // This block updates pt_peer_ctx->hpc and pt_peer_ctx->highest_rx_peer_hpc
-                    // and may set pt_peer_ctx->peer_requested_hpc_resync or pdc_process_ok_for_feedback = false
+                if (parse_mac_security_info_ie_payload(ie_payload_sec, ie_len_sec, &ver, &kidx, &secivtype_from_ie, &hpc_from_ie) == 0) {
                     LOG_INF("FT_SM_PDC_SEC (WITH_IE): MAC Sec Info IE from PT 0x%04X: PeerHPC_IE=%u, TrackedHPC=%u, SecIVType=%u",
                             pt_sender_short_id_from_pcc, hpc_from_ie, pt_peer_ctx->hpc, secivtype_from_ie);
-                    // (Simplified: just showing the log, full window/resync logic goes here)
+                    // TODO: Implement full HPC windowing and resync request logic here.
+                    // This involves updating pt_peer_ctx->hpc, pt_peer_ctx->highest_rx_peer_hpc,
+                    // and potentially setting pt_peer_ctx->peer_requested_hpc_resync or pdc_process_ok_for_feedback = false.
+                    // For now, simplified:
                     if (secivtype_from_ie == SEC_IV_TYPE_MODE1_HPC_PROVIDED) {
-                        if (pt_peer_ctx->highest_rx_peer_hpc == 0 && hpc_from_ie > 0) {pt_peer_ctx->highest_rx_peer_hpc = hpc_from_ie; pt_peer_ctx->hpc = hpc_from_ie;}
-                        else { /* ... window logic ... */ if (hpc_from_ie > pt_peer_ctx->highest_rx_peer_hpc /* simplified */) pt_peer_ctx->hpc = hpc_from_ie; }
-                    } else if (secivtype_from_ie == SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE) {
-                        if (pt_peer_ctx->highest_rx_peer_hpc == 0 && hpc_from_ie > 0) {pt_peer_ctx->highest_rx_peer_hpc = hpc_from_ie; pt_peer_ctx->hpc = hpc_from_ie;}
-                        else { /* ... window logic ... */ if (hpc_from_ie > pt_peer_ctx->highest_rx_peer_hpc /* simplified */) pt_peer_ctx->hpc = hpc_from_ie; }
-                        pt_peer_ctx->peer_requested_hpc_resync = true;
+                        if (pt_peer_ctx->highest_rx_peer_hpc == 0 || hpc_from_ie > pt_peer_ctx->highest_rx_peer_hpc) { // Simplified window
+                            pt_peer_ctx->hpc = hpc_from_ie; pt_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
+                        } else if (hpc_from_ie < pt_peer_ctx->hpc && (pt_peer_ctx->hpc - hpc_from_ie) < HPC_RX_WINDOW_SIZE) {
+                             pt_peer_ctx->hpc = hpc_from_ie; // Accept if within window
+                        } else { /* Out of window - potentially an error */ pdc_process_ok_for_feedback = false; }
+                    } else if (secivtype_from_ie == SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE) { // PT requests FT's HPC
+                        pt_peer_ctx->peer_requested_hpc_resync = true; // FT should send its HPC back
+                        // Still update tracked HPC from this IE if it's valid for this PDU's IV
+                        if (pt_peer_ctx->highest_rx_peer_hpc == 0 || hpc_from_ie > pt_peer_ctx->highest_rx_peer_hpc) {
+                            pt_peer_ctx->hpc = hpc_from_ie; pt_peer_ctx->highest_rx_peer_hpc = hpc_from_ie;
+                        } // else: if hpc_from_ie is old, but RESYNC_INITIATE, still honor request.
                     }
+                } else { LOG_ERR("FT_SM_PDC_SEC: Failed to parse MAC Sec Info IE from PT 0x%04X.", pt_sender_short_id_from_pcc); pdc_process_ok_for_feedback = false; }
 
-                } else { LOG_ERR("FT_SM_PDC_SEC: Failed to parse MAC Sec Info IE from PT 0x%04X.", pt_sender_short_id_from_pcc); }
-                
-                decryption_input_buffer_start = sdu_area_after_common_hdr + muxed_sec_ie_total_len_parsed; // Decrypt part *after* SecIE
-                decryption_input_len = sdu_area_plus_mic_actual_len - muxed_sec_ie_total_len_parsed;     // This is (Rest of SDU Area + MIC)
+                payload_to_decrypt_start = sdu_area_after_common_hdr + cleartext_sec_ie_mux_len;
+                payload_to_decrypt_len = sdu_area_plus_mic_len_in_payload - cleartext_sec_ie_mux_len;
             } else {
                 LOG_ERR("FT_SM_PDC_SEC: MAC_SECURITY_USED_WITH_IE indicated but MAC Sec Info IE not found/parsed first. Discarding.");
-                pdc_process_ok_for_feedback = false; goto process_feedback_ft_pdc_secure_rx_path;
+                pdc_process_ok_for_feedback = false;
             }
         } else { // MAC_SECURITY_USED_NO_IE
-            // Common Header is cleartext. Decrypt (SDU Area + MIC).
-            decryption_input_buffer_start = sdu_area_after_common_hdr;      // Decryption starts *after* Common Header
-            decryption_input_len = sdu_area_plus_mic_actual_len;         // Length of (SDU Area + MIC)
-            muxed_sec_ie_total_len_parsed = 0; // No SecIE in this mode
+            cleartext_sec_ie_mux_len = 0;
+            payload_to_decrypt_start = sdu_area_after_common_hdr;
+            payload_to_decrypt_len = sdu_area_plus_mic_len_in_payload;
         }
 
+        if (!pdc_process_ok_for_feedback) goto process_feedback_ft_pdc_secure_rx_path; // Abort if HPC from IE was invalid
 
-        if (!pdc_process_ok_for_feedback) goto process_feedback_ft_pdc_secure_rx_path;
+        if (payload_to_decrypt_len < 5) { LOG_ERR("FT_SM_PDC_SEC: Encrypted part too short for MIC. Discarding."); pdc_process_ok_for_feedback = false; goto process_feedback_ft_pdc_secure_rx_path; }
 
-        if (part_to_decrypt_len < 5) { LOG_ERR("FT_SM_PDC_SEC: Encrypted part too short for MIC. Discarding."); pdc_process_ok_for_feedback = false; goto process_feedback_ft_pdc_secure_rx_path; }
-        if (security_crypt_payload(part_to_decrypt_start, part_to_decrypt_len,
-                                   ctx->role_ctx.ft.peer_cipher_keys[peer_slot_idx], iv, false) != 0) {
+        uint8_t iv[16];
+        security_build_iv(iv, pt_tx_long_id_from_hdr, ctx->own_long_rd_id,
+                          pt_peer_ctx->hpc, // Use FT's tracked HPC for this PT (which might have just been updated from SecIE)
+                          received_psn);
+
+        // Decrypt (in-place on mac_pdc_payload_copy)
+        if (security_crypt_payload(payload_to_decrypt_start, payload_to_decrypt_len,
+                                   ctx->role_ctx.ft.peer_cipher_keys[peer_slot_idx], iv, false /*decrypt*/) != 0) {
             LOG_ERR("FT_SM_PDC_SEC: Decryption failed for PDU from PT 0x%04X. Discarding.", pt_sender_short_id_from_pcc);
             pdc_process_ok_for_feedback = false; goto process_feedback_ft_pdc_secure_rx_path;
         }
 
-        uint8_t received_mic[5];
-        memcpy(received_mic, part_to_decrypt_start + part_to_decrypt_len - 5, 5);
+        // MIC Verification (MIC is now cleartext at the end of payload_to_decrypt_start)
+        uint8_t *cleartext_mic_ptr = payload_to_decrypt_start + payload_to_decrypt_len - 5;
         uint8_t calculated_mic[5];
-        if (security_calculate_mic(common_hdr_start_in_payload, pdu_content_len - 5,
+        // MIC is calculated over: Common Header + MUXed SecIE (if present, cleartext) + (Rest of SDU Area, now cleartext)
+        size_t data_for_mic_len = common_hdr_actual_len + (payload_to_decrypt_len - 5) + cleartext_sec_ie_mux_len;
+
+        if (security_calculate_mic(common_hdr_start_in_payload, data_for_mic_len, /* common_hdr_start_in_payload is start of CommonHdr */
                                    ctx->role_ctx.ft.peer_integrity_keys[peer_slot_idx], calculated_mic) != 0) {
             LOG_ERR("FT_SM_PDC_SEC: MIC re-calc failed. Discarding PDU from PT 0x%04X.", pt_sender_short_id_from_pcc);
             pdc_process_ok_for_feedback = false; goto process_feedback_ft_pdc_secure_rx_path;
         }
-        if (memcmp(received_mic, calculated_mic, 5) != 0) {
+
+        if (memcmp(cleartext_mic_ptr, calculated_mic, 5) != 0) {
             LOG_ERR("FT_SM_PDC_SEC: MIC FAIL from PT 0x%04X (PSN %u, PeerHPC %u). Discarding.",
                     pt_sender_short_id_from_pcc, received_psn, pt_peer_ctx->hpc);
-            if (pt_peer_ctx) { // pt_peer_ctx should be valid if link_is_expected_to_be_secure was true
-                pt_peer_ctx->consecutive_mic_failures++;
-                if (pt_peer_ctx->consecutive_mic_failures >= MAX_MIC_FAILURES_BEFORE_HPC_RESYNC) {
-                    LOG_WRN("FT_SM_PDC_SEC: Max MIC failures (%u) for PT 0x%04X. Will request HPC resync from PT.",
-                            pt_peer_ctx->consecutive_mic_failures, pt_sender_short_id_from_pcc);
-                    pt_peer_ctx->self_needs_to_request_hpc_from_peer = true; // FT will send RESYNC_INITIATE to this PT
-                    pt_peer_ctx->consecutive_mic_failures = 0; // Reset counter after deciding to resync
-                }
+            pt_peer_ctx->consecutive_mic_failures++;
+            if (pt_peer_ctx->consecutive_mic_failures >= MAX_MIC_FAILURES_BEFORE_HPC_RESYNC) {
+                LOG_WRN("FT_SM_PDC_SEC: Max MIC failures (%u) for PT 0x%04X. Will request HPC resync from PT.",
+                        pt_peer_ctx->consecutive_mic_failures, pt_sender_short_id_from_pcc);
+                pt_peer_ctx->self_needs_to_request_hpc_from_peer = true;
+                pt_peer_ctx->consecutive_mic_failures = 0;
             }
-            pdc_process_ok_for_feedback = false; // Signal to store NACK
-            goto process_feedback_ft_pdc_secure_rx_path; // Go to store feedback, then return
+            pdc_process_ok_for_feedback = false;
         } else { // MIC OK
             LOG_DBG("FT_SM_PDC_SEC: MIC OK from PT 0x%04X (PSN %u, PeerHPC %u).",
                     pt_sender_short_id_from_pcc, received_psn, pt_peer_ctx->hpc);
-            if(pt_peer_ctx) pt_peer_ctx->consecutive_mic_failures = 0; // Reset on successful MIC
-        }
-
-        // Adjust pointers to the SDU area content (after Common Hdr and potential SecIE, before MIC)
-        if (mac_hdr_type_octet.mac_security == MAC_SECURITY_USED_WITH_IE) {
-            sdu_area_after_common_hdr = common_hdr_start_in_payload + common_hdr_actual_len + muxed_sec_ie_total_len_parsed;
-            sdu_area_plus_mic_actual_len = pdu_content_len - common_hdr_actual_len - muxed_sec_ie_total_len_parsed - 5;
-        } else { // MAC_SECURITY_USED_NO_IE
-            sdu_area_after_common_hdr = common_hdr_start_in_payload + common_hdr_actual_len;
-            sdu_area_plus_mic_actual_len = pdu_content_len - common_hdr_actual_len - 5;
+            pt_peer_ctx->consecutive_mic_failures = 0;
+            // Adjust pointers for data path: SDU area is after CommonHdr and after cleartext SecIE (if present), and excludes MIC.
+            sdu_area_for_data_path = sdu_area_after_common_hdr + cleartext_sec_ie_mux_len;
+            sdu_area_len_for_data_path = payload_to_decrypt_len - 5; // Length of (Rest of SDU Area, now cleartext)
         }
     } else { // Not secured
         LOG_DBG("FT_SM_PDC: Unsecure PDU from PT 0x%04X.", pt_sender_short_id_from_pcc);
-        sdu_area_after_common_hdr = common_hdr_start_in_payload + common_hdr_actual_len;
-        sdu_area_plus_mic_actual_len = pdu_content_len - common_hdr_actual_len;
+        // sdu_area_for_data_path and sdu_area_len_for_data_path are already set correctly for non-secure case
     }
-
+    
 process_feedback_ft_pdc_secure_rx_path:
     if (pt_peer_ctx && pt_peer_ctx->is_valid && current_pcc_data.phy_type == 1 &&
         (link_is_expected_to_be_secure || security_applied_by_sender) ) {
