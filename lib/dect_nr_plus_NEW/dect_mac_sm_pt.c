@@ -828,28 +828,107 @@ process_feedback_pt_rx_sec_path:
             
             dect_mac_cluster_beacon_ie_fields_t cb_fields_parsed;
             dect_mac_rach_info_ie_fields_t rach_fields_parsed;
-            bool cb_found = false; bool rach_found = false;
-            const uint8_t *current_mux_ptr = sdu_area_final_ptr;
-            size_t remaining_mux_len = sdu_area_final_len;
 
-            while(remaining_mux_len > 0 && (!cb_found || !rach_found)) { // Stop once both found
-                uint8_t ie_type; uint16_t ie_len; const uint8_t *ie_payload_data;
-                int mux_hdr_len = parse_mac_mux_header(current_mux_ptr, remaining_mux_len, &ie_type, &ie_len, &ie_payload_data);
-                if (mux_hdr_len < 0) { LOG_ERR("PT_PDC_BCN: MUX parse error %d", mux_hdr_len); break; }
-                if (ie_len == 0 && ((current_mux_ptr[0] >> 6) & 0x03) == 0b00) {
-                     if (remaining_mux_len < (size_t)mux_hdr_len) break;
-                     ie_len = remaining_mux_len - mux_hdr_len;
-                }
-                if (remaining_mux_len < (size_t)mux_hdr_len + ie_len) { LOG_ERR("PT_PDC_BCN: MUX IE too long"); break; }
 
-                if (ie_type == IE_TYPE_CLUSTER_BEACON) {
-                    if(parse_cluster_beacon_ie_payload(ie_payload_data, ie_len, &cb_fields_parsed)==0) cb_found = true;
-                } else if (ie_type == IE_TYPE_RACH_INFO) {
-                    if(parse_rach_info_ie_payload(ie_payload_data, ie_len, &rach_fields_parsed)==0) rach_found = true;
+            dect_mac_rd_capability_ie_t ft_caps_parsed; // To store parsed FT capabilities
+
+            bool cb_found = false;
+            bool rach_found = false;
+            bool ft_caps_parsed_successfully = false; // Changed flag name for clarity
+            uint8_t mu_from_ft_caps = 1; // Default to mu=1 (8-bit start_subslot)
+
+            const uint8_t *sdu_area_iter_ptr = sdu_area_final_ptr;
+            size_t sdu_area_iter_rem_len = sdu_area_final_len;
+
+            LOG_DBG("PT_PDC_BCN: Parsing beacon SDU area (len %zu) from FT L:0x%08X S:0x%04X",
+                    sdu_area_final_len, ft_long_id, ft_sender_short_id_from_pcc);
+
+            // First pass: Iterate through all IEs to find RD Capability and extract mu.
+            // Also parse Cluster Beacon and RACH Info if encountered, but RACH will use default mu first.
+            // We will re-parse RACH Info if a non-default mu is found in RD Capability later in this same SDU Area.
+            // A more robust method would be to store pointers/lengths of all IEs first, then process.
+
+            // Initialize structures to be parsed
+            memset(&cb_fields_parsed, 0, sizeof(cb_fields_parsed));
+            memset(&rach_fields_parsed, 0, sizeof(rach_fields_parsed));
+            memset(&ft_caps_parsed, 0, sizeof(ft_caps_parsed));
+
+
+            const uint8_t *ptr_for_rd_cap_scan = sdu_area_final_ptr;
+            size_t len_for_rd_cap_scan = sdu_area_final_len;
+            while (len_for_rd_cap_scan > 0 && !ft_caps_parsed_successfully) { // Stop if RD Cap found
+                uint8_t ie_type_scan; uint16_t ie_len_scan; const uint8_t *ie_payload_scan;
+                int mux_hdr_len_scan = parse_mac_mux_header(ptr_for_rd_cap_scan, len_for_rd_cap_scan,
+                                                            &ie_type_scan, &ie_len_scan, &ie_payload_scan);
+                if (mux_hdr_len_scan <= 0) { LOG_ERR("PT_PDC_BCN: MUX pre-scan error %d.", mux_hdr_len_scan); break; }
+                if (ie_len_scan == 0 && ((ptr_for_rd_cap_scan[0] >> 6) & 0x03) == 0b00) {
+                    if (len_for_rd_cap_scan < (size_t)mux_hdr_len_scan) break;
+                    ie_len_scan = len_for_rd_cap_scan - mux_hdr_len_scan;
                 }
-                current_mux_ptr += mux_hdr_len + ie_len;
-                if (remaining_mux_len >= (size_t)mux_hdr_len + ie_len) remaining_mux_len -= (mux_hdr_len + ie_len); else remaining_mux_len = 0;
+                if (len_for_rd_cap_scan < (size_t)mux_hdr_len_scan + ie_len_scan) { LOG_ERR("PT_PDC_BCN: MUX IE pre-scan len error."); break; }
+
+                if (ie_type_scan == IE_TYPE_RD_CAPABILITY) {
+                    if (parse_rd_capability_ie_payload(ie_payload_scan, ie_len_scan, &ft_caps_parsed) == 0) {
+                        ft_caps_parsed_successfully = true;
+                        // EXTRACT MU: This depends on how ft_caps_parsed stores mu.
+                        // Assuming dect_mac_rd_capability_ie_t has phy_variants[0].mu after parsing
+                        // (Task 1.B.5 needs to ensure this).
+                        if (ft_caps_parsed.num_phy_capabilities >= 0 && /* ensure at least base set exists */
+                            ft_caps_parsed.phy_variants[0].mu_value > 0 && /* phy_variants[0].mu_value would be new field */
+                            ft_caps_parsed.phy_variants[0].mu_value <= 8) {
+                            mu_from_ft_caps = ft_caps_parsed.phy_variants[0].mu_value;
+                            LOG_INF("PT_PDC_BCN: Extracted mu=%u from FT RD Capability IE.", mu_from_ft_caps);
+                        } else {
+                            LOG_WRN("PT_PDC_BCN: RD Cap IE parsed, but mu not found or invalid. Using default mu=%u.", mu_from_ft_caps);
+                        }
+                    } else { LOG_WRN("PT_PDC_BCN: Failed to parse RD_CAP IE payload during pre-scan.");}
+                }
+                ptr_for_rd_cap_scan += mux_hdr_len_scan + ie_len_scan;
+                if (len_for_rd_cap_scan >= (size_t)mux_hdr_len_scan + ie_len_scan) len_for_rd_cap_scan -= (mux_hdr_len_scan + ie_len_scan); else len_for_rd_cap_scan = 0;
             }
+
+            // Second pass: Parse all IEs, using the determined mu_from_ft_caps for RACH Info IE.
+            while(sdu_area_remaining_len > 0) {
+                uint8_t ie_type; uint16_t ie_len; const uint8_t *ie_payload_data;
+                int mux_hdr_len = parse_mac_mux_header(sdu_area_iter_ptr, sdu_area_iter_rem_len,
+                                                       &ie_type, &ie_len, &ie_payload_data);
+                if (mux_hdr_len <= 0) { LOG_ERR("PT_PDC_BCN: MUX parse error %d in main pass.", mux_hdr_len); break; }
+                if (ie_len == 0 && ((sdu_area_iter_ptr[0] >> 6) & 0x03) == 0b00) {
+                     if (sdu_area_iter_rem_len < (size_t)mux_hdr_len) break;
+                     ie_len = sdu_area_iter_rem_len - mux_hdr_len;
+                }
+                if (sdu_area_iter_rem_len < (size_t)mux_hdr_len + ie_len) { LOG_ERR("PT_PDC_BCN: MUX IE len error in main pass."); break; }
+
+                if (ie_type == IE_TYPE_CLUSTER_BEACON && !cb_found) {
+                    if(parse_cluster_beacon_ie_payload(ie_payload_data, ie_len, &cb_fields_parsed)==0) {
+                        cb_found = true;
+                        LOG_DBG("PT_PDC_BCN: Parsed Cluster Beacon IE.");
+                    } else { LOG_WRN("PT_PDC_BCN: Failed to parse Cluster Beacon IE payload."); }
+                } else if (ie_type == IE_TYPE_RACH_INFO && !rach_found) {
+                    if(parse_rach_info_ie_payload(ie_payload_data, ie_len, mu_from_ft_caps, &rach_fields_parsed)==0) {
+                        rach_found = true;
+                        rach_fields_parsed.mu_value_for_ft_beacon = mu_from_ft_caps; // Store mu used for this parse
+                        LOG_DBG("PT_PDC_BCN: Parsed RACH Info IE using mu=%u.", mu_from_ft_caps);
+                    } else { LOG_WRN("PT_PDC_BCN: Failed to parse RACH Info IE payload (using mu=%u).", mu_from_ft_caps); }
+                } else if (ie_type == IE_TYPE_RD_CAPABILITY && !ft_caps_parsed_successfully) {
+                    // If RD Cap wasn't found in pre-scan (e.g., it appeared after RACH_INFO),
+                    // this parse is mainly for storing its content. RACH_INFO would have used default mu.
+                    if (parse_rd_capability_ie_payload(ie_payload_data, ie_len, &ft_caps_parsed) == 0) {
+                        ft_caps_parsed_successfully = true; // Mark as parsed, even if late for mu decision for RACH
+                        LOG_DBG("PT_PDC_BCN: Parsed RD_CAP IE (main loop, mu for RACH might have been default).");
+                    }
+                } else {
+                    LOG_DBG("PT_PDC_BCN: Skipping MUX IE type 0x%X during main pass.", ie_type);
+                }
+
+                sdu_area_iter_ptr += mux_hdr_len + ie_len;
+                if (sdu_area_iter_rem_len >= (size_t)mux_hdr_len + ie_len) {
+                     sdu_area_iter_rem_len -= (mux_hdr_len + ie_len);
+                } else {
+                    sdu_area_iter_rem_len = 0;
+                }
+            }
+
 
             if (cb_found && rach_found) {
                 pt_process_identified_beacon_and_attempt_assoc(ctx, &cb_fields_parsed, &rach_fields_parsed,

@@ -1,0 +1,386 @@
+# Kconfig for DECT NR+ MAC Layer
+
+# Main menu for DECT MAC Layer configuration
+menuconfig DECT_MAC_LAYER
+	bool "DECT NR+ MAC Layer Support"
+	default n
+	help
+	  Enable the DECT NR+ Medium Access Control (MAC) layer.
+	  This layer is responsible for managing radio resources, device association,
+	  data transmission scheduling, and basic link security as per ETSI TS 103 636-4.
+	  It interacts with the nRF Modem DECT PHY library.
+
+if DECT_MAC_LAYER
+
+# General MAC Configuration
+config DECT_MAC_ROLE_PT
+	bool "MAC Role: Portable Termination (PT)"
+	help
+	  Configure this device to operate as a DECT NR+ Portable Termination.
+	  A PT associates with a Fixed Termination (FT) to join a network.
+
+config DECT_MAC_ROLE_FT
+	bool "MAC Role: Fixed Termination (FT)"
+	help
+	  Configure this device to operate as a DECT NR+ Fixed Termination.
+	  An FT forms a network and allows PTs to associate.
+
+choice DECT_MAC_OPERATIONAL_ROLE
+	prompt "DECT MAC Operational Role"
+	default DECT_MAC_ROLE_NONE_SELECTED if !DECT_MAC_ROLE_PT && !DECT_MAC_ROLE_FT
+	help
+	  Select the primary operational role for this MAC instance.
+	  Only one role can be primary at a time for a single MAC instance.
+	  Ensure either PT or FT is selected if DECT_MAC_LAYER is enabled.
+
+	config DECT_MAC_ROLE_IS_PT
+		bool "Portable Termination (PT)"
+		select DECT_MAC_ROLE_PT if !DECT_MAC_ROLE_FT
+
+	config DECT_MAC_ROLE_IS_FT
+		bool "Fixed Termination (FT)"
+		select DECT_MAC_ROLE_FT if !DECT_MAC_ROLE_PT
+
+	config DECT_MAC_ROLE_NONE_SELECTED
+		bool "No DECT MAC Role Selected (Error)"
+		# This option should ideally not be selectable if DECT_MAC_LAYER is y.
+		# Add build error if DECT_MAC_LAYER is y and this is selected.
+endchoice
+
+config DECT_MAC_THREAD_STACK_SIZE
+	int "MAC main processing thread stack size"
+	default 4096 # Increased from previous example, assess actual needs
+	help
+	  Stack size for the main DECT MAC processing thread. This thread handles
+	  events from the PHY and timers, and executes state machine logic.
+
+config DECT_MAC_THREAD_PRIORITY
+	int "MAC main processing thread priority"
+	default 7 # Typical application thread priority
+	help
+	  Priority for the main DECT MAC processing thread.
+
+config DECT_MAC_THREAD_SERVICE_INTERVAL_MS
+	int "MAC thread periodic service interval (ms)"
+	default 100
+	help
+	  Timeout for k_msgq_get in the MAC thread. Allows periodic servicing
+	  of TX queues and scheduled operations even if no external events.
+	  Shorter interval is more responsive but uses more CPU when idle.
+
+config DECT_MAC_NETWORK_ID_MS24_PREFIX
+	hex "Network ID - Most Significant 24 bits Prefix"
+	default 0xDECC00
+	help
+	  The fixed 24-bit prefix for the DECT NR+ Network ID.
+	  The least significant 8 bits are derived locally (e.g., from Long RD ID).
+	  Ensure this prefix does not conflict with other networks.
+	  Value 0x000000 is invalid per ETSI.
+
+config DECT_MAC_PROVISIONED_LONG_RD_ID
+	hex "Provisioned Long RD ID (32-bit)"
+	default 0x0
+	help
+	  The pre-provisioned 32-bit Long Radio Device ID.
+	  If set to 0 or 0xFFFFFFFF, the MAC core will attempt to derive one
+	  from the hardware ID (e.g., using hw_id_get()).
+
+# MAC Security Configuration
+config DECT_MAC_SECURITY_ENABLE
+    bool "Enable MAC Layer Security (Mode 1)"
+    default y # Usually desired for DECT NR+
+    help
+      Enable MAC layer security features as per ETSI TS 103 636-4, Mode 1
+      (AES-128 CMAC for integrity, AES-128 CTR for ciphering).
+
+if DECT_MAC_SECURITY_ENABLE
+
+config DECT_MAC_MASTER_PSK_HEX
+    string "Master Pre-Shared Key (32 hex chars for 16 bytes)"
+    default "000102030405060708090A0B0C0D0E0F"
+    help
+      The 16-byte master Pre-Shared Key (PSK) as a 32-character hex string.
+      This key is used for the simplified PSK-based key derivation.
+      IMPORTANT: For production, this key must be securely provisioned.
+
+config DECT_MAC_HPC_RX_WINDOW_SIZE
+    int "HPC Receive Window Size"
+    default 64
+    help
+      Hyper Packet Counter (HPC) receive window size. Defines how many
+      HPC values "behind" the newest known peer HPC are considered valid.
+      Helps accommodate packet reordering or minor desynchronization.
+
+config DECT_MAC_HPC_RX_FORWARD_WINDOW_MAX_ADVANCE
+    int "HPC Receive Forward Window Maximum Advance"
+    default 1024
+    help
+      Maximum allowable jump "ahead" for a received HPC value compared to the
+      newest known peer HPC. Prevents accepting extremely large, potentially
+      malicious or erroneous, HPC jumps.
+
+config DECT_MAC_MAX_MIC_FAILURES_BEFORE_HPC_RESYNC
+    int "Max MIC Failures Before Requesting HPC Resynchronization"
+    default 3
+    help
+      Number of consecutive Message Integrity Code (MIC) failures from a peer
+      before this device requests an HPC resynchronization from that peer.
+
+endif # DECT_MAC_SECURITY_ENABLE
+
+# --- PT (Portable Termination) Specific Configuration ---
+if DECT_MAC_ROLE_IS_PT || DECT_MAC_ROLE_PT # If PT is selected or enabled
+
+config DECT_MAC_PT_KEEP_ALIVE_MS
+	int "PT Keep-Alive Interval (ms)"
+	default 20000 # 20 seconds
+	help
+	  Interval at which the PT sends a Keep-Alive message to the FT
+	  when associated and idle, to maintain the association.
+
+config DECT_MAC_PT_MOBILITY_ENABLE
+    bool "Enable PT Mobility Scanning"
+    default y
+    help
+      Enable the PT to periodically scan for alternative FTs for mobility purposes
+      while associated with its current FT.
+
+config DECT_MAC_PT_MOBILITY_SCAN_MS
+	int "PT Mobility Scan Interval (ms)"
+	default 60000 # 60 seconds
+    depends on DECT_MAC_PT_MOBILITY_ENABLE
+	help
+	  Interval at which an associated PT performs a background scan for
+	  other FTs for potential handover (mobility).
+
+config DECT_MAC_PT_PAGING_CYCLE_MS
+    int "PT Paging Cycle Listen Interval (ms)"
+    default 1280 # Example: 1.28 seconds (ETSI DRF=8)
+    help
+      The interval at which the PT, when in paging mode, wakes up to listen
+      for page messages from the FT. This value should ideally be
+      negotiated or configured in conjunction with the FT.
+
+endif # DECT_MAC_ROLE_IS_PT
+
+# --- FT (Fixed Termination) Specific Configuration ---
+if DECT_MAC_ROLE_IS_FT || DECT_MAC_ROLE_FT # If FT is selected or enabled
+
+config DECT_MAC_FT_CLUSTER_BEACON_MS
+	int "FT Cluster Beacon Interval (ms)"
+	default 100 # 100 ms is a common value
+	help
+	  Interval at which the FT transmits its Cluster Beacon.
+	  Must be one of the ETSI defined values (10, 50, 100, 500, 1000, 1500, 2000, 4000, 8000, 16000, 32000 ms).
+
+config DECT_MAC_FT_NETWORK_BEACON_MS
+	int "FT Network Beacon Interval (ms)"
+	default 1000 # Example: 1 second
+	help
+	  Interval at which the FT transmits its Network Beacon (if distinct from Cluster Beacon).
+	  Must be one of the ETSI defined values (50, 100, 500, 1000, 1500, 2000, 4000 ms).
+      Currently, this driver sends a combined Cluster/Network Beacon. This interval is for the
+      network beacon information part that points to the cluster beacon.
+
+config DECT_MAC_FT_MAX_ASSOCIATED_PTS
+    int "FT Maximum number of associated PTs"
+    default 8 # Matches MAX_PEERS_PER_FT in context
+    range 1 255 # Practical limits are lower
+    help
+      Maximum number of Portable Terminations that this Fixed Termination
+      can simultaneously have associated.
+
+config DECT_MAC_FT_SECURE_ON_ASSOC
+    bool "FT Policy: Require Secure Association"
+    default y
+    help
+      If enabled, the FT will attempt to establish a secure link (using derived
+      keys from Master PSK) immediately upon successful association response.
+      If disabled, the link will initially be unsecure, requiring a separate
+      authentication procedure to secure it.
+
+config DECT_MAC_FT_DEFAULT_OPERATING_CARRIER_KHZ
+    int "FT Default Initial Operating Carrier (kHz)"
+    default 1924992 # Example US DECT 6.0 Ch2: 1924.992 MHz
+    help
+      The default carrier frequency (in kHz) the FT will attempt to use or
+      scan first if DCS is not able to select one. Ensure this is a valid
+      channel number in your regulatory domain.
+      E.g., ETSI: 1881792 + k*1728. US: 1921536 + k*1728.
+
+config DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN
+    int "Number of channels for FT to scan during DCS"
+    default 3
+    range 0 10 # Example range, max depends on band
+    help
+      Number of candidate channels the FT will scan during Dynamic Channel
+      Selection. If 0, DCS is skipped. Channel list itself is currently
+      hardcoded/simple in SM, TODO: make configurable.
+
+endif # DECT_MAC_ROLE_IS_FT
+
+# MAC General Parameters (apply to both roles or are general config)
+config DECT_MAC_RSSI_THR_MIN_DBM
+    int "RSSI Threshold Min for 'free' channel (dBm)"
+    default -90 # Example value, ETSI specifies defaults based on band
+    help
+      RSSI-1 threshold below which a subslot is considered 'free' by the MAC.
+      (Relates to ETSI RSSI_THRESHOLD_MIN)
+
+config DECT_MAC_RSSI_THR_MAX_DBM
+    int "RSSI Threshold Max for 'busy' channel (dBm)"
+    default -75 # Example value, ETSI specifies defaults based on band
+    help
+      RSSI-1 threshold above which a subslot is considered 'busy' by the MAC.
+      Between MIN and MAX is 'possible'. (Relates to ETSI RSSI_THRESHOLD_MAX)
+
+config DECT_MAC_RACH_CW_MIN_IDX
+    int "RACH Contention Window Min Index (0-7)"
+    default 2 # CW_MIN = 8 * (2^index) => 8*4=32 for index 2
+    range 0 7
+    help
+      Index for calculating initial RACH Contention Window (CW_MIN).
+      CW_MIN = 8 * (2^value). ETSI 5.3.1.
+
+config DECT_MAC_RACH_CW_MAX_IDX
+    int "RACH Contention Window Max Index (0-7)"
+    default 6 # CW_MAX = 8 * (2^index) => 8*64=512 for index 6
+    range 0 7
+    help
+      Index for calculating maximum RACH Contention Window (CW_MAX).
+      CW_MAX = 8 * (2^value). ETSI 5.3.1.
+
+config DECT_MAC_RACH_RESP_WIN_MS
+    int "RACH Response Window Timeout (ms)"
+    default 200 # Default timeout for PT to wait for Association Response.
+                # Should be derived from FT's RACH Info IE in beacon.
+    help
+      Timeout for a PT waiting for a response after sending a RACH message
+      (e.g., Association Request). The FT's beacon should advertise its
+      actual response window. This is a PT-side fallback/max.
+
+config DECT_MAC_DEFAULT_DATA_MCS
+    int "Default MCS code for data transmissions"
+    default 0 # MCS0 (robust)
+    range 0 11 # Valid MCS indices
+    help
+      Default Modulation and Coding Scheme index to be used for data PDUs
+      if no other link adaptation mechanism is active or has selected an MCS.
+
+# Log Levels for MAC submodules
+config DECT_MAC_API_LOG_LEVEL
+    int "Log level for DECT MAC API module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_CORE_LOG_LEVEL
+    int "Log level for DECT MAC Core module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_DATA_PATH_LOG_LEVEL
+    int "Log level for DECT MAC Data Path module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_DISPATCHER_LOG_LEVEL
+    int "Log level for DECT MAC Dispatcher module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_MGMT_LOG_LEVEL
+    int "Log level for DECT MAC Management service module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_PDU_LOG_LEVEL
+    int "Log level for DECT MAC PDU module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_PHY_CTRL_LOG_LEVEL
+    int "Log level for DECT MAC PHY Control module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_PHY_IF_LOG_LEVEL
+    int "Log level for DECT MAC PHY Interface module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_SECURITY_LOG_LEVEL
+    int "Log level for DECT MAC Security module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_SM_FT_LOG_LEVEL
+    int "Log level for DECT MAC FT State Machine module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_SM_PT_LOG_LEVEL
+    int "Log level for DECT MAC PT State Machine module"
+    default 3 # Info
+    range 0 4
+    depends on LOG
+
+config DECT_MAC_SHELL_ENABLE
+    bool "Enable DECT MAC Debug Shell Commands"
+    default y if SHELL
+    depends on SHELL
+    help
+      Enable a set of shell commands for debugging and testing the DECT MAC layer.
+
+config DECT_MAC_SHELL_LOG_LEVEL
+    int "Log level for DECT MAC Shell module"
+    default 3 # Info
+    range 0 4
+    depends on LOG && DECT_MAC_SHELL_ENABLE
+
+
+# Max size of data[] array in mac_sdu_t (holds a DLC PDU)
+config DECT_MAC_SDU_MAX_SIZE
+    int "Maximum MAC SDU (DLC PDU) payload size"
+    default 1636 # Max ETSI DLC SDU, or MAC SDU Area before MUX headers
+    help
+      Defines the size of the data buffer within the mac_sdu_t structure.
+      This buffer is used to carry a DLC PDU (which is a MAC SDU from MAC's perspective)
+      or the content of the MAC SDU Area after MAC common headers.
+      ETSI TS 103 636-5 specifies max DLC SDU size, but the MAC PDU can also
+      carry MUXed IEs. This should be large enough for the largest expected content
+      that goes into the MAC SDU Area (after common headers, before MIC).
+      The maximum PDSCH TBS for µ=1,β=1,MCS0,j=16 is 2120 bits (265 bytes).
+      The MAC PDU can be up to ~1638 bytes as per some interpretations for PDC.
+      Let's align with ETSI 103 636-4, 6.3.1: "The basic MAC PDU structure..."
+      The MAC SDU (DLC PDU) part itself can be large.
+      This needs to be consistent with CONFIG_DECT_DLC_MAX_SDU_PAYLOAD_SIZE if CVG->DLC->MAC.
+
+config DECT_MAC_PDU_MAX_SIZE
+    int "Maximum total MAC PDU size for PHY"
+    default 1638 # Example, from PDSCH TBS for higher MCS/longer duration
+                 # This should be the largest size the PHY can transmit in one go.
+                 # For ETSI Part 3, Annex C, C.4 (Quad Slot), MCS11 with Nss=1 for beta=8, TBS is 2.212.888 bits (276KB) - this is wrong.
+                 # Let's look at Table C.2-1 (single slot): MCS11 max is 6048 bits (756 bytes).
+                 # If we take a very large value from ETSI Annex C, e.g. max for quad slot (4*Tslot)
+                 # Table C.4-1 for quad slot, Nss=1, mu=1, beta=16, MCS11 is 264800 bits = 33100 bytes (this seems too large for typical use)
+                 # A more reasonable interpretation is related to Z=2048 for code block size.
+                 # Max payload for nRF modem seems to be around 1600-2000 bytes for some PHYs.
+                 # ETSI MAC (Part 4) doesn't explicitly limit total MAC PDU size other than through PHY frame structure.
+                 # The nRF modem DECT PHY API or product spec should define max data_size for nrf_modem_dect_phy_tx.
+                 # Defaulting to a reasonable large value for now.
+    help
+      Maximum size of the entire MAC PDU (MAC Hdr Type + Common Hdr + SDU Area + MIC)
+      that can be constructed and passed to the PHY for transmission.
+      This affects buffer sizing for PDU construction.
+
+endif # DECT_MAC_LAYER

@@ -62,37 +62,62 @@ void dect_mac_sm_ft_beacon_timer_expired_action(void) {
 }
 
 // --- FT Public Functions ---
+
 void dect_mac_sm_ft_start_operation(void) {
     dect_mac_context_t* ctx = get_mac_context();
     dect_mac_change_state(MAC_STATE_FT_SCANNING);
-    LOG_INF("FT SM: Starting initial channel scan (DCS) on carrier %u.", ctx->role_ctx.ft.operating_carrier);
+
+    // Initialize DCS context
+    ctx->role_ctx.ft.dcs_current_channel_scan_index = 0;
+    ctx->role_ctx.ft.dcs_scan_complete = false;
+    for (int i = 0; i < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN; i++) {
+        ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] = NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED; // Indicates not scanned or invalid
+        ctx->role_ctx.ft.dcs_candidate_busy_percent[i] = 101; // Indicates not scanned
+    }
+
+    // Populate candidate channels - TODO: Get this from Kconfig or a fixed list
+    // Example:
+    if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN > 0) ctx->role_ctx.ft.dcs_candidate_channels[0] = DEFAULT_DECT_CARRIER;
+    if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN > 1) ctx->role_ctx.ft.dcs_candidate_channels[1] = DEFAULT_DECT_CARRIER + 1; // Example, ensure valid channel
+    if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN > 2) ctx->role_ctx.ft.dcs_candidate_channels[2] = DEFAULT_DECT_CARRIER - 1; // Example, ensure valid channel
+    // ... populate others if CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN is larger
+
+    if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN == 0) {
+        LOG_WRN("FT SM: DCS channel scan count is 0. Defaulting to operating_carrier %u and starting beaconing.", ctx->role_ctx.ft.operating_carrier);
+        // Fallback to immediate beaconing on default configured carrier if no scan channels
+        if (ctx->role_ctx.ft.operating_carrier == 0) ctx->role_ctx.ft.operating_carrier = DEFAULT_DECT_CARRIER;
+        ft_start_beaconing_actions(); // This will transition to FT_BEACONING
+        return;
+    }
+
+    uint16_t scan_carrier = ctx->role_ctx.ft.dcs_candidate_channels[0];
+    LOG_INF("FT SM: Starting DCS scan, 1/%d on carrier %u.", CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, scan_carrier);
 
     uint32_t phy_op_handle = sys_rand32_get();
+    // Duration calculation logic from previous ft_start_operation
     uint32_t scan_duration_total_subslots = SCAN_MEAS_DURATION_SLOTS_CONFIG * SUB_SLOTS_PER_ETSI_SLOT;
     uint32_t subslot_ticks = get_subslot_duration_ticks(ctx);
     uint32_t scan_duration_modem_units = scan_duration_total_subslots * subslot_ticks;
-
-    if (subslot_ticks == 0) { // Should not happen if get_subslot_duration_ticks is correct
-        LOG_ERR("FT SM: Subslot duration is zero! Cannot calculate scan duration.");
-        scan_duration_modem_units = modem_us_to_ticks(10000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); // Default 10ms
-    } else if (scan_duration_modem_units < subslot_ticks) {
-        scan_duration_modem_units = subslot_ticks * SUB_SLOTS_PER_ETSI_SLOT; // Min 1 ETSI slot
-        LOG_WRN("FT SM: Calculated scan duration was too small, using %u TU (1 ETSI slot).", scan_duration_modem_units);
-    }
+    if (subslot_ticks == 0) scan_duration_modem_units = modem_us_to_ticks(10000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+    else if (scan_duration_modem_units < subslot_ticks) scan_duration_modem_units = subslot_ticks * SUB_SLOTS_PER_ETSI_SLOT;
 
     int ret = dect_mac_phy_ctrl_start_rssi_scan(
-        ctx->role_ctx.ft.operating_carrier,
+        scan_carrier,
         scan_duration_modem_units,
-        NRF_MODEM_DECT_PHY_RSSI_INTERVAL_24_SLOTS,
+        NRF_MODEM_DECT_PHY_RSSI_INTERVAL_24_SLOTS, // Or a value that gives enough samples
         phy_op_handle,
         PENDING_OP_FT_INITIAL_SCAN);
 
     if (ret != 0) {
-        LOG_ERR("FT SM: Failed to start initial RSSI scan: %d. Retrying after delay.", ret);
+        LOG_ERR("FT SM: Failed to start initial RSSI scan for DCS (channel %u): %d. Retrying after delay.", scan_carrier, ret);
+        // Use beacon_timer for generic retry, or a dedicated DCS retry mechanism
         k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_SECONDS(1), K_NO_WAIT);
-        dect_mac_change_state(MAC_STATE_IDLE);
+        dect_mac_change_state(MAC_STATE_IDLE); // Go back to IDLE to retry init sequence
     }
 }
+
+
+
 
 void dect_mac_sm_ft_handle_event(const struct dect_mac_event_msg *msg) {
     dect_mac_context_t* ctx = get_mac_context();
@@ -229,48 +254,59 @@ static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sf
 }
 
 
-static void ft_select_operating_carrier_and_start_beaconing(const struct nrf_modem_dect_phy_rssi_event *rssi_event_data) {
+
+static void ft_select_operating_carrier_and_start_beaconing(const struct nrf_modem_dect_phy_rssi_event *optional_last_rssi_event_data) {
     dect_mac_context_t* ctx = get_mac_context();
     if (ctx->state != MAC_STATE_FT_SCANNING) {
-        LOG_WRN("FT_DCS: Not in SCANNING state (%s), ignoring RSSI for carrier sel.", dect_mac_state_to_str(ctx->state));
+        LOG_WRN("FT_DCS_SEL: Not in SCANNING state (%s), ignoring request to select carrier.", dect_mac_state_to_str(ctx->state));
         return;
     }
+    if (!ctx->role_ctx.ft.dcs_scan_complete && optional_last_rssi_event_data == NULL) {
+        LOG_WRN("FT_DCS_SEL: Called to select carrier, but scan not marked complete and no final RSSI event given.");
+        // This might happen if a scan op failed catastrophically.
+        // Attempt to select based on whatever data is available.
+    }
 
-    if (rssi_event_data && rssi_event_data->meas_len > 0) {
-        int32_t rssi_sum = 0; int valid_count = 0;
-        for(uint16_t i=0; i < rssi_event_data->meas_len; ++i) {
-            if(rssi_event_data->meas[i] != NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED) {
-                rssi_sum += rssi_event_data->meas[i];
-                valid_count++;
+
+    // Select the best channel from ctx->role_ctx.ft.dcs_candidate_rssi_avg
+    int16_t best_rssi = INT16_MAX; // Looking for the lowest (most negative) RSSI
+    uint16_t selected_carrier = 0;
+    int best_idx = -1;
+
+    LOG_INF("FT_DCS_SEL: Selecting best carrier from %d candidates:", CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN);
+    for (int i = 0; i < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN; i++) {
+        if (ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] != NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED) { // Check if scanned
+            LOG_DBG("  Candidate %d: C%u, AvgRSSI: %.1f dBm", i,
+                    ctx->role_ctx.ft.dcs_candidate_channels[i],
+                    (float)ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] / 2.0f);
+            // Simple selection: lowest average RSSI that is below a general "too noisy" threshold
+            // TODO: Add busy_percent and other metrics to selection criteria.
+            if (ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] < best_rssi &&
+                ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] < (ctx->config.rssi_threshold_min_dbm * 2 + 20*2 /* e.g. -65dBm threshold */ ) ) {
+                best_rssi = ctx->role_ctx.ft.dcs_candidate_rssi_avg[i];
+                selected_carrier = ctx->role_ctx.ft.dcs_candidate_channels[i];
+                best_idx = i;
             }
         }
-        if (valid_count > 0) {
-            int16_t avg_rssi_q7_1 = rssi_sum / valid_count;
-            if (avg_rssi_q7_1 > (ctx->config.rssi_threshold_min_dbm * 2)) {
-                LOG_WRN("FT_DCS: Scanned carrier %u (avg RSSI %.1f dBm) > threshold (%d dBm). Defaulting to %u",
-                        rssi_event_data->carrier, (float)avg_rssi_q7_1 / 2.0f, ctx->config.rssi_threshold_min_dbm, DEFAULT_DECT_CARRIER);
-                ctx->role_ctx.ft.operating_carrier = DEFAULT_DECT_CARRIER;
-            } else {
-                ctx->role_ctx.ft.operating_carrier = rssi_event_data->carrier;
-                 LOG_INF("FT_DCS: Selected carrier %u (avg RSSI %.1f dBm).",
-                        ctx->role_ctx.ft.operating_carrier, (float)avg_rssi_q7_1 / 2.0f);
-            }
-        } else {
-            LOG_WRN("FT_DCS: No valid RSSI measurements from scan on %u. Defaulting to %u.",
-                     rssi_event_data->carrier, DEFAULT_DECT_CARRIER);
-            ctx->role_ctx.ft.operating_carrier = DEFAULT_DECT_CARRIER;
-        }
+    }
+
+    if (best_idx != -1 && selected_carrier != 0) {
+        ctx->role_ctx.ft.operating_carrier = selected_carrier;
+        LOG_INF("FT_DCS_SEL: Best carrier selected: C%u (idx %d) with Avg RSSI %.1f dBm.",
+                selected_carrier, best_idx, (float)best_rssi / 2.0f);
     } else {
-        LOG_WRN("FT_DCS: No RSSI event data. Defaulting operating carrier to %u.", DEFAULT_DECT_CARRIER);
+        LOG_WRN("FT_DCS_SEL: No suitable quiet channel found from scan. Defaulting to C%u.", DEFAULT_DECT_CARRIER);
         ctx->role_ctx.ft.operating_carrier = DEFAULT_DECT_CARRIER;
     }
 
+    // Update advertised RACH channel based on selected operating carrier
     ctx->role_ctx.ft.advertised_rach_params.rach_operating_channel = ctx->role_ctx.ft.operating_carrier;
     ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields.channel_abs_freq_num = ctx->role_ctx.ft.operating_carrier;
-    ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields.channel_field_present = true;
+    ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields.channel_field_present = true; // Assuming RACH is on op channel
 
-    ft_start_beaconing_actions();
+    ft_start_beaconing_actions(); // This transitions state and starts beacon timer
 }
+
 
 static void ft_start_beaconing_actions(void) {
     dect_mac_context_t* ctx = get_mac_context();
@@ -488,18 +524,51 @@ static void ft_handle_phy_op_complete_ft(const struct nrf_modem_dect_phy_op_comp
     dect_mac_context_t* ctx = get_mac_context();
     switch (completed_op_type) {
         case PENDING_OP_FT_INITIAL_SCAN:
-             if (event->err == NRF_MODEM_DECT_PHY_SUCCESS || event->err == NRF_MODEM_DECT_PHY_ERR_OP_CANCELED) {
-                LOG_INF("FT SM: Initial channel scan PHY op complete (err %d).", event->err);
-                // Decision to beacon is from ft_select_operating_carrier_and_start_beaconing via RSSI event.
-                if (ctx->state == MAC_STATE_FT_SCANNING) {
-                    LOG_WRN("FT SM: Scan op completed, but no suitable carrier found from RSSI events yet. Retrying scan.");
-                    dect_mac_sm_ft_start_operation(); // Retry scan
+            LOG_INF("FT SM: DCS Scan for channel %u (idx %u) completed (err %d).",
+                    ctx->role_ctx.ft.dcs_candidate_channels[ctx->role_ctx.ft.dcs_current_channel_scan_index],
+                    ctx->role_ctx.ft.dcs_current_channel_scan_index,
+                    event->err);
+
+            if (event->err != NRF_MODEM_DECT_PHY_SUCCESS && event->err != NRF_MODEM_DECT_PHY_ERR_OP_CANCELED) {
+                LOG_ERR("FT_DCS: Scan op for C%u failed (err %d). Marking as unusable.",
+                         ctx->role_ctx.ft.dcs_candidate_channels[ctx->role_ctx.ft.dcs_current_channel_scan_index], event->err);
+                // Mark this channel as bad in results, e.g. very high RSSI
+                ctx->role_ctx.ft.dcs_candidate_rssi_avg[ctx->role_ctx.ft.dcs_current_channel_scan_index] = 127*2; // Effectively +127dBm
+            }
+            // Note: RSSI results themselves are processed in ft_handle_phy_rssi_ft
+
+            ctx->role_ctx.ft.dcs_current_channel_scan_index++;
+            if (ctx->role_ctx.ft.dcs_current_channel_scan_index < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN) {
+                // Scan next channel
+                uint16_t next_scan_carrier = ctx->role_ctx.ft.dcs_candidate_channels[ctx->role_ctx.ft.dcs_current_channel_scan_index];
+                LOG_INF("FT SM: Starting DCS scan %u/%u on carrier %u.",
+                        ctx->role_ctx.ft.dcs_current_channel_scan_index + 1, CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, next_scan_carrier);
+
+                uint32_t phy_op_handle = sys_rand32_get();
+                uint32_t scan_duration_total_subslots = SCAN_MEAS_DURATION_SLOTS_CONFIG * SUB_SLOTS_PER_ETSI_SLOT;
+                uint32_t subslot_ticks = get_subslot_duration_ticks(ctx);
+                uint32_t scan_duration_modem_units = scan_duration_total_subslots * subslot_ticks;
+                if (subslot_ticks == 0) scan_duration_modem_units = modem_us_to_ticks(10000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+                else if (scan_duration_modem_units < subslot_ticks) scan_duration_modem_units = subslot_ticks * SUB_SLOTS_PER_ETSI_SLOT;
+
+                int ret = dect_mac_phy_ctrl_start_rssi_scan(
+                    next_scan_carrier,
+                    scan_duration_modem_units,
+                    NRF_MODEM_DECT_PHY_RSSI_INTERVAL_24_SLOTS, // Or other suitable interval
+                    phy_op_handle,
+                    PENDING_OP_FT_INITIAL_SCAN); // Same op type for iterative scanning
+                if (ret != 0) {
+                    LOG_ERR("FT SM: Failed to start next DCS scan (C%u): %d. Aborting DCS.", next_scan_carrier, ret);
+                    // Fallback: Try to use default carrier or best found so far if any
+                    ctx->role_ctx.ft.dcs_scan_complete = true; // Mark as complete to trigger selection
+                    ft_select_operating_carrier_and_start_beaconing(NULL); // Pass NULL, selection uses stored results
                 }
-             } else {
-                LOG_ERR("FT SM: Initial channel scan PHY op failed (err %d). Retrying after delay.", event->err);
-                k_sleep(K_MSEC(1000 + (sys_rand32_get() % 1000)));
-                dect_mac_sm_ft_start_operation();
-             }
+            } else {
+                // All channels scanned
+                LOG_INF("FT SM: DCS scan sequence complete.");
+                ctx->role_ctx.ft.dcs_scan_complete = true;
+                ft_select_operating_carrier_and_start_beaconing(NULL); // Pass NULL, selection logic uses stored results
+            }
             break;
         case PENDING_OP_FT_BEACON:
             if (event->err != NRF_MODEM_DECT_PHY_SUCCESS) {
@@ -561,17 +630,66 @@ static void ft_handle_phy_op_complete_ft(const struct nrf_modem_dect_phy_op_comp
     }
 }
 
+
 static void ft_handle_phy_rssi_ft(const struct nrf_modem_dect_phy_rssi_event *rssi_event) {
     dect_mac_context_t* ctx = get_mac_context();
-    if (ctx->pending_op_type == PENDING_OP_FT_INITIAL_SCAN && rssi_event->handle == ctx->pending_op_handle) {
-        LOG_INF("FT SM: Processing initial channel scan RSSI results for carrier %u.", rssi_event->carrier);
-        // RSSI data (rssi_event->meas) is modem-owned. ft_select_operating_carrier_and_start_beaconing processes it immediately.
-        ft_select_operating_carrier_and_start_beaconing(rssi_event);
-    } else {
-        LOG_WRN("FT SM: Received RSSI result for unexpected op type %s or handle %u.",
-                dect_pending_op_to_str(ctx->pending_op_type), rssi_event->handle);
+    if (ctx->state != MAC_STATE_FT_SCANNING || ctx->pending_op_type != PENDING_OP_FT_INITIAL_SCAN || rssi_event->handle != ctx->pending_op_handle) {
+        LOG_WRN("FT_RSSI: Received RSSI result for unexpected op type %s, handle %u, or state %s.",
+                dect_pending_op_to_str(ctx->pending_op_type), rssi_event->handle, dect_mac_state_to_str(ctx->state));
+        // Clear pending op if it was this handle to avoid stall
+        if (rssi_event->handle == ctx->pending_op_handle) {
+             dect_mac_phy_ctrl_handle_op_complete(&(struct nrf_modem_dect_phy_op_complete_event){.handle = rssi_event->handle, .err = NRF_MODEM_DECT_PHY_ERR_OP_CANCELED});
+        }
+        return;
     }
+
+    // pending_op is cleared by dect_mac_phy_ctrl_handle_op_complete called from dispatcher before this.
+    // No, this handler is called directly for the RSSI event itself by the dispatcher.
+    // The PENDING_OP_FT_INITIAL_SCAN is completed with its own NRF_MODEM_DECT_PHY_EVT_COMPLETED event.
+    // This RSSI event is an intermediate report *during* PENDING_OP_FT_INITIAL_SCAN.
+
+    uint8_t current_scan_idx = ctx->role_ctx.ft.dcs_current_channel_scan_index;
+    uint16_t scanned_carrier = rssi_event->carrier;
+
+    if (scanned_carrier != ctx->role_ctx.ft.dcs_candidate_channels[current_scan_idx]) {
+        LOG_WRN("FT_RSSI: RSSI report for carrier %u, but expected scan for %u (idx %u). Ignoring.",
+                scanned_carrier, ctx->role_ctx.ft.dcs_candidate_channels[current_scan_idx], current_scan_idx);
+        return;
+    }
+
+    if (rssi_event->meas_len > 0) {
+        int32_t rssi_sum = 0;
+        int valid_count = 0;
+        for (uint16_t i = 0; i < rssi_event->meas_len; ++i) {
+            if (rssi_event->meas[i] != NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED) {
+                rssi_sum += rssi_event->meas[i];
+                valid_count++;
+            }
+        }
+        if (valid_count > 0) {
+            ctx->role_ctx.ft.dcs_candidate_rssi_avg[current_scan_idx] = rssi_sum / valid_count;
+            LOG_INF("FT_DCS: Scan %u/%u on C%u: Avg RSSI %.1f dBm (%d valid samples).",
+                    current_scan_idx + 1, CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN,
+                    scanned_carrier, (float)ctx->role_ctx.ft.dcs_candidate_rssi_avg[current_scan_idx] / 2.0f,
+                    valid_count);
+            // TODO: Calculate busy percentage based on thresholds
+            // ctx->role_ctx.ft.dcs_candidate_busy_percent[current_scan_idx] = calculated_busy_pc;
+        } else {
+            LOG_WRN("FT_DCS: Scan %u/%u on C%u: No valid RSSI samples.",
+                    current_scan_idx + 1, CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, scanned_carrier);
+            ctx->role_ctx.ft.dcs_candidate_rssi_avg[current_scan_idx] = 0; // Or some other marker for no valid data
+        }
+    } else {
+        LOG_WRN("FT_DCS: Scan %u/%u on C%u: RSSI event with no measurements.",
+                current_scan_idx + 1, CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, scanned_carrier);
+    }
+
+    // This RSSI event is just a report. The actual PENDING_OP_FT_INITIAL_SCAN
+    // will complete with NRF_MODEM_DECT_PHY_EVT_COMPLETED.
+    // The logic to scan the *next* channel or select the best should happen
+    // in the handler for NRF_MODEM_DECT_PHY_EVT_COMPLETED for PENDING_OP_FT_INITIAL_SCAN.
 }
+
 
 // Include the full ft_handle_phy_pcc_ft from "Phase 5 P5.3"
 static void ft_handle_phy_pcc_ft(const struct nrf_modem_dect_phy_pcc_event *pcc_event) {

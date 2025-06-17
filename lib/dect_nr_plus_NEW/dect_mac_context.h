@@ -348,6 +348,13 @@ typedef struct {
     bool keys_provisioned_for_peer[MAX_PEERS_PER_FT];
     uint8_t peer_integrity_keys[MAX_PEERS_PER_FT][16];
     uint8_t peer_cipher_keys[MAX_PEERS_PER_FT][16];
+
+    // DCS (Dynamic Channel Selection) state
+    uint8_t dcs_current_channel_scan_index; // Index into a list of channels to scan
+    uint16_t dcs_candidate_channels[CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN]; // Array to store channels
+    int16_t dcs_candidate_rssi_avg[CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN]; // Avg RSSI for scanned channels
+    uint8_t dcs_candidate_busy_percent[CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN]; // Placeholder for occupancy
+    bool dcs_scan_complete;
 } ft_context_t;
 
 /** @brief The single, global context structure for the entire MAC layer. */
