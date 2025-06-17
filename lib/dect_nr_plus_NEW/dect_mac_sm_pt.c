@@ -1040,7 +1040,7 @@ static void pt_process_identified_beacon_and_attempt_assoc(dect_mac_context_t *c
             ctx->role_ctx.pt.target_ft.operating_carrier = beacon_rx_carrier;
             LOG_INF("PT_BEACON_PROC: Target FT using beacon RX carrier: %u.", beacon_rx_carrier);
         }
-
+        LOG_INF("PT_BEACON_PROC: Target FT operating_carrier set to: %u", ctx->role_ctx.pt.target_ft.operating_carrier);
 
         // Estimate or refine the FT's SFN timing anchor
         uint32_t frame_duration_ticks = (uint32_t)FRAME_DURATION_MS_NOMINAL *
@@ -1065,37 +1065,80 @@ static void pt_process_identified_beacon_and_attempt_assoc(dect_mac_context_t *c
         }
         // Always update the SFN value that corresponds to our latest timing information.
         ctx->current_sfn_at_anchor_update = cb_fields->sfn;
-
+        LOG_DBG("PT_BEACON_PROC: FT SFN0 Anchor: %llu (Beacon SFN %u @ %llu)",
+                ctx->ft_sfn_zero_modem_time_anchor, cb_fields->sfn, beacon_pcc_rx_time);
 
         // Copy RACH parameters from parsed IE into PT's operational RACH context for this FT
-        memcpy(&ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields, rach_fields, sizeof(dect_mac_rach_info_ie_fields_t));
+        memcpy(&ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields,
+               parsed_rach_ie_fields, sizeof(dect_mac_rach_info_ie_fields_t));
 
-        // Derive operational RACH values
-        if (rach_fields->channel_field_present && rach_fields->channel_abs_freq_num != 0 && rach_fields->channel_abs_freq_num != 0xFFFF) {
-            ctx->role_ctx.pt.current_ft_rach_params.rach_operating_channel = rach_fields->channel_abs_freq_num;
+        // Derive RACH Operating Channel
+        if (parsed_rach_ie_fields->channel_field_present &&
+            parsed_rach_ie_fields->channel_abs_freq_num != 0 &&
+            parsed_rach_ie_fields->channel_abs_freq_num != 0xFFFF) {
+            ctx->role_ctx.pt.current_ft_rach_params.rach_operating_channel = parsed_rach_ie_fields->channel_abs_freq_num;
         } else {
-            // If RACH IE doesn't specify channel, it's FT's current operating channel (where beacon was heard or next_cluster_channel)
             ctx->role_ctx.pt.current_ft_rach_params.rach_operating_channel = ctx->role_ctx.pt.target_ft.operating_carrier;
         }
-        // CWmin_sig and Cwmax_sig codes are 0-7. CW = 8 * 2^code.
-        // ETSI 5.3.1: CW_CURRENT is value (not code), between CW_MIN and CW_MAX.
-        // The fields cwmin_sig_code and cwmax_sig_code store the *codes*.
-        // CW_MIN/MAX values themselves (as per ETSI 5.3.1) not directly in IE, but derived.
-        // For now, store the codes, and backoff logic will use config->rach_cw_min_idx.
-        // Let's also store the derived min/max values for clarity for backoff logic.
-        ctx->role_ctx.pt.current_ft_rach_params.cw_min_val = 8 * (1 << rach_fields->cwmin_sig_code);
-        ctx->role_ctx.pt.current_ft_rach_params.cw_max_val = 8 * (1 << rach_fields->cwmax_sig_code);
 
-        uint32_t resp_win_subslots = rach_fields->response_window_subslots_val_minus_1 + 1;
-        uint32_t subslot_dur_us = get_subslot_duration_ticks(ctx) * 1000 / NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ;
-        ctx->role_ctx.pt.current_ft_rach_params.response_window_duration_us = resp_win_subslots * subslot_dur_us;
+        // Derive CW_MIN and CW_MAX values from codes (ETSI 5.3.1: CW_Value = 8 * 2^Code)
+        if (parsed_rach_ie_fields->cwmin_sig_code <= 7) { // Code is 0-7
+             ctx->role_ctx.pt.current_ft_rach_params.cw_min_val = 8 * (1U << parsed_rach_ie_fields->cwmin_sig_code);
+        } else {
+            LOG_WRN("PT_BEACON_PROC: Invalid cwmin_sig_code %u from FT. Using Kconfig default.", parsed_rach_ie_fields->cwmin_sig_code);
+             ctx->role_ctx.pt.current_ft_rach_params.cw_min_val = 8 * (1U << ctx->config.rach_cw_min_idx); // Fallback
+        }
+        if (parsed_rach_ie_fields->cwmax_sig_code <= 7) { // Code is 0-7
+            ctx->role_ctx.pt.current_ft_rach_params.cw_max_val = 8 * (1U << parsed_rach_ie_fields->cwmax_sig_code);
+        } else {
+            LOG_WRN("PT_BEACON_PROC: Invalid cwmax_sig_code %u from FT. Using Kconfig default.", parsed_rach_ie_fields->cwmax_sig_code);
+            ctx->role_ctx.pt.current_ft_rach_params.cw_max_val = 8 * (1U << ctx->config.rach_cw_max_idx); // Fallback
+        }
 
-        LOG_INF("PT_BEACON_PROC: Stored RACH params for FT 0x%04X: OpCarrier %u, CWmin_code %u (val %u), CWmax_code %u (val %u), RespWin %u us",
-                ft_short_id,
+        // Calculate Response Window Duration in microseconds, now mu-aware
+        uint32_t resp_win_subslots_actual = parsed_rach_ie_fields->response_window_subslots_val_minus_1 + 1;
+        uint8_t ft_mu = parsed_rach_ie_fields->mu_value_for_ft_beacon; // This was set by parser
+        if (ft_mu == 0 || ft_mu > 8) { // Sanitize mu from FT
+            LOG_WRN("PT_BEACON_PROC: Invalid mu (%u) in parsed RACH IE for RespWin calc. Defaulting to mu=1.", ft_mu);
+            ft_mu = 1;
+        }
+
+        uint32_t ft_base_symbol_duration_ticks = NRF_MODEM_DECT_SYMBOL_DURATION; // Ticks for mu=1 symbol
+        uint32_t ft_actual_symbol_duration_ticks = ft_base_symbol_duration_ticks;
+        if (ft_mu > 1) { // Assuming NRF_MODEM_DECT_SYMBOL_DURATION is for mu=1
+            ft_actual_symbol_duration_ticks = ft_base_symbol_duration_ticks / (1U << (ft_mu - 1));
+        }
+        uint32_t ft_subslot_duration_ticks = ft_actual_symbol_duration_ticks * 5; // 5 OFDM symbols per subslot
+
+        if (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ > 0 && ft_subslot_duration_ticks > 0) {
+            ctx->role_ctx.pt.current_ft_rach_params.response_window_duration_us =
+                (resp_win_subslots_actual * ft_subslot_duration_ticks * 1000U) / NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ;
+        } else {
+            LOG_ERR("PT_BEACON_PROC: Invalid tick rate or subslot duration for FT mu %u. Cannot calc RespWin_us.", ft_mu);
+            ctx->role_ctx.pt.current_ft_rach_params.response_window_duration_us = ctx->config.rach_response_window_ms * 1000; // Fallback
+        }
+
+        LOG_INF("PT_BEACON_PROC: Stored RACH params for FT 0x%04X (L:0x%08X):", ft_short_id, ft_long_id);
+        LOG_INF("  RACH OperCarrier: %u, RACH IE mu (for StartSS): %u",
                 ctx->role_ctx.pt.current_ft_rach_params.rach_operating_channel,
-                rach_fields->cwmin_sig_code, ctx->role_ctx.pt.current_ft_rach_params.cw_min_val,
-                rach_fields->cwmax_sig_code, ctx->role_ctx.pt.current_ft_rach_params.cw_max_val,
-                ctx->role_ctx.pt.current_ft_rach_params.response_window_duration_us);
+                parsed_rach_ie_fields->mu_value_for_ft_beacon);
+        LOG_INF("  CWmin_code: %u (val %u), CWmax_code: %u (val %u)",
+                parsed_rach_ie_fields->cwmin_sig_code, ctx->role_ctx.pt.current_ft_rach_params.cw_min_val,
+                parsed_rach_ie_fields->cwmax_sig_code, ctx->role_ctx.pt.current_ft_rach_params.cw_max_val);
+        LOG_INF("  RespWin: %u subslots => %u us (using FT_mu=%u for timing, FT_subslot_ticks=%u)",
+                resp_win_subslots_actual, ctx->role_ctx.pt.current_ft_rach_params.response_window_duration_us,
+                ft_mu, ft_subslot_duration_ticks);
+        LOG_INF("  RACH StartSS: %u (%sbit), Len: %u %s, MaxRACHLen: %u %s, RepCode: %u, DECTDelay: %d",
+                parsed_rach_ie_fields->start_subslot_index,
+                (parsed_rach_ie_fields->mu_value_for_ft_beacon > 4 ? "9" : "8"),
+                parsed_rach_ie_fields->num_subslots_or_slots, parsed_rach_ie_fields->length_type_is_slots ? "slots" : "subslots",
+                parsed_rach_ie_fields->max_rach_pdu_len_units, parsed_rach_ie_fields->max_len_type_is_slots ? "slots" : "subslots",
+                parsed_rach_ie_fields->repetition_code, parsed_rach_ie_fields->dect_delay_for_response);
+        if (parsed_rach_ie_fields->sfn_validity_present) {
+            LOG_INF("  RACH SFN: %u, Validity: %u frames", parsed_rach_ie_fields->sfn_value, parsed_rach_ie_fields->validity_frames);
+        }
+
+
 
         ctx->role_ctx.pt.current_assoc_retries = 0; // Reset retries for new target
         ctx->rach_context.rach_cw_current_idx = ctx->config.rach_cw_min_idx; // Reset CW for new attempt sequence
