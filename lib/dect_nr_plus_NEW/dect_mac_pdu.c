@@ -326,7 +326,6 @@ int parse_cluster_beacon_ie_payload(const uint8_t *ie_payload, uint16_t ie_paylo
  * @param rach_fields Pointer to the structure holding the RACH Info IE fields to be serialized.
  * @return Length of the serialized payload in bytes, or negative error code.
  */
-
 static int serialize_rach_info_ie_payload(uint8_t *buf, size_t buf_max_len,
                                           const dect_mac_rach_info_ie_fields_t *rach_fields)
 {
@@ -454,7 +453,6 @@ static int serialize_rach_info_ie_payload(uint8_t *buf, size_t buf_max_len,
 }
 
 
-
 /**
  * @brief Deserializes the payload of a RACH Info IE.
  * Ref: ETSI TS 103 636-4, Clause 6.4.3.4 & Table 6.4.3.4-1
@@ -464,6 +462,7 @@ static int serialize_rach_info_ie_payload(uint8_t *buf, size_t buf_max_len,
  * @param out_rach_fields Pointer to the structure to store the deserialized fields.
  * @return 0 on success, or a negative error code on failure (e.g., -EMSGSIZE if payload too short).
  */
+
 int parse_rach_info_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_len,
                                uint8_t mu_value_for_ft_beacon, /* New parameter */
                                dect_mac_rach_info_ie_fields_t *out_rach_fields)
@@ -569,6 +568,7 @@ int parse_rach_info_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_le
  * @param req_fields Pointer to the structure holding the Association Request fields.
  * @return Length of the serialized payload in bytes (currently always 1), or negative error code.
  */
+
 static int serialize_assoc_req_ie_payload(uint8_t *buf, size_t buf_max_len,
                                           const dect_mac_assoc_req_ie_t *req_fields)
 {
@@ -576,77 +576,123 @@ static int serialize_assoc_req_ie_payload(uint8_t *buf, size_t buf_max_len,
         LOG_ERR("ASSOC_REQ_SER: NULL input pointers.");
         return -EINVAL;
     }
-    // Mandatory part is 1 octet.
+    // Min 1 octet for mandatory part. Max is complex: 1 (flags) + 2 (HARQ) + ceil(6*6/8)=5 (FlowIDs) +
+    // 1 (FT periods) + 2 (FT NextChan) + 4 (FT TimeToNext) approx = 1+2+5+1+2+4 = 15 bytes.
     if (buf_max_len < 1) {
-        LOG_ERR("ASSOC_REQ_SER: Buffer too small (%zu bytes) for Assoc Req IE mandatory part (1 byte).", buf_max_len);
+        LOG_ERR("ASSOC_REQ_SER: Buffer too small (%zu bytes) for mandatory part (1 byte).", buf_max_len);
         return -ENOMEM;
     }
 
-    memset(buf, 0, buf_max_len); // Initialize buffer, ensures reserved bits are 0
+    memset(buf, 0, buf_max_len);
     int bit_offset = 0;
     int ret;
 
     // --- Octet 0: Flags and Basic Info ---
-    // Bit 7 (MSB): Power Const (0 = RD has no power constraints for this association)
-    // Bit 6: FT Mode (0 = RD operates only in PT mode for this association)
-    // Bit 5-3: Number of Flows (requested to be setup, 000 means 0 flows initially)
-    // Bit 2-0: Setup Cause (e.g., 000 = initial association)
-
     uint8_t octet0 = 0;
-
-    // Bit 7: Power Const
-    if (req_fields->power_const_active) {
-        WRITE_BIT(octet0, 7, 1);
-    } // else it's 0 by memset
-
-    // Bit 6: FT Mode
-    if (req_fields->ft_mode_capable) {
-        WRITE_BIT(octet0, 6, 1);
-    } // else it's 0
-
-    // Bits 5-3: Number of Flows
-    if (req_fields->number_of_flows_val > 0x07) {
-        LOG_WRN("ASSOC_REQ_SER: Number of flows %u exceeds 3-bit field. Clamping to 7.", req_fields->number_of_flows_val);
-        octet0 |= (0x07 << 3);
+    WRITE_BIT(octet0, 7, req_fields->power_const_active);
+    WRITE_BIT(octet0, 6, req_fields->ft_mode_capable);
+    if (req_fields->number_of_flows_val > MAX_FLOW_IDS_IN_ASSOC_REQ && req_fields->number_of_flows_val != 7) { /* 7 is special meaning */
+        LOG_WRN("ASSOC_REQ_SER: NumFlows %u invalid for actual flow list. Clamping to 0 for list, or use 7 if all prev.", req_fields->number_of_flows_val);
+        octet0 |= (0 << 3); // Default to 0 if invalid for list.
     } else {
         octet0 |= ((req_fields->number_of_flows_val & 0x07) << 3);
     }
-
-    // Bits 2-0: Setup Cause
-    if (req_fields->setup_cause_val > 0x07) {
-        LOG_WRN("ASSOC_REQ_SER: Setup cause %u exceeds 3-bit field. Using raw low 3 bits.", req_fields->setup_cause_val);
-        octet0 |= (req_fields->setup_cause_val & 0x07);
-    } else {
-        octet0 |= (req_fields->setup_cause_val & 0x07);
-    }
-
+    octet0 |= (req_fields->setup_cause_val & 0x07);
     ret = write_bits(buf, buf_max_len, bit_offset, octet0, 8);
-    if (ret < 0) {
-        LOG_ERR("ASSOC_REQ_SER: Failed to write octet0: %d", ret);
-        return ret;
-    }
+    if (ret < 0) { LOG_ERR("ASSOC_REQ_SER: Write octet0 failed: %d", ret); return ret; }
     bit_offset = ret;
 
-    // --- Conditional Fields (ETSI Table 6.4.2.4-1) ---
-    // These are TODO for full implementation.
-    // - HARQ Process TX (3b), MAX HARQ RE-TX (5b)
-    // - HARQ Process RX (3b), MAX HARQ RE-RX (5b)
-    // - Flow IDs (6b each, repeated 'Number of Flows' times if > 0)
-    // - FT Mode specific parameters (if ft_mode_capable is true):
-    //   - Network Beacon period (4b), Cluster Beacon period (4b)
-    //   - Next Cluster Channel (1b flag + 13b value if flag is 1)
-    //   - Time to next (1b flag + 32b value if flag is 1)
-    //   - Current (1b flag + 13b value if flag is 1 and Next Cluster Channel is different)
+    // --- Conditional: HARQ Parameters (Octets 1 & 2) ---
+    // Assuming harq_params_present flag in struct correctly indicates if these should be included.
+    // ETSI implies these are typically present for initial association.
+    if (req_fields->harq_params_present) {
+        if (((bit_offset / 8) + 2) > buf_max_len) { LOG_ERR("ASSOC_REQ_SER: No space for HARQ params."); return -ENOMEM;}
+        // Octet 1: HARQ Proc TX (3b), MAX HARQ RE-TX delay code (5b)
+        uint8_t octet1_harq = ((req_fields->harq_processes_tx_val & 0x07) << 5) |
+                               (req_fields->max_harq_re_tx_delay_code & 0x1F);
+        ret = write_bits(buf, buf_max_len, bit_offset, octet1_harq, 8);
+        if (ret < 0) { LOG_ERR("ASSOC_REQ_SER: Write HARQ Octet1 failed: %d", ret); return ret; }
+        bit_offset = ret;
 
-    if (req_fields->number_of_flows_val > 0 || req_fields->ft_mode_capable) {
-        LOG_WRN("ASSOC_REQ_SER: Conditional fields for Assoc Req IE (Flows, FT Params) are NOT YET SERIALIZED.");
-        // For a fully compliant PDU, these would need to be serialized here if their flags/conditions are met.
-        // This would increase the returned length.
+        // Octet 2: HARQ Proc RX (3b), MAX HARQ RE-RX delay code (5b)
+        uint8_t octet2_harq = ((req_fields->harq_processes_rx_val & 0x07) << 5) |
+                               (req_fields->max_harq_re_rx_delay_code & 0x1F);
+        ret = write_bits(buf, buf_max_len, bit_offset, octet2_harq, 8);
+        if (ret < 0) { LOG_ERR("ASSOC_REQ_SER: Write HARQ Octet2 failed: %d", ret); return ret; }
+        bit_offset = ret;
     }
 
-    // Return length in bytes (currently always 1 for this simplified version)
+    // --- Conditional: Flow IDs (Variable length) ---
+    uint8_t num_flows_to_list = (req_fields->number_of_flows_val <= MAX_FLOW_IDS_IN_ASSOC_REQ) ? req_fields->number_of_flows_val : 0;
+    if (num_flows_to_list > 0) {
+        if (((bit_offset + (num_flows_to_list * 6) - 1) / 8) >= buf_max_len) { LOG_ERR("ASSOC_REQ_SER: No space for Flow IDs."); return -ENOMEM; }
+        for (int i = 0; i < num_flows_to_list; i++) {
+            if (req_fields->flow_ids[i] > 0x3F) { LOG_WRN("ASSOC_REQ_SER: FlowID %u > 6-bit. Clamping.", req_fields->flow_ids[i]); }
+            ret = write_bits(buf, buf_max_len, bit_offset, req_fields->flow_ids[i] & 0x3F, 6);
+            if (ret < 0) { LOG_ERR("ASSOC_REQ_SER: Write FlowID %d failed: %d", i, ret); return ret; }
+            bit_offset = ret;
+        }
+        // Pad to next octet boundary if num_flows_to_list * 6 is not a multiple of 8
+        if (bit_offset % 8 != 0) {
+            int padding_bits = 8 - (bit_offset % 8);
+            ret = write_bits(buf, buf_max_len, bit_offset, 0, (uint8_t)padding_bits); // Pad with 0s
+            if (ret < 0) { LOG_ERR("ASSOC_REQ_SER: FlowID padding failed: %d", ret); return ret; }
+            bit_offset = ret;
+        }
+    }
+
+    // --- Conditional: FT Mode Parameters (if ft_mode_capable) ---
+    if (req_fields->ft_mode_capable) {
+        // These are flags for presence + values, similar to Cluster Beacon IE construction
+        // For simplicity, let's assume if ft_mode_capable, PT provides its preferred periods.
+        // And if it wants to suggest a next channel/time, those flags are set in req_fields.
+
+        // Octet for Beacon Periods (if any present)
+        if (req_fields->ft_net_beacon_period_present || req_fields->ft_cluster_beacon_period_present) {
+            if (((bit_offset / 8) + 1) > buf_max_len) { LOG_ERR("ASSOC_REQ_SER: No space for FT Beacon Periods."); return -ENOMEM; }
+            uint8_t ft_periods_octet = 0;
+            // Assuming codes are already validated to be 4-bit
+            if (req_fields->ft_net_beacon_period_present) ft_periods_octet |= (req_fields->ft_network_beacon_period_code & 0x0F) << 4;
+            if (req_fields->ft_cluster_beacon_period_present) ft_periods_octet |= (req_fields->ft_cluster_beacon_period_code & 0x0F);
+            ret = write_bits(buf, buf_max_len, bit_offset, ft_periods_octet, 8);
+            if (ret < 0) { LOG_ERR("ASSOC_REQ_SER: Write FT Periods failed: %d", ret); return ret; }
+            bit_offset = ret;
+        }
+
+        // Octet for FT Param Presence Flags
+        // Bit 7: Next Cluster Channel present, Bit 6: Time To Next present, Bit 5: Current Cluster Channel present (omitting for now)
+        if (req_fields->ft_next_channel_present || req_fields->ft_time_to_next_present) {
+            if (((bit_offset / 8) + 1) > buf_max_len) { LOG_ERR("ASSOC_REQ_SER: No space for FT Param Flags."); return -ENOMEM; }
+            uint8_t ft_param_flags_octet = 0;
+            WRITE_BIT(ft_param_flags_octet, 7, req_fields->ft_next_channel_present);
+            WRITE_BIT(ft_param_flags_octet, 6, req_fields->ft_time_to_next_present);
+            // Other bits reserved
+            ret = write_bits(buf, buf_max_len, bit_offset, ft_param_flags_octet, 8);
+            if (ret < 0) { LOG_ERR("ASSOC_REQ_SER: Write FT Param Flags failed: %d", ret); return ret; }
+            bit_offset = ret;
+
+            if (req_fields->ft_next_channel_present) {
+                if (((bit_offset + 16 - 1) / 8) >= buf_max_len) { LOG_ERR("ASSOC_REQ_SER: No space for FT Next Chan."); return -ENOMEM; }
+                uint16_t chan_val = (req_fields->ft_next_cluster_channel_val & 0x1FFF) << 3;
+                ret = write_bits(buf, buf_max_len, bit_offset, (chan_val >> 8) & 0xFF, 8);
+                if (ret < 0) return ret; bit_offset = ret;
+                ret = write_bits(buf, buf_max_len, bit_offset, chan_val & 0xFF, 8);
+                if (ret < 0) return ret; bit_offset = ret;
+            }
+            if (req_fields->ft_time_to_next_present) {
+                 if (((bit_offset + 32 - 1) / 8) >= buf_max_len) { LOG_ERR("ASSOC_REQ_SER: No space for FT TimeToNext."); return -ENOMEM; }
+                uint32_t ttn_val = req_fields->ft_time_to_next_us_val;
+                ret = write_bits(buf, buf_max_len, bit_offset, (ttn_val >> 24) & 0xFF, 8); if (ret < 0) return ret; bit_offset = ret;
+                ret = write_bits(buf, buf_max_len, bit_offset, (ttn_val >> 16) & 0xFF, 8); if (ret < 0) return ret; bit_offset = ret;
+                ret = write_bits(buf, buf_max_len, bit_offset, (ttn_val >> 8) & 0xFF, 8); if (ret < 0) return ret; bit_offset = ret;
+                ret = write_bits(buf, buf_max_len, bit_offset, ttn_val & 0xFF, 8); if (ret < 0) return ret; bit_offset = ret;
+            }
+        }
+    }
     return (bit_offset + 7) / 8;
 }
+
+
 
 /**
  * @brief Deserializes the payload of an Association Request IE.
@@ -658,6 +704,7 @@ static int serialize_assoc_req_ie_payload(uint8_t *buf, size_t buf_max_len,
  * @param out_req_fields Pointer to the structure to store the deserialized fields.
  * @return 0 on success, or a negative error code on failure (e.g., -EMSGSIZE if payload too short).
  */
+
 int parse_assoc_req_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_len,
                                dect_mac_assoc_req_ie_t *out_req_fields)
 {
@@ -665,56 +712,111 @@ int parse_assoc_req_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_le
         LOG_ERR("ASSOC_REQ_PARSE: NULL input pointers.");
         return -EINVAL;
     }
-    // Mandatory part is 1 octet.
     if (ie_payload_len < 1) {
-        LOG_ERR("ASSOC_REQ_PARSE: Payload too short (%u bytes) for Assoc Req IE mandatory part (1 byte).", ie_payload_len);
+        LOG_ERR("ASSOC_REQ_PARSE: Payload too short (%u bytes) for mandatory part (1 byte).", ie_payload_len);
         return -EMSGSIZE;
     }
     memset(out_req_fields, 0, sizeof(dect_mac_assoc_req_ie_t));
 
     int bit_offset = 0;
-    int remaining_bits = ie_payload_len * 8; // Track remaining bits for robust parsing
+    int remaining_bits_from_len = ie_payload_len * 8;
+    int *remaining_bits = &remaining_bits_from_len;
 
-    // --- Octet 0: Flags and Basic Info ---
-    // Bit 7 (MSB): Power Const
-    // Bit 6: FT Mode
-    // Bit 5-3: Number of Flows
-    // Bit 2-0: Setup Cause
-    if (remaining_bits < 8) return -EMSGSIZE; // Should be caught by ie_payload_len < 1
-    uint8_t octet0 = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
-
+    // Octet 0: Flags and Basic Info
+    if (*remaining_bits < 8) return -EMSGSIZE;
+    uint8_t octet0 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
     out_req_fields->power_const_active  = (octet0 >> 7) & 0x01;
     out_req_fields->ft_mode_capable     = (octet0 >> 6) & 0x01;
     out_req_fields->number_of_flows_val = (octet0 >> 3) & 0x07;
-    out_req_fields->setup_cause_val     = octet0 & 0x07;
+    out_req_fields->setup_cause_val     = (dect_assoc_setup_cause_t)(octet0 & 0x07);
 
-    LOG_DBG("ASSOC_REQ_PARSE: Parsed Octet0 -> PowerConst:%d, FTMode:%d, NumFlows:%d, Cause:%d",
-            out_req_fields->power_const_active, out_req_fields->ft_mode_capable,
-            out_req_fields->number_of_flows_val, out_req_fields->setup_cause_val);
+    // Conditional: HARQ Parameters (Octets 1 & 2)
+    // ETSI Table implies these are present based on context (e.g. initial assoc)
+    // rather than an explicit flag in Octet 0.
+    // For robust parsing, check if enough bytes remain for them *if* they are expected.
+    // Let's assume for an initial association (cause 0) or if NumFlows > 0, they are present.
+    // This 'harq_params_present' should ideally be set by the SM based on setup_cause.
+    // For now, we try to parse if bytes are available.
+    if (*remaining_bits >= 16) { // Check if at least 2 more octets exist
+        out_req_fields->harq_params_present = true; // Assume present if space allows
+        uint8_t octet1_harq = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        out_req_fields->harq_processes_tx_val = (octet1_harq >> 5) & 0x07;
+        out_req_fields->max_harq_re_tx_delay_code = octet1_harq & 0x1F;
 
-    // --- Conditional Fields (ETSI Table 6.4.2.4-1) ---
-    // These are TODO for full implementation.
-    // The parser needs to check flags and `out_req_fields->number_of_flows_val`
-    // to determine if and how many of these optional fields are present.
-    // - HARQ Process TX (3b), MAX HARQ RE-TX (5b) -> Total 1 octet
-    // - HARQ Process RX (3b), MAX HARQ RE-RX (5b) -> Total 1 octet
-    // - Flow IDs (6b each, repeated 'Number of Flows' times if > 0) -> Variable length
-    // - FT Mode specific parameters (if ft_mode_capable is true):
-    //   - Network Beacon period (4b), Cluster Beacon period (4b) -> Total 1 octet
-    //   - Next Cluster Channel Flag (1b)
-    //     - Next Cluster Channel (13b + 3b reserved if flag=1) -> Total 2 octets
-    //   - Time to next Flag (1b)
-    //     - Time to next (32b if flag=1) -> Total 4 octets
-    //   - Current Flag (1b)
-    //     - Current Cluster Channel (13b + 3b reserved if flag=1 and NextChan flag was 1 and different) -> Total 2 octets
-
-    if (remaining_bits >= 8) { // Check if there's at least one more byte
-        LOG_WRN("ASSOC_REQ_PARSE: Conditional fields present in Assoc Req IE but NOT YET PARSED (remaining %d bits).", remaining_bits);
-        // For a fully compliant parser, you would now check number_of_flows_val, ft_mode_capable,
-        // and the flags for optional channel/time fields to parse the rest of the IE.
+        uint8_t octet2_harq = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        out_req_fields->harq_processes_rx_val = (octet2_harq >> 5) & 0x07;
+        out_req_fields->max_harq_re_rx_delay_code = octet2_harq & 0x1F;
+    } else {
+        out_req_fields->harq_params_present = false;
     }
 
-    // For successfully parsing the first octet is sufficient to identify the request.
+    // Conditional: Flow IDs
+    uint8_t num_flows_to_parse = (out_req_fields->number_of_flows_val <= MAX_FLOW_IDS_IN_ASSOC_REQ) ? out_req_fields->number_of_flows_val : 0;
+    if (num_flows_to_parse > 0) {
+        if (*remaining_bits < (num_flows_to_parse * 6)) {
+            LOG_ERR("ASSOC_REQ_PARSE: Not enough bits for %u Flow IDs.", num_flows_to_parse);
+            // Mark as parsing failure or partial success
+            return -EMSGSIZE;
+        }
+        for (int i = 0; i < num_flows_to_parse; i++) {
+            out_req_fields->flow_ids[i] = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 6);
+        }
+        // Consume padding bits if any
+        if (bit_offset % 8 != 0) {
+            int padding_to_read = 8 - (bit_offset % 8);
+            if (*remaining_bits < padding_to_read) { /* Error */ return -EMSGSIZE; }
+            read_bits_adv(ie_payload, &bit_offset, remaining_bits, (uint8_t)padding_to_read);
+        }
+    }
+
+    // Conditional: FT Mode Parameters
+    if (out_req_fields->ft_mode_capable) {
+        // Try to parse FT Beacon Periods octet (if present)
+        if (*remaining_bits >= 8) {
+            uint8_t ft_periods_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+            // Heuristic: If any period code is non-zero, assume the octet was intended for periods
+            if ((ft_periods_octet >> 4) != 0 || (ft_periods_octet & 0x0F) != 0) {
+                 out_req_fields->ft_net_beacon_period_present = ((ft_periods_octet >> 4) != 0); // Approximation
+                 out_req_fields->ft_network_beacon_period_code = (ft_periods_octet >> 4) & 0x0F;
+                 out_req_fields->ft_cluster_beacon_period_present = ((ft_periods_octet & 0x0F) != 0); // Approximation
+                 out_req_fields->ft_cluster_beacon_period_code = ft_periods_octet & 0x0F;
+            } else { // Octet was all zeros, might not have been periods octet, rewind conceptually
+                bit_offset -= 8; *remaining_bits += 8; // "Unread" it if it was all zeros
+            }
+        }
+
+        // Try to parse FT Param Presence Flags octet (if present)
+        if (*remaining_bits >= 8) {
+            uint8_t ft_param_flags_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+            out_req_fields->ft_next_channel_present = (ft_param_flags_octet >> 7) & 0x01;
+            out_req_fields->ft_time_to_next_present = (ft_param_flags_octet >> 6) & 0x01;
+            // Bit 5 for Current Cluster Channel present - not parsing this for now
+
+            if (out_req_fields->ft_next_channel_present) {
+                if (*remaining_bits < 16) { LOG_ERR("ASSOC_REQ_PARSE: No space for FT Next Chan."); return -EMSGSIZE;}
+                uint8_t msb = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+                uint8_t lsb = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+                out_req_fields->ft_next_cluster_channel_val = ((uint16_t)msb << 8) | lsb;
+                out_req_fields->ft_next_cluster_channel_val = (out_req_fields->ft_next_cluster_channel_val >> 3) & 0x1FFF;
+            }
+            if (out_req_fields->ft_time_to_next_present) {
+                if (*remaining_bits < 32) { LOG_ERR("ASSOC_REQ_PARSE: No space for FT TimeToNext."); return -EMSGSIZE;}
+                uint32_t ttn_val = 0;
+                ttn_val |= ((uint32_t)read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8)) << 24;
+                ttn_val |= ((uint32_t)read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8)) << 16;
+                ttn_val |= ((uint32_t)read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8)) << 8;
+                ttn_val |= read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+                out_req_fields->ft_time_to_next_us_val = ttn_val;
+            }
+        }
+    }
+
+    if (*remaining_bits >= 8) {
+        LOG_WRN("ASSOC_REQ_PARSE: %d unparsed bits (>=1 byte) remain. Payload len %u.", *remaining_bits, ie_payload_len);
+    } else if (*remaining_bits > 0) {
+        LOG_WRN("ASSOC_REQ_PARSE: %d unparsed bits remain (padding or error). Payload len %u.", *remaining_bits, ie_payload_len);
+    }
+
     return 0;
 }
 
@@ -731,6 +833,7 @@ int parse_assoc_req_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_le
  * @return Length of the serialized payload in bytes (currently 2 for the summary),
  *         or negative error code.
  */
+
 static int serialize_rd_capability_ie_payload(uint8_t *buf, size_t buf_max_len,
                                               const dect_mac_rd_capability_ie_t *cap_fields)
 {
@@ -738,88 +841,80 @@ static int serialize_rd_capability_ie_payload(uint8_t *buf, size_t buf_max_len,
         LOG_ERR("RD_CAP_SER: NULL input pointers.");
         return -EINVAL;
     }
-    // Mandatory part is 2 octets for the summary (Octet 0 & Octet 1).
-    if (buf_max_len < 2) {
-        LOG_ERR("RD_CAP_SER: Buffer too small (%zu bytes) for RD Cap IE mandatory part (2 bytes).", buf_max_len);
+    size_t min_len_needed = 2; // Mandatory summary octets
+    if (cap_fields->num_phy_capabilities >= 1) {
+        min_len_needed += 5; // Add 5 bytes for the first PHY set
+    }
+    if (buf_max_len < min_len_needed) {
+        LOG_ERR("RD_CAP_SER: Buffer too small (%zu bytes) for RD Cap IE (needs min %zu).", buf_max_len, min_len_needed);
         return -ENOMEM;
     }
 
-    memset(buf, 0, buf_max_len); // Initialize buffer, ensures reserved bits are 0
+    memset(buf, 0, buf_max_len);
     int bit_offset = 0;
     int ret;
 
-    // --- Octet 0: Number of PHY Capabilities (3 MSB), Release (5 LSB) ---
-    // Number of PHY Capabilities: Indicates N-1 additional sets.
-    // 000 means 1 set (the base set, often implied or described by subsequent summary fields).
-    // 001 means 1 additional explicit PHY capability set follows (total 1+1=2 sets).
-    // The `cap_fields->num_phy_capabilities` should hold the actual N-1 value for the field.
-    if (cap_fields->num_phy_capabilities > 0x07) {
-        LOG_WRN("RD_CAP_SER: num_phy_capabilities %u exceeds 3-bit field. Clamping.", cap_fields->num_phy_capabilities);
-    }
-    if (cap_fields->release_version > 0x1F) {
-        LOG_WRN("RD_CAP_SER: release_version %u exceeds 5-bit field. Clamping.", cap_fields->release_version);
-    }
+    // Octet 0: Number of PHY Capabilities (3 MSB), Release (5 LSB)
+    if (cap_fields->num_phy_capabilities > 0x07) LOG_WRN("RD_CAP_SER: num_phy_cap %u > 3bit. Clamping.", cap_fields->num_phy_capabilities);
+    if (cap_fields->release_version > 0x1F) LOG_WRN("RD_CAP_SER: release_ver %u > 5bit. Clamping.", cap_fields->release_version);
     uint8_t octet0 = ((cap_fields->num_phy_capabilities & 0x07) << 5) |
                      (cap_fields->release_version & 0x1F);
     ret = write_bits(buf, buf_max_len, bit_offset, octet0, 8);
-    if (ret < 0) { LOG_ERR("RD_CAP_SER: Failed to write octet0: %d", ret); return ret; }
+    if (ret < 0) { LOG_ERR("RD_CAP_SER: Write octet0 failed: %d", ret); return ret; }
     bit_offset = ret;
 
-    // --- Octet 1: Flags ---
-    // Bit 7 (MSB): Group Assignment support
-    // Bit 6: Paging support
-    // Bit 5-4: Operating Modes (00=PT, 01=FT, 10=Both, 11=Reserved)
-    // Bit 3: Mesh support
-    // Bit 2: Scheduled data transfer service support
-    // Bit 1-0: MAC Security mode(s) supported (00=None, 01=Mode1, 10=Mode2(Rsvd), 11=Mode1&2(Rsvd))
-    //          (ETSI Table 6.4.3.5-1 shows 2 bits for MAC Security)
+    // Octet 1: Flags
     uint8_t octet1 = 0;
     WRITE_BIT(octet1, 7, cap_fields->supports_group_assignment);
     WRITE_BIT(octet1, 6, cap_fields->supports_paging);
-
-    if (cap_fields->operating_modes_code > 0x03) {
-        LOG_WRN("RD_CAP_SER: operating_modes_code %u exceeds 2-bit field. Clamping.", cap_fields->operating_modes_code);
-    }
+    if (cap_fields->operating_modes_code > 0x03) LOG_WRN("RD_CAP_SER: op_modes %u > 2bit. Clamping.", cap_fields->operating_modes_code);
     octet1 |= ((cap_fields->operating_modes_code & 0x03) << 4);
-
     WRITE_BIT(octet1, 3, cap_fields->supports_mesh);
     WRITE_BIT(octet1, 2, cap_fields->supports_sched_data);
-
-    if (cap_fields->mac_security_modes_code > 0x03) {
-         LOG_WRN("RD_CAP_SER: mac_security_modes_code %u exceeds 2-bit field. Clamping.", cap_fields->mac_security_modes_code);
-    }
+    if (cap_fields->mac_security_modes_code > 0x03) LOG_WRN("RD_CAP_SER: mac_sec %u > 2bit. Clamping.", cap_fields->mac_security_modes_code);
     octet1 |= (cap_fields->mac_security_modes_code & 0x03);
-
     ret = write_bits(buf, buf_max_len, bit_offset, octet1, 8);
-    if (ret < 0) { LOG_ERR("RD_CAP_SER: Failed to write octet1: %d", ret); return ret; }
+    if (ret < 0) { LOG_ERR("RD_CAP_SER: Write octet1 failed: %d", ret); return ret; }
     bit_offset = ret;
 
-    // --- Conditional PHY Capability Sets (Octets 2 to (1 + N*5)) ---
-    // N is (num_phy_capabilities field value + 1), but ETSI says num_phy_capabilities is N-1.
-    // So, if num_phy_capabilities field is 'X', there are 'X' *additional* 5-octet sets following.
-    // If num_phy_capabilities field is 0, no *additional* sets.
-    // The fields in Octet 1 (like Schedul., MAC Security) and other implicit capabilities (like
-    // support for HARQ based on HARQ process count IE, etc.) form the "base" capability set.
-    // ETSI Annex A.2 describes some fields as "part of first set of PHY capabilities".
+    // Conditional: First PHY Capability Set (Octets 2 to 6)
+    if (cap_fields->num_phy_capabilities >= 1) {
+        const dect_mac_phy_capability_set_t *phy_set0 = &cap_fields->phy_variants[0];
+        uint8_t phy_octet;
 
-    // we only send the 2 summary octets.
-    // A fully compliant device *must* send its actual PHY capabilities.
-    if (cap_fields->num_phy_capabilities > 0) {
-        LOG_WRN("RD_CAP_SER: Serialization of %u additional PHY capability set(s) (5 octets each) is NOT YET IMPLEMENTED.",
-                cap_fields->num_phy_capabilities);
-        // Here, you would loop cap_fields->num_phy_capabilities times:
-        // For each set:
-        //   - Get data from a corresponding struct (e.g., an array of PHY cap sets in dect_mac_rd_capability_ie_t)
-        //   - Serialize 5 octets:
-        //     - Octet 0: DLC Service Type (3b), RX for TX diversity (3b), Reserved (2b)
-        //     - Octet 1: mu (3b), beta (4b), Reserved (1b)
-        //     - Octet 2: Max NSS for RX (3b), Max MCS (4b), Reserved (1b)
-        //     - Octet 3: HARQ soft buffer size code (4b), Num HARQ process code (2b), Reserved (2b)
-        //     - Octet 4: HARQ feedback delay code (4b), D_Delay (1b), HalfDup (1b), Reserved (2b)
+        // Set Octet 0: DLC Svc (3b), RX Div (3b), Rsvd (2b)
+        phy_octet = ((phy_set0->dlc_service_type_support_code & 0x07) << 5) |
+                    ((phy_set0->rx_for_tx_diversity_code & 0x07) << 2); // Rsvd are 0
+        ret = write_bits(buf, buf_max_len, bit_offset, phy_octet, 8); if (ret < 0) return ret; bit_offset = ret;
+
+        // Set Octet 1: mu (3b), beta (4b), Rsvd (1b)
+        phy_octet = ((phy_set0->mu_value & 0x07) << 5) |
+                    ((phy_set0->beta_value & 0x0F) << 1); // Rsvd is 0
+        ret = write_bits(buf, buf_max_len, bit_offset, phy_octet, 8); if (ret < 0) return ret; bit_offset = ret;
+
+        // Set Octet 2: Max NSS (3b), Max MCS (4b), Rsvd (1b)
+        phy_octet = ((phy_set0->max_nss_for_rx_code & 0x07) << 5) |
+                    ((phy_set0->max_mcs_code & 0x0F) << 1); // Rsvd is 0
+        ret = write_bits(buf, buf_max_len, bit_offset, phy_octet, 8); if (ret < 0) return ret; bit_offset = ret;
+
+        // Set Octet 3: HARQ Buf (4b), Num HARQ Proc (2b), Rsvd (2b)
+        phy_octet = ((phy_set0->harq_soft_buffer_size_code & 0x0F) << 4) |
+                    ((phy_set0->num_harq_processes_code & 0x03) << 2); // Rsvd are 0
+        ret = write_bits(buf, buf_max_len, bit_offset, phy_octet, 8); if (ret < 0) return ret; bit_offset = ret;
+
+        // Set Octet 4: HARQ Delay (4b), D_Delay (1b), HalfDup (1b), Rsvd (2b)
+        phy_octet = ((phy_set0->harq_feedback_delay_code & 0x0F) << 4) |
+                    ((phy_set0->supports_dect_delay ? 1 : 0) << 3) |
+                    ((phy_set0->supports_half_duplex ? 1 : 0) << 2); // Rsvd are 0
+        ret = write_bits(buf, buf_max_len, bit_offset, phy_octet, 8); if (ret < 0) return ret; bit_offset = ret;
     }
+    // TODO: Loop here if cap_fields->num_phy_capabilities > 1 and phy_variants was an array
 
-    return (bit_offset + 7) / 8; // Bytes written (currently 2)
+    return (bit_offset + 7) / 8;
 }
+
+
+
 
 
 /**
@@ -833,6 +928,7 @@ static int serialize_rd_capability_ie_payload(uint8_t *buf, size_t buf_max_len,
  * @param out_cap_fields Pointer to the structure to store the deserialized fields.
  * @return 0 on success, or a negative error code on failure (e.g., -EMSGSIZE if payload too short).
  */
+
 int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_len,
                                    dect_mac_rd_capability_ie_t *out_cap_fields)
 {
@@ -840,37 +936,25 @@ int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payloa
         LOG_ERR("RD_CAP_PARSE: NULL input pointers.");
         return -EINVAL;
     }
-    // Mandatory part is 2 octets for the summary.
     if (ie_payload_len < 2) {
-        LOG_ERR("RD_CAP_PARSE: Payload too short (%u bytes) for RD Cap IE mandatory part (2 bytes).", ie_payload_len);
+        LOG_ERR("RD_CAP_PARSE: Payload too short (%u bytes) for mandatory part (2 bytes).", ie_payload_len);
         return -EMSGSIZE;
     }
     memset(out_cap_fields, 0, sizeof(dect_mac_rd_capability_ie_t));
 
     int bit_offset = 0;
-    int remaining_bits = ie_payload_len * 8;
+    int remaining_bits_from_len = ie_payload_len * 8;
+    int *remaining_bits = &remaining_bits_from_len;
 
-    // --- Octet 0: Number of PHY Capabilities (3 MSB), Release (5 LSB) ---
-    if (remaining_bits < 8) return -EMSGSIZE; // Should be caught by ie_payload_len check
-    uint8_t octet0 = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
-    out_cap_fields->num_phy_capabilities = (octet0 >> 5) & 0x07; // N-1 value
+    // Octet 0: Number of PHY Capabilities (3 MSB), Release (5 LSB)
+    if (*remaining_bits < 8) return -EMSGSIZE;
+    uint8_t octet0 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+    out_cap_fields->num_phy_capabilities = (octet0 >> 5) & 0x07;
     out_cap_fields->release_version      = octet0 & 0x1F;
 
-    LOG_DBG("RD_CAP_PARSE: Octet0 -> NumPHYsets(N-1):%u, ReleaseVer:%u",
-            out_cap_fields->num_phy_capabilities, out_cap_fields->release_version);
-
-    // --- Octet 1: Flags ---
-    // Bit 7 (MSB): Group Assignment support
-    // Bit 6: Paging support
-    // Bit 5-4: Operating Modes
-    // Bit 3: Mesh support
-    // Bit 2: Scheduled data transfer service support
-    // Bit 1-0: MAC Security mode(s) supported
-    if (remaining_bits < 8) {
-        LOG_ERR("RD_CAP_PARSE: Payload too short for Octet 1 flags after reading Octet 0.");
-        return -EMSGSIZE;
-    }
-    uint8_t octet1 = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
+    // Octet 1: Flags
+    if (*remaining_bits < 8) { LOG_ERR("RD_CAP_PARSE: Payload too short for Octet 1 flags."); return -EMSGSIZE; }
+    uint8_t octet1 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
     out_cap_fields->supports_group_assignment = (octet1 >> 7) & 0x01;
     out_cap_fields->supports_paging           = (octet1 >> 6) & 0x01;
     out_cap_fields->operating_modes_code      = (octet1 >> 4) & 0x03;
@@ -878,53 +962,56 @@ int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payloa
     out_cap_fields->supports_sched_data       = (octet1 >> 2) & 0x01;
     out_cap_fields->mac_security_modes_code   = octet1 & 0x03;
 
-    LOG_DBG("RD_CAP_PARSE: Octet1 -> GrpAs:%d Paging:%d OpM:0x%X Mesh:%d Sched:%d MACSec:0x%X",
-            out_cap_fields->supports_group_assignment, out_cap_fields->supports_paging,
-            out_cap_fields->operating_modes_code, out_cap_fields->supports_mesh,
-            out_cap_fields->supports_sched_data, out_cap_fields->mac_security_modes_code);
+    // Conditional: First PHY Capability Set (Octets 2 to 6)
+    if (out_cap_fields->num_phy_capabilities >= 1) { // If field value is N-1, then N-1 >= 1 means N >= 2 sets total (base + >=1 explicit)
+                                                    // Or, if field value N means N explicit sets, then if >=1.
+                                                    // ETSI Table 6.4.3.5-1: "Num PHY Capabilities. (N-1)". So if value is 0, means 1 set (the base), no 5-octet parts.
+                                                    // If value is 1, means 1 additional 5-octet set.
+        if (*remaining_bits < (5 * 8)) { LOG_ERR("RD_CAP_PARSE: num_phy_cap >= 1, but not enough bits for 5-octet set."); return -EMSGSIZE; }
+        
+        dect_mac_phy_capability_set_t *phy_set0 = &out_cap_fields->phy_variants[0];
+        uint8_t phy_octet;
 
-    // --- Conditional PHY Capability Sets (Octets 2 to (1 + N*5)) ---
-    // N is the actual number of sets. num_phy_capabilities field stores (N-1).
-    // So, if num_phy_capabilities field value is X, there are X *additional* 5-octet sets.
-    // (If X=0, no additional sets beyond what's implied by summary/base PHY).
+        // Set Octet 0: DLC Svc (3b), RX Div (3b), Rsvd (2b)
+        phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        phy_set0->dlc_service_type_support_code = (phy_octet >> 5) & 0x07;
+        phy_set0->rx_for_tx_diversity_code = (phy_octet >> 2) & 0x07;
 
-    uint8_t num_additional_phy_sets = out_cap_fields->num_phy_capabilities;
-    if (num_additional_phy_sets > 0) {
-        LOG_WRN("RD_CAP_PARSE: Deserialization of %u additional PHY capability set(s) (5 octets each) is NOT YET IMPLEMENTED.",
-                num_additional_phy_sets);
+        // Set Octet 1: mu (3b), beta (4b), Rsvd (1b)
+        phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        phy_set0->mu_value = (phy_octet >> 5) & 0x07;
+        phy_set0->beta_value = (phy_octet >> 1) & 0x0F;
 
-        if (remaining_bits < (int)(num_additional_phy_sets * 5 * 8)) {
-            LOG_ERR("RD_CAP_PARSE: Payload too short for %u declared additional PHY capability sets (need %u bits, have %d).",
-                    num_additional_phy_sets, num_additional_phy_sets * 5 * 8, remaining_bits);
-            // Proceed with parsed summary, but capabilities are incomplete.
-            // Depending on strictness, could return -EMSGSIZE.
-        } else {
-            // Placeholder for loop to parse actual sets:
-            // const uint8_t *phy_set_ptr = ie_payload + (bit_offset / 8);
-            // for (int i = 0; i < num_additional_phy_sets; i++) {
-            //     // Parse 5 octets from phy_set_ptr into a struct for PHY capabilities
-            //     // e.g., out_cap_fields->phy_variants[i].dlc_service_type = (phy_set_ptr[0] >> 5) & 0x07;
-            //     // ... and so on for all fields in the 5 octets ...
-            //     phy_set_ptr += 5;
-            //     bit_offset += (5*8);
-            //     remaining_bits -= (5*8);
-            // }
-        }
+        // Set Octet 2: Max NSS (3b), Max MCS (4b), Rsvd (1b)
+        phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        phy_set0->max_nss_for_rx_code = (phy_octet >> 5) & 0x07;
+        phy_set0->max_mcs_code = (phy_octet >> 1) & 0x0F;
+
+        // Set Octet 3: HARQ Buf (4b), Num HARQ Proc (2b), Rsvd (2b)
+        phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        phy_set0->harq_soft_buffer_size_code = (phy_octet >> 4) & 0x0F;
+        phy_set0->num_harq_processes_code = (phy_octet >> 2) & 0x03;
+
+        // Set Octet 4: HARQ Delay (4b), D_Delay (1b), HalfDup (1b), Rsvd (2b)
+        phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+        phy_set0->harq_feedback_delay_code = (phy_octet >> 4) & 0x0F;
+        phy_set0->supports_dect_delay = (phy_octet >> 3) & 0x01;
+        phy_set0->supports_half_duplex = (phy_octet >> 2) & 0x01;
+
+        LOG_DBG("RD_CAP_PARSE: Parsed PHY Set 0: mu=%u, beta=%u, max_mcs=%u",
+                phy_set0->mu_value, phy_set0->beta_value, phy_set0->max_mcs_code);
     }
+    // TODO: Loop here to parse more sets if out_cap_fields->num_phy_capabilities > 1 and phy_variants was an array.
 
-    // Check if we consumed an expected number of bytes if all fields were parsed.
-    // For now, we only parsed 2 bytes.
-    int expected_bytes_parsed = 2 + (num_additional_phy_sets * 5);
-    if (ie_payload_len < (uint16_t)expected_bytes_parsed && num_additional_phy_sets > 0) {
-        // This warning was already covered by remaining_bits check if it's critical.
-    } else if ( (bit_offset / 8) != expected_bytes_parsed && num_additional_phy_sets > 0) {
-        // Only log if we intended to parse more but didn't align.
-        // If only summary is parsed, bit_offset/8 will be 2.
-    }
+    if (*remaining_bits >= 8) { /* Log warning about unparsed data */ }
+    else if (*remaining_bits > 0) { /* Log warning about unparsed bits */ }
 
-
-    return 0; // Success for parsing the summary part
+    return 0;
 }
+
+
+
+
 
 
 /**
@@ -939,6 +1026,7 @@ int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payloa
  * @return Length of the serialized payload in bytes (1 if ACK and no optionals, 2 if NACK),
  *         or negative error code.
  */
+
 int serialize_assoc_resp_ie_payload(uint8_t *buf, size_t buf_max_len,
                                       const dect_mac_assoc_resp_ie_t *resp_fields)
 {
@@ -946,88 +1034,104 @@ int serialize_assoc_resp_ie_payload(uint8_t *buf, size_t buf_max_len,
         LOG_ERR("ASSOC_RESP_SER: NULL input pointers.");
         return -EINVAL;
     }
-    // Mandatory part is 1 octet. If NACK, it's 2 octets.
-    if (buf_max_len < 1) {
-        LOG_ERR("ASSOC_RESP_SER: Buffer too small (%zu bytes) for Assoc Resp IE mandatory part (1 byte).", buf_max_len);
-        return -ENOMEM;
-    }
-    if (!resp_fields->ack_nack && buf_max_len < 2) {
-        LOG_ERR("ASSOC_RESP_SER: Buffer too small (%zu bytes) for NACK response (needs 2 bytes).", buf_max_len);
+    // Min 1 octet (ACK with no optionals) or 2 octets (NACK).
+    size_t min_len_needed = resp_fields->ack_nack ? 1 : 2;
+    if (buf_max_len < min_len_needed) {
+        LOG_ERR("ASSOC_RESP_SER: Buffer too small (%zu bytes) for min Assoc Resp IE (needs %zu).", buf_max_len, min_len_needed);
         return -ENOMEM;
     }
 
-
-    memset(buf, 0, buf_max_len); // Initialize buffer, ensures reserved bits are 0
+    memset(buf, 0, buf_max_len);
     int bit_offset = 0;
     int ret;
 
     // --- Octet 0: Flags and Basic Info ---
-    // Bit 7 (MSB): ACK/NACK (1=ACK, 0=NACK)
-    // Bit 6: HARQ mod present (0=HARQ params not present/accepted as is, 1=HARQ params follow)
-    // Bit 5-3: Number of Flows accepted/indicated (000-110 for 0-6 flows, 111=all flows accepted)
-    // Bit 2: Group (0=Group ID/Tag not present, 1=present)
-    // Bit 1-0: Reserved (set to 0)
-
     uint8_t octet0 = 0;
-
     WRITE_BIT(octet0, 7, resp_fields->ack_nack);
-    WRITE_BIT(octet0, 6, resp_fields->harq_mod_present); // this is usually false
-
+    WRITE_BIT(octet0, 6, resp_fields->harq_mod_present);
     if (resp_fields->number_of_flows_accepted > 0x07) {
-        LOG_WRN("ASSOC_RESP_SER: Number of flows accepted %u exceeds 3-bit field. Clamping to 7 (all).", resp_fields->number_of_flows_accepted);
+        LOG_WRN("ASSOC_RESP_SER: NumFlowsAccepted %u invalid. Clamping to 7 (all).", resp_fields->number_of_flows_accepted);
         octet0 |= (0x07 << 3);
     } else {
         octet0 |= ((resp_fields->number_of_flows_accepted & 0x07) << 3);
     }
-
-    WRITE_BIT(octet0, 2, resp_fields->group_assignment_active); // usually false
-
-    // Bits 1-0 are reserved and should be 0 (achieved by initial memset and not setting them)
-    // octet0 |= (resp_fields->reserved_2bits & 0x03); // If reserved_2bits was a field
+    WRITE_BIT(octet0, 2, resp_fields->group_assignment_active);
+    // Bits 1-0 are reserved, implicitly 0 by memset then explicit ORing of higher bits.
+    // Or, if resp_fields->reserved_3bits was used, it should be (resp_fields->reserved_3bits & 0x03)
+    // For ETSI text (bits 1-0 reserved):
+    // octet0 |= (0 & 0x03); // Explicitly setting reserved bits 1-0 to 0.
 
     ret = write_bits(buf, buf_max_len, bit_offset, octet0, 8);
-    if (ret < 0) { LOG_ERR("ASSOC_RESP_SER: Failed to write octet0: %d", ret); return ret; }
+    if (ret < 0) { LOG_ERR("ASSOC_RESP_SER: Write octet0 failed: %d", ret); return ret; }
     bit_offset = ret;
 
-    // --- Conditional Octet 1 (Only if NACK, i.e., ack_nack = 0) ---
+    // --- Conditional: Reject Cause & Timer (Octet 1, if NACK) ---
     if (!resp_fields->ack_nack) {
-        // Octet 1: Reject Timer (4 MSBs), Reject Cause (4 LSBs)
-        if (((bit_offset / 8) + 1) > buf_max_len) { // Check if space for 1 more byte
-             LOG_ERR("ASSOC_RESP_SER: Buffer too small for NACK details octet.");
-             return -ENOMEM;
-        }
-        if (resp_fields->reject_timer_code > 0x0F) {
-            LOG_WRN("ASSOC_RESP_SER: reject_timer_code %u exceeds 4-bit field. Clamping.", resp_fields->reject_timer_code);
-        }
-        if (resp_fields->reject_cause > 0x0F) { // dect_assoc_reject_cause_t should be < 16
-            LOG_WRN("ASSOC_RESP_SER: reject_cause %u exceeds 4-bit field. Clamping.", resp_fields->reject_cause);
+        if (((bit_offset / 8) + 1) > buf_max_len) { LOG_ERR("ASSOC_RESP_SER: No space for NACK details."); return -ENOMEM; }
+        uint8_t octet1_reject = 0;
+        if (resp_fields->reject_timer_code > 0x0F) LOG_WRN("ASSOC_RESP_SER: RejectTimerCode %u > 4bit. Clamping.", resp_fields->reject_timer_code);
+        if (resp_fields->reject_cause >= 8) LOG_WRN("ASSOC_RESP_SER: RejectCause %u invalid. Clamping.", resp_fields->reject_cause); // Assuming enum 0-7 for cause
+
+        octet1_reject |= (resp_fields->reject_timer_code & 0x0F) << 4;
+        octet1_reject |= (resp_fields->reject_cause & 0x0F); // Assuming cause is also 4 bits effectively
+        ret = write_bits(buf, buf_max_len, bit_offset, octet1_reject, 8);
+        if (ret < 0) { LOG_ERR("ASSOC_RESP_SER: Write reject octet1 failed: %d", ret); return ret; }
+        bit_offset = ret;
+    } else { // --- Conditional fields for ACK ---
+        // --- HARQ Parameters (Octets 2 & 3, if ack_nack = 1 AND harq_mod_present = 1) ---
+        if (resp_fields->harq_mod_present) {
+            if (((bit_offset / 8) + 2) > buf_max_len) { LOG_ERR("ASSOC_RESP_SER: No space for HARQ params."); return -ENOMEM; }
+            uint8_t octet_harq_tx = ((resp_fields->harq_processes_tx_val_ft & 0x07) << 5) |
+                                    (resp_fields->max_harq_re_tx_delay_code_ft & 0x1F);
+            ret = write_bits(buf, buf_max_len, bit_offset, octet_harq_tx, 8);
+            if (ret < 0) { LOG_ERR("ASSOC_RESP_SER: Write HARQ TX Octet failed: %d", ret); return ret; }
+            bit_offset = ret;
+
+            uint8_t octet_harq_rx = ((resp_fields->harq_processes_rx_val_ft & 0x07) << 5) |
+                                    (resp_fields->max_harq_re_rx_delay_code_ft & 0x1F);
+            ret = write_bits(buf, buf_max_len, bit_offset, octet_harq_rx, 8);
+            if (ret < 0) { LOG_ERR("ASSOC_RESP_SER: Write HARQ RX Octet failed: %d", ret); return ret; }
+            bit_offset = ret;
         }
 
-        uint8_t octet1_reject = ((resp_fields->reject_timer_code & 0x0F) << 4) |
-                                  (resp_fields->reject_cause & 0x0F);
-        ret = write_bits(buf, buf_max_len, bit_offset, octet1_reject, 8);
-        if (ret < 0) { LOG_ERR("ASSOC_RESP_SER: Failed to write reject octet1: %d", ret); return ret; }
-        bit_offset = ret;
-    } else { // ACK path
-        // --- Conditional Fields for ACK (ETSI Table 6.4.2.5-1) ---
-        // These are TODO for full implementation.
-        if (resp_fields->harq_mod_present) {
-            LOG_WRN("ASSOC_RESP_SER: HARQ Modification parameters present but NOT YET SERIALIZED.");
-            // Serialize 2 octets for HARQ params
+        // --- Accepted Flow IDs (Variable length, if number_of_flows_accepted is 1-6) ---
+        uint8_t num_flows_to_list_resp = (resp_fields->number_of_flows_accepted <= MAX_FLOW_IDS_IN_ASSOC_REQ) ? resp_fields->number_of_flows_accepted : 0;
+        if (num_flows_to_list_resp > 0) {
+            if (((bit_offset + (num_flows_to_list_resp * 6) - 1) / 8) >= buf_max_len) { LOG_ERR("ASSOC_RESP_SER: No space for Flow IDs."); return -ENOMEM; }
+            for (int i = 0; i < num_flows_to_list_resp; i++) {
+                if (resp_fields->accepted_flow_ids[i] > 0x3F) { LOG_WRN("ASSOC_RESP_SER: AcceptedFlowID %u > 6-bit. Clamping.", resp_fields->accepted_flow_ids[i]); }
+                ret = write_bits(buf, buf_max_len, bit_offset, resp_fields->accepted_flow_ids[i] & 0x3F, 6);
+                if (ret < 0) { LOG_ERR("ASSOC_RESP_SER: Write AcceptedFlowID %d failed: %d", i, ret); return ret; }
+                bit_offset = ret;
+            }
+            if (bit_offset % 8 != 0) { // Pad to next octet boundary
+                int padding_bits = 8 - (bit_offset % 8);
+                ret = write_bits(buf, buf_max_len, bit_offset, 0, (uint8_t)padding_bits);
+                if (ret < 0) { LOG_ERR("ASSOC_RESP_SER: FlowID padding failed: %d", ret); return ret; }
+                bit_offset = ret;
+            }
         }
-        if (resp_fields->number_of_flows_accepted < 0x07 && resp_fields->number_of_flows_accepted > 0) {
-            LOG_WRN("ASSOC_RESP_SER: List of %u accepted Flow IDs NOT YET SERIALIZED.", resp_fields->number_of_flows_accepted);
-            // Serialize (N * 6 bits) for Flow IDs, padded to octet boundary.
-        }
+
+        // --- Group ID & Resource Tag (2 octets, if group_assignment_active = 1) ---
         if (resp_fields->group_assignment_active) {
-            LOG_WRN("ASSOC_RESP_SER: Group ID and Resource Tag present but NOT YET SERIALIZED.");
-            // Serialize 2 octets for Group ID and Resource Tag.
+            if (((bit_offset / 8) + 2) > buf_max_len) { LOG_ERR("ASSOC_RESP_SER: No space for GroupID/ResTag."); return -ENOMEM; }
+            // Group ID: 7 MSB, 1 LSB Reserved
+            uint8_t group_id_octet = (resp_fields->group_id_val & 0x7F) << 1;
+            ret = write_bits(buf, buf_max_len, bit_offset, group_id_octet, 8);
+            if (ret < 0) { LOG_ERR("ASSOC_RESP_SER: Write GroupID failed: %d", ret); return ret; }
+            bit_offset = ret;
+
+            // Resource Tag: 7 MSB, 1 LSB Reserved
+            uint8_t res_tag_octet = (resp_fields->resource_tag_val & 0x7F) << 1;
+            ret = write_bits(buf, buf_max_len, bit_offset, res_tag_octet, 8);
+            if (ret < 0) { LOG_ERR("ASSOC_RESP_SER: Write ResourceTag failed: %d", ret); return ret; }
+            bit_offset = ret;
         }
     }
-
-    // Return length in bytes
-    return (bit_offset + 7) / 8;
+    return (bit_offset + 7) / 8; // Total bytes written
 }
+
+
 
 /**
  * @brief Deserializes the payload of an Association Response IE.
@@ -1040,6 +1144,7 @@ int serialize_assoc_resp_ie_payload(uint8_t *buf, size_t buf_max_len,
  * @param out_resp_fields Pointer to the structure to store the deserialized fields.
  * @return 0 on success, or a negative error code on failure (e.g., -EMSGSIZE if payload too short).
  */
+
 int parse_assoc_resp_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_len,
                                 dect_mac_assoc_resp_ie_t *out_resp_fields)
 {
@@ -1047,80 +1152,82 @@ int parse_assoc_resp_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_l
         LOG_ERR("ASSOC_RESP_PARSE: NULL input pointers.");
         return -EINVAL;
     }
-    // Mandatory part is at least 1 octet.
     if (ie_payload_len < 1) {
-        LOG_ERR("ASSOC_RESP_PARSE: Payload too short (%u bytes) for Assoc Resp IE base (min 1 byte).", ie_payload_len);
+        LOG_ERR("ASSOC_RESP_PARSE: Payload too short (%u bytes) for mandatory part (1 byte).", ie_payload_len);
         return -EMSGSIZE;
     }
     memset(out_resp_fields, 0, sizeof(dect_mac_assoc_resp_ie_t));
 
     int bit_offset = 0;
-    int remaining_bits = ie_payload_len * 8;
+    int remaining_bits_from_len = ie_payload_len * 8;
+    int *remaining_bits = &remaining_bits_from_len;
 
-    // --- Octet 0: Flags and Basic Info ---
-    // Bit 7 (MSB): ACK/NACK (1=ACK, 0=NACK)
-    // Bit 6: HARQ mod present
-    // Bit 5-3: Number of Flows accepted/indicated
-    // Bit 2: Group
-    // Bit 1-0: Reserved
-    if (remaining_bits < 8) return -EMSGSIZE; // Should be caught by ie_payload_len check
-    uint8_t octet0 = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
-
+    // Octet 0: Flags and Basic Info
+    if (*remaining_bits < 8) return -EMSGSIZE;
+    uint8_t octet0 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
     out_resp_fields->ack_nack                 = (octet0 >> 7) & 0x01;
     out_resp_fields->harq_mod_present         = (octet0 >> 6) & 0x01;
     out_resp_fields->number_of_flows_accepted = (octet0 >> 3) & 0x07;
     out_resp_fields->group_assignment_active  = (octet0 >> 2) & 0x01;
-    out_resp_fields->reserved_3bits           = octet0 & 0x03; // Store reserved bits (bits 1-0 of octet 0)
+    out_resp_fields->reserved_3bits           = octet0 & 0x03; // Store actual reserved bits (0-1 or 0-2 depending on interpretation)
 
-    LOG_DBG("ASSOC_RESP_PARSE: Parsed Octet0 -> ACK:%d, HARQMod:%d, NumFlowsAcc:%d, GroupAct:%d, Rsvd:%u",
-            out_resp_fields->ack_nack, out_resp_fields->harq_mod_present,
-            out_resp_fields->number_of_flows_accepted, out_resp_fields->group_assignment_active,
-            out_resp_fields->reserved_3bits);
-
-
-    // --- Conditional Octet 1 (Only if NACK, i.e., ack_nack = 0) ---
+    // Conditional: Reject Cause & Timer (Octet 1, if NACK)
     if (!out_resp_fields->ack_nack) {
-        // Octet 1: Reject Timer (4 MSBs), Reject Cause (4 LSBs)
-        if (remaining_bits < 8) {
-            LOG_ERR("ASSOC_RESP_PARSE: NACK indicated, but payload too short for reject cause/timer octet (need %d more bits).", 8 - remaining_bits);
+        if (*remaining_bits < 8) {
+            LOG_ERR("ASSOC_RESP_PARSE: NACK, but not enough bits for Reject Cause/Timer octet.");
             return -EMSGSIZE;
         }
-        uint8_t octet1_reject = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 8);
+        uint8_t octet1_reject = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
         out_resp_fields->reject_timer_code = (octet1_reject >> 4) & 0x0F;
         out_resp_fields->reject_cause      = (dect_assoc_reject_cause_t)(octet1_reject & 0x0F);
-        LOG_INF("ASSOC_RESP_PARSE: NACK details -> RejectCause: %u, RejectTimerCode: %u",
-                out_resp_fields->reject_cause, out_resp_fields->reject_timer_code);
-    } else { // ACK path
-        // --- Conditional Fields for ACK (ETSI Table 6.4.2.5-1) ---
-        // These are TODO for full implementation.
-        // The parser needs to check flags (harq_mod_present, group_assignment_active)
-        // and number_of_flows_accepted to determine if these fields are present.
-
+    } else { // Conditional fields for ACK
+        // HARQ Parameters (Octets 2 & 3, if harq_mod_present = 1)
         if (out_resp_fields->harq_mod_present) {
-            LOG_WRN("ASSOC_RESP_PARSE: ACK with HARQ Modification parameters present but NOT YET PARSED (remaining %d bits).", remaining_bits);
-            // TODO: Parse 2 octets for HARQ params if remaining_bits >= 16
-            // bit_offset = read_bits_adv(ie_payload, &bit_offset, &remaining_bits, 16); // Example
+            if (*remaining_bits < 16) { LOG_ERR("ASSOC_RESP_PARSE: harq_mod_present, but not enough bits for HARQ params."); return -EMSGSIZE; }
+            uint8_t octet_harq_tx = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+            out_resp_fields->harq_processes_tx_val_ft = (octet_harq_tx >> 5) & 0x07;
+            out_resp_fields->max_harq_re_tx_delay_code_ft = octet_harq_tx & 0x1F;
+
+            uint8_t octet_harq_rx = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+            out_resp_fields->harq_processes_rx_val_ft = (octet_harq_rx >> 5) & 0x07;
+            out_resp_fields->max_harq_re_rx_delay_code_ft = octet_harq_rx & 0x1F;
         }
-        if (out_resp_fields->number_of_flows_accepted < 0x07 && out_resp_fields->number_of_flows_accepted > 0) {
-            LOG_WRN("ASSOC_RESP_PARSE: ACK with %u accepted Flow IDs indicated but NOT YET PARSED (remaining %d bits).",
-                    out_resp_fields->number_of_flows_accepted, remaining_bits);
-            // TODO: Parse (N * 6 bits) for Flow IDs, handling padding.
+
+        // Accepted Flow IDs (Variable length, if number_of_flows_accepted is 1-6)
+        uint8_t num_flows_to_parse_resp = (out_resp_fields->number_of_flows_accepted <= MAX_FLOW_IDS_IN_ASSOC_REQ) ? out_resp_fields->number_of_flows_accepted : 0;
+        if (num_flows_to_parse_resp > 0) {
+            if (*remaining_bits < (num_flows_to_parse_resp * 6)) { LOG_ERR("ASSOC_RESP_PARSE: Not enough bits for %u AcceptedFlowIDs.", num_flows_to_parse_resp); return -EMSGSIZE; }
+            for (int i = 0; i < num_flows_to_parse_resp; i++) {
+                out_resp_fields->accepted_flow_ids[i] = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 6);
+            }
+            if (bit_offset % 8 != 0) { // Consume padding bits
+                int padding_to_read = 8 - (bit_offset % 8);
+                if (*remaining_bits < padding_to_read) { /* Error */ return -EMSGSIZE; }
+                read_bits_adv(ie_payload, &bit_offset, remaining_bits, (uint8_t)padding_to_read);
+            }
         }
+
+        // Group ID & Resource Tag (2 octets, if group_assignment_active = 1)
         if (out_resp_fields->group_assignment_active) {
-            LOG_WRN("ASSOC_RESP_PARSE: ACK with Group ID and Resource Tag present but NOT YET PARSED (remaining %d bits).", remaining_bits);
-            // TODO: Parse 2 octets for Group ID and Resource Tag if remaining_bits >= 16
+            if (*remaining_bits < 16) { LOG_ERR("ASSOC_RESP_PARSE: group_assignment_active, but not enough bits for GroupID/ResTag."); return -EMSGSIZE; }
+            uint8_t group_id_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+            out_resp_fields->group_id_val = (group_id_octet >> 1) & 0x7F; // 7 MSBs
+
+            uint8_t res_tag_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
+            out_resp_fields->resource_tag_val = (res_tag_octet >> 1) & 0x7F; // 7 MSBs
         }
     }
 
-    // Check if we consumed roughly what was expected.
-    // This is difficult without parsing all conditional fields.
-    if (remaining_bits >= 8) { // If a full byte or more remains after parsing known fields
-        LOG_WRN("ASSOC_RESP_PARSE: %d unparsed bits (>=1 byte) remain at the end of Assoc Resp IE payload (len %u). Potentially unparsed conditional fields or error.",
-                remaining_bits, ie_payload_len);
+    if (*remaining_bits >= 8) {
+        LOG_WRN("ASSOC_RESP_PARSE: %d unparsed bits (>=1 byte) remain. Payload len %u.", *remaining_bits, ie_payload_len);
+    } else if (*remaining_bits > 0) {
+        LOG_WRN("ASSOC_RESP_PARSE: %d unparsed bits remain (padding or error). Payload len %u.", *remaining_bits, ie_payload_len);
     }
-
-    return 0; // Success for parsing the parts implemented
+    return 0;
 }
+
+
+
 
 /**
  * @brief Serializes the payload of a Resource Allocation IE.
@@ -1133,6 +1240,7 @@ int parse_assoc_resp_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_l
  *                  target link's 'mu' value if 9-bit start_subslot is intended.
  * @return Length of the serialized payload in bytes, or negative error code.
  */
+
 int serialize_resource_alloc_ie_payload(uint8_t *buf, size_t buf_max_len,
                                           const dect_mac_resource_alloc_ie_fields_t *ra_fields)
 {
@@ -1141,67 +1249,56 @@ int serialize_resource_alloc_ie_payload(uint8_t *buf, size_t buf_max_len,
         return -EINVAL;
     }
 
-    size_t min_len_check = 1; // Min is 1 byte for RELEASE_ALL
+    size_t min_len_check = 1; 
+    uint8_t res1_start_subslot_num_bits = 0; 
+
     if (ra_fields->alloc_type_val != RES_ALLOC_TYPE_RELEASE_ALL) {
-        // If not RELEASE_ALL, bitmap octet 1 + Res1 fields (2 octets if 8-bit start_subslot) are mandatory
-        min_len_check = 1 + 1 + 2; // Bitmap0 + Bitmap1 + Res1_fields
+        res1_start_subslot_num_bits = ra_fields->res1_is_9bit_subslot ? 9 : 8;
+        min_len_check = 1 + 1 + ((res1_start_subslot_num_bits + 1 + 7 + 7) / 8); // BMP0(1)+BMP1(1)+Res1_fields(2 or 3)
+        if (ra_fields->alloc_type_val == RES_ALLOC_TYPE_BIDIR) {
+             uint8_t res2_start_subslot_num_bits = ra_fields->res2_is_9bit_subslot ? 9 : 8;
+             min_len_check += ((res2_start_subslot_num_bits + 1 + 7 + 7) / 8); // Add Res2_fields(2 or 3)
+        }
     }
     if (buf_max_len < min_len_check) {
-         LOG_ERR("RA_SER: buf_max_len %zu too small for min ResAlloc IE (expected ~%zu).", buf_max_len, min_len_check);
+         LOG_ERR("RA_SER: buf_max_len %zu too small for ResAlloc IE (expected min ~%zu).", buf_max_len, min_len_check);
          return -ENOMEM;
     }
 
-    memset(buf, 0, buf_max_len); // Initialize buffer (sets reserved bits to 0)
+    memset(buf, 0, buf_max_len);
     int bit_offset = 0;
     int ret;
 
-    // --- Octet 0 of Bitmap (Always present) ---
-    // Bits 7-6 (MSB side): Alloc Type (ra_fields->alloc_type_val)
-    // Bit 5: Add (ra_fields->add_allocation)
-    // Bit 4: ID (ra_fields->id_present)
-    // Bits 3-1: Repeat (ra_fields->repeat_val)
-    // Bit 0 (LSB): SFN (ra_fields->sfn_present)
+    // Octet 0 of Bitmap
     uint8_t bitmap_octet0 = 0;
     bitmap_octet0 |= ((uint8_t)ra_fields->alloc_type_val & 0x03) << 6;
     WRITE_BIT(bitmap_octet0, 5, ra_fields->add_allocation);
     WRITE_BIT(bitmap_octet0, 4, ra_fields->id_present);
     bitmap_octet0 |= ((uint8_t)ra_fields->repeat_val & 0x07) << 1;
     WRITE_BIT(bitmap_octet0, 0, ra_fields->sfn_present);
-
     ret = write_bits(buf, buf_max_len, bit_offset, bitmap_octet0, 8);
     if (ret < 0) { LOG_ERR("RA_SER: Write Bitmap0 failed: %d", ret); return ret; }
     bit_offset = ret;
 
-    // If Alloc Type is RELEASE_ALL, no more fields are present.
     if (ra_fields->alloc_type_val == RES_ALLOC_TYPE_RELEASE_ALL) {
-        return (bit_offset + 7) / 8; // Should be 1 byte
+        return (bit_offset + 7) / 8;
     }
 
-    // --- Octet 1 of Bitmap (Present if not RELEASE_ALL) ---
-    // Bit 7: Channel (ra_fields->channel_present)
-    // Bit 6: RLF (ra_fields->rlf_present)
-    // Bits 5-0: Start subslot (MS 6 bits IF Res1 Start Subslot is 9-bit AND this bitmap format is used for it)
-    //           OR Reserved (if Res1 Start Subslot is 8-bit, or fewer than 6 MSBs needed).
-    // ETSI Figure 6.4.3.3-1 is a bit ambiguous on how the 9-bit start_subslot's MSBs are split
-    // if other flags (Channel, RLF) are also in this octet.
-    // For simplicity and more standard packing: Assume if Res1 Start Subslot is 9-bit,
-    // those 9 bits are packed contiguously *after* the full 2-octet bitmap.
-    // Thus, bits 5-0 of Bitmap Octet 1 are RESERVED here.
+    // Octet 1 of Bitmap
     uint8_t bitmap_octet1 = 0;
     WRITE_BIT(bitmap_octet1, 7, ra_fields->channel_present);
     WRITE_BIT(bitmap_octet1, 6, ra_fields->rlf_present);
-    // Bits 5-0 are reserved, set to 0 by memset.
-
+    // Bits 5-0 are reserved
     ret = write_bits(buf, buf_max_len, bit_offset, bitmap_octet1, 8);
     if (ret < 0) { LOG_ERR("RA_SER: Write Bitmap1 failed: %d", ret); return ret; }
     bit_offset = ret;
 
-
-    // --- Resource 1 Fields (Start Subslot, Length Type, Length) ---
-    // Total 2 octets if Start Subslot is 8-bit.
-    // If Start Subslot is 9-bit, then 9+1+7 = 17 bits, requiring careful packing or an extra byte.
-    uint8_t res1_start_subslot_num_bits = ra_fields->res1_is_9bit_subslot ? 9 : 8;
-
+    // Resource 1 Fields
+    // res1_start_subslot_num_bits was determined above based on ra_fields->res1_is_9bit_subslot
+    if (ra_fields->start_subslot_val_res1 >= (1U << res1_start_subslot_num_bits)) {
+        LOG_WRN("RA_SER: Res1 StartSS %u too large for %u bits. Truncating.",
+                ra_fields->start_subslot_val_res1, res1_start_subslot_num_bits);
+    }
     ret = write_bits(buf, buf_max_len, bit_offset, ra_fields->start_subslot_val_res1, res1_start_subslot_num_bits);
     if (ret < 0) { LOG_ERR("RA_SER: Write Res1 StartSS failed: %d", ret); return ret; }
     bit_offset = ret;
@@ -1210,20 +1307,18 @@ int serialize_resource_alloc_ie_payload(uint8_t *buf, size_t buf_max_len,
     if (ret < 0) { LOG_ERR("RA_SER: Write Res1 LenType failed: %d", ret); return ret; }
     bit_offset = ret;
 
-    if ((ra_fields->length_val_res1 +1) == 0 || (ra_fields->length_val_res1 +1) > 128) { // length_val is N-1, actual length is val+1. Max 7 bits for val.
-         LOG_ERR("RA_SER: Invalid Res1 Length value (N-1): %u", ra_fields->length_val_res1); return -EINVAL;
-    }
+    if (ra_fields->length_val_res1 > 0x7F) { LOG_WRN("RA_SER: Res1 LenVal %u > 7-bit. Clamping.", ra_fields->length_val_res1); }
     ret = write_bits(buf, buf_max_len, bit_offset, ra_fields->length_val_res1 & 0x7F, 7);
     if (ret < 0) { LOG_ERR("RA_SER: Write Res1 Length failed: %d", ret); return ret; }
     bit_offset = ret;
 
-    // After Res1 fields: (8+1+7 = 16 bits) or (9+1+7 = 17 bits)
-    // If 17 bits, bit_offset is not byte aligned. The write_bits helper handles internal byte progression.
-
-    // --- Resource 2 Fields (if alloc_type is BIDIR) ---
+    // Resource 2 Fields (if alloc_type is BIDIR)
     if (ra_fields->alloc_type_val == RES_ALLOC_TYPE_BIDIR) {
         uint8_t res2_start_subslot_num_bits = ra_fields->res2_is_9bit_subslot ? 9 : 8;
-
+        if (ra_fields->start_subslot_val_res2 >= (1U << res2_start_subslot_num_bits)) {
+            LOG_WRN("RA_SER: Res2 StartSS %u too large for %u bits. Truncating.",
+                    ra_fields->start_subslot_val_res2, res2_start_subslot_num_bits);
+        }
         ret = write_bits(buf, buf_max_len, bit_offset, ra_fields->start_subslot_val_res2, res2_start_subslot_num_bits);
         if (ret < 0) { LOG_ERR("RA_SER: Write Res2 StartSS failed: %d", ret); return ret; }
         bit_offset = ret;
@@ -1232,25 +1327,23 @@ int serialize_resource_alloc_ie_payload(uint8_t *buf, size_t buf_max_len,
         if (ret < 0) { LOG_ERR("RA_SER: Write Res2 LenType failed: %d", ret); return ret; }
         bit_offset = ret;
 
-        if ((ra_fields->length_val_res2 +1) == 0 || (ra_fields->length_val_res2+1) > 128) {
-             LOG_ERR("RA_SER: Invalid Res2 Length value (N-1): %u", ra_fields->length_val_res2); return -EINVAL;
-        }
+        if (ra_fields->length_val_res2 > 0x7F) { LOG_WRN("RA_SER: Res2 LenVal %u > 7-bit. Clamping.", ra_fields->length_val_res2); }
         ret = write_bits(buf, buf_max_len, bit_offset, ra_fields->length_val_res2 & 0x7F, 7);
         if (ret < 0) { LOG_ERR("RA_SER: Write Res2 Length failed: %d", ret); return ret; }
         bit_offset = ret;
     }
 
-    // --- Optional Fields based on Bitmap (these must follow byte alignment after packed bitfields) ---
-    // Ensure byte alignment for the following fields if they are present.
+    // Byte alignment padding before optional octet-aligned fields
     if (bit_offset % 8 != 0) {
         int padding_bits = 8 - (bit_offset % 8);
-        LOG_DBG("RA_SER: Padding %d bits to byte align before optional fields (current offset %d).", padding_bits, bit_offset);
-        ret = write_bits(buf, buf_max_len, bit_offset, 0, (uint8_t)padding_bits); // Pad with 0s
+        ret = write_bits(buf, buf_max_len, bit_offset, 0, (uint8_t)padding_bits);
         if (ret < 0) { LOG_ERR("RA_SER: Padding failed: %d", ret); return ret; }
         bit_offset = ret;
     }
 
-    uint8_t *current_byte_ptr = buf + (bit_offset / 8); // Start of byte-aligned optional fields
+    // --- Optional Fields (Byte Aligned) ---
+    // Ensure buffer pointers and lengths are managed correctly from here.
+    uint8_t *current_byte_ptr = buf + (bit_offset / 8);
     size_t remaining_byte_buf_len = buf_max_len - (bit_offset / 8);
 
     if (ra_fields->id_present) {
@@ -1261,8 +1354,8 @@ int serialize_resource_alloc_ie_payload(uint8_t *buf, size_t buf_max_len,
 
     if (ra_fields->repeat_val != RES_ALLOC_REPEAT_SINGLE) {
         if (remaining_byte_buf_len < 2) { LOG_ERR("RA_SER: No space for Repetition/Validity"); return -ENOMEM; }
-        *current_byte_ptr++ = ra_fields->repetition_value; // Actual value (e.g. 1 for next, 2 for every 2nd)
-        *current_byte_ptr++ = ra_fields->validity_value;   // 0xFF for permanent
+        *current_byte_ptr++ = ra_fields->repetition_value;
+        *current_byte_ptr++ = ra_fields->validity_value;
         remaining_byte_buf_len -= 2; bit_offset += 16;
     }
 
@@ -1274,7 +1367,6 @@ int serialize_resource_alloc_ie_payload(uint8_t *buf, size_t buf_max_len,
 
     if (ra_fields->channel_present) {
         if (remaining_byte_buf_len < 2) { LOG_ERR("RA_SER: No space for Channel value"); return -ENOMEM; }
-        // Channel is 13 bits (MSB), Reserved 3 LSBs
         uint16_t chan_field_on_air = (ra_fields->channel_val & 0x1FFF) << 3;
         sys_put_be16(chan_field_on_air, current_byte_ptr);
         current_byte_ptr += 2; remaining_byte_buf_len -= 2; bit_offset += 16;
@@ -1282,13 +1374,14 @@ int serialize_resource_alloc_ie_payload(uint8_t *buf, size_t buf_max_len,
 
     if (ra_fields->rlf_present) {
         if (remaining_byte_buf_len < 1) { LOG_ERR("RA_SER: No space for RLF value"); return -ENOMEM; }
-        // dectScheduledResourceFailure timer code (4 MSBs), Reserved (4 LSBs)
         *current_byte_ptr++ = (ra_fields->dect_sched_res_fail_timer_code & 0x0F) << 4;
-        remaining_byte_buf_len -= 1; bit_offset += 8;
+        // remaining_byte_buf_len -= 1; // This was missing, but current_byte_ptr advanced
+        bit_offset += 8;
     }
 
     return (bit_offset + 7) / 8; // Total bytes written
 }
+
 
 /**
  * @brief Deserializes the payload of a Resource Allocation IE.
@@ -1302,24 +1395,34 @@ int serialize_resource_alloc_ie_payload(uint8_t *buf, size_t buf_max_len,
  *                      unless specific bitmap encoding for 9-bit MSBs were implemented and detected.
  * @return 0 on success, or a negative error code on failure (e.g., -EMSGSIZE if payload too short).
  */
+
+
 int parse_resource_alloc_ie_payload(const uint8_t *ie_payload, uint16_t ie_payload_len,
+                                    uint8_t link_mu_value, /* New parameter */
                                     dect_mac_resource_alloc_ie_fields_t *out_ra_fields)
 {
     if (!ie_payload || !out_ra_fields) {
         LOG_ERR("RA_PARSE: NULL input pointers.");
         return -EINVAL;
     }
-    if (ie_payload_len < 1) { // Min 1 byte for RELEASE_ALL
+    if (ie_payload_len < 1) {
         LOG_ERR("RA_PARSE: Payload too short (%u bytes) for Res Alloc IE base.", ie_payload_len);
         return -EMSGSIZE;
     }
+    if (link_mu_value == 0 || link_mu_value > 8) {
+        LOG_WRN("RA_PARSE: Invalid link_mu_value: %u. Assuming mu <= 4 for 8-bit start_subslot.", link_mu_value);
+        link_mu_value = (link_mu_value == 0) ? 1 : (link_mu_value > 8 ? 1 : link_mu_value); // Sanitize
+    }
+
     memset(out_ra_fields, 0, sizeof(dect_mac_resource_alloc_ie_fields_t));
+    out_ra_fields->res1_is_9bit_subslot = (link_mu_value > 4); // True if mu > 4
+    out_ra_fields->res2_is_9bit_subslot = (link_mu_value > 4); // True if mu > 4
 
     int bit_offset = 0;
     int remaining_bits_from_len = ie_payload_len * 8;
-    int *remaining_bits = &remaining_bits_from_len; // Use pointer for read_bits_adv
+    int *remaining_bits = &remaining_bits_from_len;
 
-    // --- Octet 0 of Bitmap ---
+    // Octet 0 of Bitmap
     if (*remaining_bits < 8) return -EMSGSIZE;
     uint8_t bitmap_octet0 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
     out_ra_fields->alloc_type_val   = (dect_alloc_type_t)((bitmap_octet0 >> 6) & 0x03);
@@ -1336,113 +1439,91 @@ int parse_resource_alloc_ie_payload(const uint8_t *ie_payload, uint16_t ie_paylo
         if (ie_payload_len != 1) {
             LOG_WRN("RA_PARSE: AllocType RELEASE_ALL but payload len is %u bytes (expected 1).", ie_payload_len);
         }
-        return 0; // No more fields
+        return 0;
     }
 
-    // Minimum length for non-RELEASE_ALL is 1 (bmp0) + 1 (bmp1) + 2 (Res1 fields) = 4 bytes
-    if (ie_payload_len < 4 && !(out_ra_fields->res1_is_9bit_subslot && ie_payload_len <3 )) { // 9-bit with no Res2 might be 3 bytes + padding byte
-         LOG_ERR("RA_PARSE: Payload too short (%u bytes) for non-RELEASE_ALL ResAlloc IE (min ~3-4 bytes).", ie_payload_len);
+    uint8_t res1_ss_bits = out_ra_fields->res1_is_9bit_subslot ? 9 : 8;
+    int min_bits_needed_after_bmp0 = 8 + res1_ss_bits + 1 + 7; // BMP1 + Res1 fields
+    if (out_ra_fields->alloc_type_val == RES_ALLOC_TYPE_BIDIR) {
+        uint8_t res2_ss_bits = out_ra_fields->res2_is_9bit_subslot ? 9 : 8;
+        min_bits_needed_after_bmp0 += (res2_ss_bits + 1 + 7);
+    }
+    if (*remaining_bits < min_bits_needed_after_bmp0) {
+        LOG_ERR("RA_PARSE: Not enough bits for Bitmap1 + mandatory Res fields (need %d, have %d).", min_bits_needed_after_bmp0, *remaining_bits);
         return -EMSGSIZE;
     }
 
-
-    // --- Octet 1 of Bitmap ---
-    if (*remaining_bits < 8) return -EMSGSIZE;
+    // Octet 1 of Bitmap
     uint8_t bitmap_octet1 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
     out_ra_fields->channel_present  = (bitmap_octet1 >> 7) & 0x01;
     out_ra_fields->rlf_present      = (bitmap_octet1 >> 6) & 0x01;
-    // Bits 5-0 could be MSBs of a 9-bit start_subslot_val_res1 if that encoding was used.
-    // Current serializer packs 9-bit start subslot contiguously *after* bitmap.
-    // So, here we assume bits 5-0 of bitmap_octet1 are reserved if that model is followed.
-    uint8_t res1_start_msbs_in_bmp1 = bitmap_octet1 & 0x3F;
-    LOG_DBG("RA_PARSE: BMP1: ChanPres:%d RLFPres:%d Rsvd/SS1Msb:0x%02X",
-            out_ra_fields->channel_present, out_ra_fields->rlf_present, res1_start_msbs_in_bmp1);
+    // Bits 5-0 are reserved.
 
-
-    // --- Resource 1 Fields ---
-    // Determine number of bits for start_subslot based on pre-set out_ra_fields->res1_is_9bit_subslot
-    // (which should be set by caller based on 'mu' of the link context if known). Default to 8.
-    uint8_t res1_start_subslot_num_bits = out_ra_fields->res1_is_9bit_subslot ? 9 : 8;
-
-    if (*remaining_bits < (res1_start_subslot_num_bits + 1 + 7)) {LOG_ERR("RA_PARSE: Not enough bits for Res1 fields."); return -EMSGSIZE;}
-    out_ra_fields->start_subslot_val_res1 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, res1_start_subslot_num_bits);
+    // Resource 1 Fields
+    out_ra_fields->start_subslot_val_res1 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, res1_ss_bits);
     out_ra_fields->length_type_is_slots_res1 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 1);
     out_ra_fields->length_val_res1 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 7);
-    LOG_DBG("RA_PARSE: Res1: StartSS(%db):%u LenTypeSlots:%d LenVal:%u",
-            res1_start_subslot_num_bits, out_ra_fields->start_subslot_val_res1,
-            out_ra_fields->length_type_is_slots_res1, out_ra_fields->length_val_res1);
 
-
-    // --- Resource 2 Fields (if alloc_type is BIDIR) ---
+    // Resource 2 Fields (if alloc_type is BIDIR)
     if (out_ra_fields->alloc_type_val == RES_ALLOC_TYPE_BIDIR) {
-        uint8_t res2_start_subslot_num_bits = out_ra_fields->res2_is_9bit_subslot ? 9 : 8;
-        if (*remaining_bits < (res2_start_subslot_num_bits + 1 + 7)) {LOG_ERR("RA_PARSE: Not enough bits for Res2 fields."); return -EMSGSIZE;}
-
-        out_ra_fields->start_subslot_val_res2 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, res2_start_subslot_num_bits);
+        uint8_t res2_ss_bits = out_ra_fields->res2_is_9bit_subslot ? 9 : 8;
+        // No need to re-check remaining_bits here as it was part of min_bits_needed_after_bmp0
+        out_ra_fields->start_subslot_val_res2 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, res2_ss_bits);
         out_ra_fields->length_type_is_slots_res2 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 1);
         out_ra_fields->length_val_res2 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 7);
-        LOG_DBG("RA_PARSE: Res2: StartSS(%db):%u LenTypeSlots:%d LenVal:%u",
-                res2_start_subslot_num_bits, out_ra_fields->start_subslot_val_res2,
-                out_ra_fields->length_type_is_slots_res2, out_ra_fields->length_val_res2);
     }
 
-    // --- Optional Fields (these start after byte alignment) ---
-    if (bit_offset % 8 != 0) { // If current offset is not byte aligned
+    // Optional Fields (these start after byte alignment)
+    if (bit_offset % 8 != 0) {
         int padding_to_read = 8 - (bit_offset % 8);
-        if (*remaining_bits < padding_to_read) {LOG_ERR("RA_PARSE: Not enough bits for alignment padding."); return -EMSGSIZE;}
-        read_bits_adv(ie_payload, &bit_offset, remaining_bits, (uint8_t)padding_to_read); // Consume padding
-        LOG_DBG("RA_PARSE: Consumed %d padding bits to byte-align for optional fields.", padding_to_read);
+        if (*remaining_bits < padding_to_read) { LOG_ERR("RA_PARSE: Not enough bits for alignment padding (%d needed, %d have).", padding_to_read, *remaining_bits); return -EMSGSIZE; }
+        read_bits_adv(ie_payload, &bit_offset, remaining_bits, (uint8_t)padding_to_read);
     }
 
     const uint8_t *current_byte_ptr_opts = ie_payload + (bit_offset / 8);
+    // Calculate remaining_byte_len_opts based on *remaining_bits* which is accurately tracked
     uint16_t remaining_byte_len_opts = (*remaining_bits) / 8;
 
     if (out_ra_fields->id_present) {
-        if (remaining_byte_len_opts < 2) {LOG_ERR("RA_PARSE: Payload too short for ShortRDID."); return -EMSGSIZE;}
+        if (remaining_byte_len_opts < 2) { LOG_ERR("RA_PARSE: Payload too short for ShortRDID."); return -EMSGSIZE; }
         out_ra_fields->short_rd_id_val = sys_get_be16(current_byte_ptr_opts);
-        current_byte_ptr_opts += 2; remaining_byte_len_opts -= 2; bit_offset += 16; *remaining_bits -= 16;
-        LOG_DBG("RA_PARSE: Opt ShortRDID: 0x%04X", out_ra_fields->short_rd_id_val);
+        current_byte_ptr_opts += 2; remaining_byte_len_opts -= 2; *remaining_bits -= 16;
     }
 
     if (out_ra_fields->repeat_val != RES_ALLOC_REPEAT_SINGLE) {
-        if (remaining_byte_len_opts < 2) {LOG_ERR("RA_PARSE: Payload too short for Repetition/Validity."); return -EMSGSIZE;}
-        out_ra_fields->repetition_value = *current_byte_ptr_opts++; bit_offset += 8; *remaining_bits -= 8;
-        out_ra_fields->validity_value   = *current_byte_ptr_opts++; bit_offset += 8; *remaining_bits -= 8;
-        remaining_byte_len_opts -= 2;
-        LOG_DBG("RA_PARSE: Opt Repetition: %u, Validity: %u", out_ra_fields->repetition_value, out_ra_fields->validity_value);
+        if (remaining_byte_len_opts < 2) { LOG_ERR("RA_PARSE: Payload too short for Repetition/Validity."); return -EMSGSIZE; }
+        out_ra_fields->repetition_value = *current_byte_ptr_opts++;
+        out_ra_fields->validity_value   = *current_byte_ptr_opts++;
+        remaining_byte_len_opts -= 2; *remaining_bits -= 16;
     }
 
     if (out_ra_fields->sfn_present) {
-        if (remaining_byte_len_opts < 1) {LOG_ERR("RA_PARSE: Payload too short for SFN value."); return -EMSGSIZE;}
+        if (remaining_byte_len_opts < 1) { LOG_ERR("RA_PARSE: Payload too short for SFN value."); return -EMSGSIZE; }
         out_ra_fields->sfn_val = *current_byte_ptr_opts++;
-        remaining_byte_len_opts -= 1; bit_offset += 8; *remaining_bits -= 8;
-        LOG_DBG("RA_PARSE: Opt SFN Val: %u", out_ra_fields->sfn_val);
+        remaining_byte_len_opts -= 1; *remaining_bits -= 8;
     }
 
     if (out_ra_fields->channel_present) {
-        if (remaining_byte_len_opts < 2) {LOG_ERR("RA_PARSE: Payload too short for Channel value."); return -EMSGSIZE;}
+        if (remaining_byte_len_opts < 2) { LOG_ERR("RA_PARSE: Payload too short for Channel value."); return -EMSGSIZE; }
         uint16_t chan_field_on_air = sys_get_be16(current_byte_ptr_opts);
-        current_byte_ptr_opts += 2; remaining_byte_len_opts -= 2; bit_offset += 16; *remaining_bits -= 16;
-        out_ra_fields->channel_val = (chan_field_on_air >> 3) & 0x1FFF; // Extract 13 MSBs
-        LOG_DBG("RA_PARSE: Opt Channel Val: %u", out_ra_fields->channel_val);
+        current_byte_ptr_opts += 2; remaining_byte_len_opts -= 2; *remaining_bits -= 16;
+        out_ra_fields->channel_val = (chan_field_on_air >> 3) & 0x1FFF;
     }
 
     if (out_ra_fields->rlf_present) {
-        if (remaining_byte_len_opts < 1) {LOG_ERR("RA_PARSE: Payload too short for RLF value."); return -EMSGSIZE;}
-        // RLF code is in 4 MSBs of the octet
+        if (remaining_byte_len_opts < 1) { LOG_ERR("RA_PARSE: Payload too short for RLF value."); return -EMSGSIZE; }
         out_ra_fields->dect_sched_res_fail_timer_code = (*current_byte_ptr_opts++ >> 4) & 0x0F;
-        remaining_byte_len_opts -= 1; bit_offset += 8; *remaining_bits -= 8; // Consumed full byte
-        LOG_DBG("RA_PARSE: Opt RLF Code: %u", out_ra_fields->dect_sched_res_fail_timer_code);
+        // remaining_byte_len_opts -= 1; // This was correctly handled by current_byte_ptr_opts++
+        *remaining_bits -= 8;
     }
 
-    if (*remaining_bits >= 8) { // If a full byte or more remains unparsed
-        LOG_WRN("RA_PARSE: %d unparsed bits (>=1 byte) remain at the end of Res Alloc IE payload (len %u).",
+    if (*remaining_bits > 0 && *remaining_bits < 8) {
+        LOG_WRN("RA_PARSE: %d unparsed bits remain (padding or error at end). Payload len %u.",
                 *remaining_bits, ie_payload_len);
-    } else if (*remaining_bits > 0) { // Some bits, but less than a byte
-         LOG_WRN("RA_PARSE: %d unparsed bits remain (less than 1 byte), possible padding or parse error. Payload len %u.",
+    } else if (*remaining_bits >= 8) {
+         LOG_WRN("RA_PARSE: %d unparsed bits (>=1 byte) remain. Payload len %u. Likely unparsed optional IEs or error.",
                 *remaining_bits, ie_payload_len);
     }
-
     return 0;
 }
 

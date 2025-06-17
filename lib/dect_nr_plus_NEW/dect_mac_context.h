@@ -177,7 +177,7 @@ typedef struct {
     uint16_t start_subslot_index;    // 8 or 9 bits, based on mu
     bool length_type_is_slots;       // For the "Length" field that follows start_subslot
     uint8_t num_subslots_or_slots;   // 7 bits, actual count
-    uint8_t max_rach_pdu_len_units;  // 7 bits, actual count
+    uint8_t max_rach_pdu_len_units;  // 7 bits, actual count (N-1 coded for PDU length in units)
     uint8_t cwmin_sig_code;          // 3 bits
     uint8_t cwmax_sig_code;          // 3 bits
     uint8_t repetition_code;         // 2 bits (ETSI: 00=1, 01=2, 10=4, 11=8 repetitions)
@@ -186,6 +186,7 @@ typedef struct {
     uint8_t validity_frames;         // If sfn_validity_present
     uint16_t channel_abs_freq_num;   // If channel_field_present
     uint16_t channel2_abs_freq_num;  // If channel2_field_present
+    uint8_t mu_value_for_ft_beacon;  // mu value of the FT advertising this RACH IE.
 } dect_mac_rach_info_ie_fields_t;
 
 
