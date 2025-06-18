@@ -11,6 +11,7 @@
 #include "dect_mac_context.h"   // For dect_mac_context_t and its members, config constants
 #include "dect_mac_main_dispatcher.h" // For string utility functions (logging)
 #include "dect_mac_pdu.h"       // For dect_mac_header_type_octet_t (though nrf_modem provides its own PCC structs)
+#include "dect_mac_phy_tbs_tables.h" // Include the new header with TBS tables
 
 LOG_MODULE_REGISTER(dect_mac_phy_ctrl, CONFIG_DECT_MAC_PHY_CTRL_LOG_LEVEL);
 
@@ -523,34 +524,34 @@ void dect_mac_phy_ctrl_calculate_pcc_params(size_t mac_pdc_payload_len_bytes,
     bool found_fit = false;
     uint8_t selected_mcs = *in_out_selected_mcs_field; // Use the input MCS
 
-    const uint16_t (*selected_tbs_table)[MAX_PDSCH_SUB_SLOTS_CTRL] = NULL;
 
-    // Select TBS table based on mu and beta
-    // TODO: Add tables and logic for other mu/beta combinations.
-    if (mu == 1 && beta == 1) {
-        selected_tbs_table = tbs_mu1_beta1_ctrl;
+
+
+
+    const uint16_t (*selected_tbs_table)[TBS_MAX_SUB_SLOTS_J] = NULL;
+    if (mu == 0 && beta == 0) { // Assuming mu_code 0 for mu=1, beta_code 0 for beta=1
+        selected_tbs_table = tbs_single_slot_mu1_beta1; // From dect_mac_phy_tbs_tables.h
     } else {
-        LOG_ERR("PCC_CALC: Unsupported mu=%u, beta=%u. Defaulting to mu=1,beta=1 table if available, or error.", mu, beta);
-        // Fallback to mu=1,beta=1 for now if others are not critical path yet,
-        // or strictly error out if mu/beta must be supported.
-        if (tbs_mu1_beta1_ctrl != NULL) { // Check if at least this one is valid
-             selected_tbs_table = tbs_mu1_beta1_ctrl;
-             LOG_WRN("PCC_CALC: Using mu=1,beta=1 TBS as fallback.");
-        } else {
-            LOG_ERR("PCC_CALC: No TBS table available for mu=%u, beta=%u or fallback. Cannot calculate.", mu, beta);
-            *out_packet_length_field = PCC_PACKET_LENGTH_FIELD_MAX_VALUE_CTRL; // Max length, likely problematic
-            *out_packet_length_type_field = 0; // Subslots
-            // *in_out_selected_mcs_field remains unchanged
+        LOG_ERR("PCC_CALC: Unsupported mu_code=%u, beta_code=%u. Only mu_code=0, beta_code=0 (mu=1,beta=1) supported currently.", mu, beta);
+        // Fallback to mu=1,beta=1 table if available, or error out
+        selected_tbs_table = tbs_single_slot_mu1_beta1; // Use the only table we have for now
+        if (!selected_tbs_table) { // Should not happen if header is included
+             LOG_ERR("PCC_CALC: tbs_single_slot_mu1_beta1 table is NULL. Cannot proceed.");
+            *out_packet_length_field = PCC_PACKET_LENGTH_FIELD_MAX_VALUE_CTRL; 
+            *out_packet_length_type_field = 0; 
             return;
         }
+        LOG_WRN("PCC_CALC: Using mu=1,beta=1 TBS as fallback.");
     }
 
-    if (selected_mcs > MAX_MCS_INDEX_SUPPORTED_CTRL) {
+    if (selected_mcs > TBS_MAX_MCS_INDEX) {
         LOG_ERR("PCC_CALC: Requested MCS %u is out of supported range (max %u). Clamping to max supported.",
-                selected_mcs, MAX_MCS_INDEX_SUPPORTED_CTRL);
-        selected_mcs = MAX_MCS_INDEX_SUPPORTED_CTRL;
-        *in_out_selected_mcs_field = selected_mcs; // Update the output
+                selected_mcs, TBS_MAX_MCS_INDEX);
+        selected_mcs = TBS_MAX_MCS_INDEX;
+        *in_out_selected_mcs_field = selected_mcs; 
     }
+
+
 
     if (mac_pdc_payload_len_bytes == 0) {
         // For a zero-byte PDC payload (e.g., MAC PDU with only PCC for ACK/NACK feedback),
@@ -558,26 +559,33 @@ void dect_mac_phy_ctrl_calculate_pcc_params(size_t mac_pdc_payload_len_bytes,
         num_subslots_needed = 1;
         found_fit = true;
     } else {
-        for (uint8_t j_idx = 0; j_idx < MAX_PDSCH_SUB_SLOTS_CTRL; j_idx++) {
-            // selected_tbs_table[selected_mcs] gives row for current MCS.
-            // selected_tbs_table[selected_mcs][j_idx] gives Tb for (j_idx+1) subslots.
+
+
+        for (uint8_t j_idx = 0; j_idx < TBS_MAX_SUB_SLOTS_J; j_idx++) { // New constant
+            // Check if selected_tbs_table is valid before dereferencing
+            if (!selected_tbs_table) { found_fit = false; break; } // Should have been caught earlier
+
             if (selected_tbs_table[selected_mcs][j_idx] == 0 && pdc_payload_len_bits > 0) {
-                // This (MCS, j) combination is not supported or table not fully populated.
-                // If we haven't found a fit yet, continue to see if more subslots help.
-                // If this is the last j_idx and still no fit, then it's an error handled below.
-                if (j_idx == MAX_PDSCH_SUB_SLOTS_CTRL - 1 && !found_fit) {
-                    LOG_WRN("PCC_CALC: TBS entry is 0 for MCS %u at max subslots (%u), payload %u bits. Likely too large.",
+                if (j_idx == TBS_MAX_SUB_SLOTS_J - 1 && !found_fit) {
+                    LOG_WRN("PCC_CALC: TBS entry is 0 for MCS %u at max subslots (%u), payload %u bits. Likely too large or table incomplete.",
                             selected_mcs, j_idx + 1, pdc_payload_len_bits);
                 }
                 continue;
             }
             if (pdc_payload_len_bits <= selected_tbs_table[selected_mcs][j_idx]) {
-                num_subslots_needed = j_idx + 1; // j_idx is 0 to 15, so num_subslots is 1 to 16
+                num_subslots_needed = j_idx + 1; 
                 found_fit = true;
                 break;
             }
         }
+
+
     }
+
+
+
+
+
 
     if (!found_fit) {
         LOG_ERR("PCC_CALC: Payload %zu bytes (%u bits) too large for MCS %u even at max %u subslots (TBS: %u bits). Clamping length.",
