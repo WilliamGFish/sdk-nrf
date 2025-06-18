@@ -360,6 +360,50 @@ config DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN
       Selection. If 0, DCS is skipped. Channel list itself is currently
       hardcoded/simple in SM, TODO: make configurable.
 
+config DECT_MAC_DCS_CHANNEL_LIST
+    string "DCS Candidate Channel List (comma-separated kHz)"
+    default "1881792,1883520,1885248,1886976,1888704" # Example ETSI DECT EU Ch 0-4
+    depends on DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN > 0
+    help
+      Comma-separated list of absolute carrier frequencies in kHz for the FT
+      to consider during Dynamic Channel Selection. The number of channels actually
+      scanned is limited by DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN.
+      Ensure these are valid channels for your regulatory domain and hardware band.
+      Example ETSI Band 1 (1880-1900MHz): 1881792 + k * 1728 (for k=0..9)
+      Example US DECT 6.0 (1920-1930MHz): 1921536 + k * 1728 (for k=0..4)
+
+config DECT_MAC_DCS_NOISY_THRESHOLD_DBM
+    int "DCS Noisy Channel Threshold (dBm)"
+    default -70 # Example: channels noisier than -70dBm might be less preferred
+    help
+      Average RSSI threshold (in dBm, e.g., -70) above which a channel scanned
+      during DCS is considered "too noisy" and might be deprioritized or avoided,
+      even if it's below the absolute 'busy' threshold used for LBT.
+
+config DECT_MAC_FT_COUNT_TO_TRIGGER_CODE
+    int "FT Beacon: Count To Trigger Code (0-7)"
+    default 7 # Code 7 = 256 times (ETSI Table 6.4.2.3-1)
+    range 0 7
+    help
+      Code for Count_To_Trigger field in Cluster Beacon IE.
+      Determines how many times a PT must measure a better FT before handover.
+
+config DECT_MAC_FT_REL_QUALITY_CODE
+    int "FT Beacon: Relative Quality Code (0-7)"
+    default 2 # Code 2 = 6 dB (ETSI Table 6.4.2.3-1)
+    range 0 7
+    help
+      Code for Rel_Quality field in Cluster Beacon IE.
+      Relative RSSI difference for PT mobility decisions.
+
+config DECT_MAC_FT_MIN_QUALITY_CODE
+    int "FT Beacon: Minimum Quality Code (0-3)"
+    default 1 # Code 1 = 3 dB above sensitivity (ETSI Table 6.4.2.3-1)
+    range 0 3
+    help
+      Code for Min_Quality field in Cluster Beacon IE.
+      Minimum quality for PT to consider associating.
+
 endif # DECT_MAC_ROLE_IS_FT
 
 # MAC General Parameters (apply to both roles or are general config)

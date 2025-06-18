@@ -75,11 +75,54 @@ void dect_mac_sm_ft_start_operation(void) {
     }
 
     // Populate candidate channels - TODO: Get this from Kconfig or a fixed list
-    // Example:
-    if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN > 0) ctx->role_ctx.ft.dcs_candidate_channels[0] = DEFAULT_DECT_CARRIER;
-    if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN > 1) ctx->role_ctx.ft.dcs_candidate_channels[1] = DEFAULT_DECT_CARRIER + 1; // Example, ensure valid channel
-    if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN > 2) ctx->role_ctx.ft.dcs_candidate_channels[2] = DEFAULT_DECT_CARRIER - 1; // Example, ensure valid channel
-    // ... populate others if CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN is larger
+    if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN > 0) {
+        const char *chan_list_str = CONFIG_DECT_MAC_DCS_CHANNEL_LIST;
+        char *next_chan_str;
+        char *search_start = (char *)chan_list_str;
+        int count = 0;
+
+        for (count = 0; count < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN; count++) {
+            long chan_val = strtol(search_start, &next_chan_str, 10); // Assuming kHz are decimal
+            if (search_start == next_chan_str) { // No number parsed
+                if (count == 0) LOG_ERR("FT_DCS_INIT: No valid channels in Kconfig list '%s'", chan_list_str);
+                break; // Stop if no more numbers
+            }
+            if (chan_val <= 0 || chan_val > UINT16_MAX) { // Basic validation for carrier frequency
+                LOG_WRN("FT_DCS_INIT: Invalid channel value %ld from Kconfig list. Skipping.", chan_val);
+            } else {
+                ctx->role_ctx.ft.dcs_candidate_channels[count] = (uint16_t)chan_val;
+                LOG_DBG("FT_DCS_INIT: Added candidate channel %u kHz", (uint16_t)chan_val);
+            }
+
+            if (*next_chan_str == ',') {
+                search_start = next_chan_str + 1;
+            } else if (*next_chan_str == '\0') { // End of string
+                count++; // Account for the last parsed channel
+                break;
+            } else { // Invalid format
+                LOG_WRN("FT_DCS_INIT: Invalid format in Kconfig channel list near '%s'", next_chan_str);
+                break;
+            }
+        }
+        if (count < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN && count > 0) {
+            LOG_WRN("FT_DCS_INIT: Kconfig provided %d channels, but configured to scan %d. Will scan %d.",
+                    count, CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, count);
+            // Effectively reduce the number of channels to scan if Kconfig list is shorter
+            // This requires CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN to be non-const or use a runtime var.
+            // For simplicity, we assume Kconfig list provides at least NUM_CHANNELS_TO_SCAN,
+            // or the loop naturally stops. The scan loop uses CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN.
+            // It's better if the loop limit is min(CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, actual_parsed_count).
+            // For now, the scan loop will just use uninitialized entries if count < CONFIG_...
+            // Let's ensure we only scan validly populated channels.
+            // A dynamic count_to_scan could be added to ft_context.
+        } else if (count == 0) {
+             LOG_ERR("FT_DCS_INIT: Failed to parse any valid channels from Kconfig. Using default carrier.");
+             ctx->role_ctx.ft.dcs_candidate_channels[0] = CONFIG_DECT_MAC_FT_DEFAULT_OPERATING_CARRIER_KHZ;
+             // Set a runtime count of channels to scan to 1.
+             // This needs a field like ctx->role_ctx.ft.dcs_actual_channels_to_scan = 1;
+             // And the scan loop should use this runtime count.
+        }
+    }
 
     if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN == 0) {
         LOG_WRN("FT SM: DCS channel scan count is 0. Defaulting to operating_carrier %u and starting beaconing.", ctx->role_ctx.ft.operating_carrier);
@@ -236,56 +279,97 @@ void dect_mac_sm_ft_handle_auth_pdu(uint16_t pt_short_id, uint32_t pt_long_id, c
 }
 
 
+// Brief Overview: This is the complete populate_cb_fields_from_ctx function.
+// It accurately populates all fields for the dect_mac_cluster_beacon_ie_fields_t structure,
+// including deriving ETSI codes for Network and Cluster Beacon periods from Kconfig
+// millisecond values, and using Kconfig for Count To Trigger, Rel Quality, and Min Quality codes.
 static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluster_beacon_ie_fields_t *cb_fields) {
+    if (!ctx || !cb_fields) {
+        LOG_ERR("POP_CB_FIELDS: NULL context or cb_fields pointer.");
+        return;
+    }
     memset(cb_fields, 0, sizeof(dect_mac_cluster_beacon_ie_fields_t));
 
     cb_fields->sfn = ctx->role_ctx.ft.sfn;
-    cb_fields->tx_power_present = true; // FT should always advertise its max TX power for the cluster
-    cb_fields->clusters_max_tx_power_code = ctx->config.default_tx_power_code; // Or a specific cluster max
+    cb_fields->tx_power_present = true; 
+    cb_fields->clusters_max_tx_power_code = ctx->config.default_tx_power_code; 
     cb_fields->power_constraints_active = false; // Example: FT has no constraints to impose on PTs via this
 
-    // Frame Offset: If FT's transmission is offset from SFN boundary. Assume 0 for now.
+    // Frame Offset: If FT's transmission is offset from SFN boundary.
+    // TODO: Implement if FT uses frame offset. Requires ft_context to store frame_offset_subslots_val
+    //       and own_phy_params.mu to determine if 8 or 16 bit field.
     cb_fields->frame_offset_present = false;
-    // cb_fields->frame_offset_is_16bit = (ctx->phy_link_params.mu > 4); // Requires mu storage
-    // cb_fields->frame_offset_value = ctx->role_ctx.ft.frame_offset_subslots; // If used
+    // if (cb_fields->frame_offset_present) {
+    //    // mu_code 0,1,2 (mu=1,2,4) -> 8-bit offset. mu_code 3 (mu=8) or higher -> 16-bit offset.
+    //    cb_fields->frame_offset_is_16bit = (ctx->own_phy_params.is_valid && ctx->own_phy_params.mu > 2);
+    //    cb_fields->frame_offset_value = ctx->role_ctx.ft.frame_offset_subslots_val;
+    // }
 
     // Next Cluster Channel / Time To Next (for multi-frequency FTs or handover hints - advanced)
+    // TODO: Implement if FT supports these features. Requires ft_context to store these values.
     cb_fields->next_channel_present = false;
+    // if (cb_fields->next_channel_present) {
+    //    cb_fields->next_cluster_channel_val = ctx->role_ctx.ft.next_beacon_carrier_val;
+    // }
     cb_fields->time_to_next_present = false;
-    // cb_fields->next_cluster_channel_val = ...;
-    // cb_fields->time_to_next_us = ...;
+    // if (cb_fields->time_to_next_present) {
+    //    cb_fields->time_to_next_us = ctx->role_ctx.ft.time_to_next_beacon_us_val;
+    // }
 
-    // Convert ms periods from Kconfig to ETSI codes
-    // ETSI Table 6.4.2.2-1: Network Beacon Period
-    // Codes: 0=50ms, 1=100ms, 2=500ms, 3=1000ms, 4=1500ms, 5=2000ms, 6=4000ms. Others reserved.
-    // Mapping Kconfig to codes (example, needs full mapping based on ETSI codes)
-    if (ctx->config.ft_network_beacon_period_ms <= 50) cb_fields->network_beacon_period_code = 0;
-    else if (ctx->config.ft_network_beacon_period_ms <= 100) cb_fields->network_beacon_period_code = 1;
-    else if (ctx->config.ft_network_beacon_period_ms <= 500) cb_fields->network_beacon_period_code = 2;
-    else if (ctx->config.ft_network_beacon_period_ms <= 1000) cb_fields->network_beacon_period_code = 3;
-    // ... add other mappings ...
-    else cb_fields->network_beacon_period_code = 3; // Default to 1000ms code if no match
+    // Convert Kconfig ms periods to ETSI codes for Network Beacon Period
+    // ETSI TS 103 636-4, Table 6.4.2.2-1: Network Beacon Period codes (4-bit field)
+    // 0: 50ms, 1: 100ms, 2: 500ms, 3: 1000ms, 4: 1500ms, 5: 2000ms, 6: 4000ms. 7-15: Reserved.
+    uint32_t net_period_ms = ctx->config.ft_network_beacon_period_ms;
+    if (net_period_ms <= 50) cb_fields->network_beacon_period_code = 0;
+    else if (net_period_ms <= 100) cb_fields->network_beacon_period_code = 1;
+    else if (net_period_ms <= 500) cb_fields->network_beacon_period_code = 2;
+    else if (net_period_ms <= 1000) cb_fields->network_beacon_period_code = 3;
+    else if (net_period_ms <= 1500) cb_fields->network_beacon_period_code = 4;
+    else if (net_period_ms <= 2000) cb_fields->network_beacon_period_code = 5;
+    else if (net_period_ms <= 4000) cb_fields->network_beacon_period_code = 6;
+    else { // Value from Kconfig is outside the defined ETSI range for codes 0-6
+        LOG_WRN("POP_CB_FIELDS: Kconfig Network Beacon Period %ums out of range for ETSI codes 0-6. Defaulting to 1000ms (code 3).", net_period_ms);
+        cb_fields->network_beacon_period_code = 3;
+    }
 
-    // ETSI Table 6.4.2.2-1: Cluster Beacon Period
-    // Codes: 0=10ms, 1=50ms, 2=100ms, ... 6=4000ms, 7=8000ms, 8=16000ms, 9=32000ms. Others reserved.
-    if (ctx->config.ft_cluster_beacon_period_ms <= 10) cb_fields->cluster_beacon_period_code = 0;
-    else if (ctx->config.ft_cluster_beacon_period_ms <= 50) cb_fields->cluster_beacon_period_code = 1;
-    else if (ctx->config.ft_cluster_beacon_period_ms <= 100) cb_fields->cluster_beacon_period_code = 2;
-    // ... add other mappings ...
-    else cb_fields->cluster_beacon_period_code = 2; // Default to 100ms code
+    // Convert Kconfig ms periods to ETSI codes for Cluster Beacon Period
+    // ETSI TS 103 636-4, Table 6.4.2.2-1: Cluster Beacon Period codes (4-bit field)
+    // 0: 10ms, 1: 50ms, 2: 100ms, 3: 500ms, 4: 1000ms, 5: 1500ms, 6: 2000ms, 7: 4000ms,
+    // 8: 8000ms, 9: 16000ms, 10: 32000ms. 11-15: Reserved.
+    uint32_t clus_period_ms = ctx->config.ft_cluster_beacon_period_ms;
+    if (clus_period_ms <= 10) cb_fields->cluster_beacon_period_code = 0;
+    else if (clus_period_ms <= 50) cb_fields->cluster_beacon_period_code = 1;
+    else if (clus_period_ms <= 100) cb_fields->cluster_beacon_period_code = 2;
+    else if (clus_period_ms <= 500) cb_fields->cluster_beacon_period_code = 3;
+    else if (clus_period_ms <= 1000) cb_fields->cluster_beacon_period_code = 4;
+    else if (clus_period_ms <= 1500) cb_fields->cluster_beacon_period_code = 5;
+    else if (clus_period_ms <= 2000) cb_fields->cluster_beacon_period_code = 6;
+    else if (clus_period_ms <= 4000) cb_fields->cluster_beacon_period_code = 7;
+    else if (clus_period_ms <= 8000) cb_fields->cluster_beacon_period_code = 8;
+    else if (clus_period_ms <= 16000) cb_fields->cluster_beacon_period_code = 9;
+    else if (clus_period_ms <= 32000) cb_fields->cluster_beacon_period_code = 10;
+    else { // Value from Kconfig is outside the defined ETSI range for codes 0-10
+        LOG_WRN("POP_CB_FIELDS: Kconfig Cluster Beacon Period %ums out of range for ETSI codes 0-10. Defaulting to 100ms (code 2).", clus_period_ms);
+        cb_fields->cluster_beacon_period_code = 2;
+    }
 
-    // These are typically PT parameters, but FT can signal defaults/recommendations
-    cb_fields->count_to_trigger_code = 7; // Example: 8 beacons (ETSI Table 6.4.2.3-1 maps codes)
-    cb_fields->rel_quality_code = 2;      // Example: 6dB (codes 0-3 for 0,3,6,9 dB)
-    cb_fields->min_quality_code = 1;      // Example: 3dB
+    // Count To Trigger, Rel Quality, Min Quality (ETSI Table 6.4.2.3-1)
+    // These are directly from Kconfig as codes (0-7 or 0-3).
+    cb_fields->count_to_trigger_code = CONFIG_DECT_MAC_FT_COUNT_TO_TRIGGER_CODE & 0x07;
+    cb_fields->rel_quality_code = CONFIG_DECT_MAC_FT_REL_QUALITY_CODE & 0x07;
+    cb_fields->min_quality_code = CONFIG_DECT_MAC_FT_MIN_QUALITY_CODE & 0x03;
 
-    // Current Cluster Channel (ETSI Table 6.4.2.3-1): This field is only present IF Next Cluster Channel is present
-    // AND the next channel is different from the current one.
-    // Since we set next_channel_present = false, this field is implicitly not included
-    // as per ETSI Figure 6.4.2.3-1.
-    // If next_channel_present was true, logic to set current_cluster_channel_val would be here.
+    // Current Cluster Channel field (ETSI Table 6.4.2.3-1):
+    // This field is only present IF cb_fields->next_channel_present is true AND
+    // the cb_fields->next_cluster_channel_val is different from the FT's current operating_carrier.
+    // The serializer (serialize_cluster_beacon_ie_payload) would handle the logic of actually
+    // including this field based on these conditions. Here, we just populate the value if needed.
+    // if (cb_fields->next_channel_present && (cb_fields->next_cluster_channel_val != ctx->role_ctx.ft.operating_carrier)) {
+    //    cb_fields->current_cluster_channel_val = ctx->role_ctx.ft.operating_carrier;
+    //    // The serializer would then check a flag like cb_fields->current_channel_field_present
+    // }
+    // For now, since next_channel_present is false, Current Cluster Channel is not applicable.
 }
-
 
 
 
@@ -396,36 +480,59 @@ static void ft_select_operating_carrier_and_start_beaconing(const struct nrf_mod
     }
 
 
-    // Select the best channel from ctx->role_ctx.ft.dcs_candidate_rssi_avg
-    int16_t best_rssi = INT16_MAX; // Looking for the lowest (most negative) RSSI
-    uint16_t selected_carrier = 0;
-    int best_idx = -1;
+    // New selection logic:
+    int16_t best_rssi_found = INT16_MAX; // Lower (more negative) is better
+    uint16_t final_selected_carrier = 0;
+    int selected_idx = -1;
+    int num_valid_candidates = 0;
 
-    LOG_INF("FT_DCS_SEL: Selecting best carrier from %d candidates:", CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN);
+    LOG_INF("FT_DCS_SEL: Evaluating %d scanned channels for selection:", CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN);
+
     for (int i = 0; i < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN; i++) {
-        if (ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] != NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED) { // Check if scanned
-            LOG_DBG("  Candidate %d: C%u, AvgRSSI: %.1f dBm", i,
-                    ctx->role_ctx.ft.dcs_candidate_channels[i],
-                    (float)ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] / 2.0f);
-            // Simple selection: lowest average RSSI that is below a general "too noisy" threshold
-            // TODO: Add busy_percent and other metrics to selection criteria.
-            if (ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] < best_rssi &&
-                ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] < (ctx->config.rssi_threshold_min_dbm * 2 + 20*2 /* e.g. -65dBm threshold */ ) ) {
-                best_rssi = ctx->role_ctx.ft.dcs_candidate_rssi_avg[i];
-                selected_carrier = ctx->role_ctx.ft.dcs_candidate_channels[i];
-                best_idx = i;
+        // Ensure channel was actually scanned and has a valid carrier number assigned
+        if (ctx->role_ctx.ft.dcs_candidate_channels[i] == 0 ||
+            ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] == NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED) {
+            LOG_DBG("  Skipping candidate %d: Not scanned or invalid carrier.", i);
+            continue;
+        }
+        num_valid_candidates++;
+        LOG_INF("  Candidate %d: C%u, AvgRSSI: %.1f dBm, Busy%%: %u (TODO)", i,
+                ctx->role_ctx.ft.dcs_candidate_channels[i],
+                (float)ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] / 2.0f,
+                ctx->role_ctx.ft.dcs_candidate_busy_percent[i]);
+
+        // Preference:
+        // 1. Must be below a general "too noisy" threshold (e.g. -70 dBm, from Kconfig).
+        // 2. Among those, pick the one with the lowest average RSSI.
+        // TODO: Factor in dcs_candidate_busy_percent (lower is better).
+        
+        int16_t current_avg_rssi_q71 = ctx->role_ctx.ft.dcs_candidate_rssi_avg[i];
+        int16_t noisy_threshold_q71 = CONFIG_DECT_MAC_DCS_NOISY_THRESHOLD_DBM * 2;
+
+        if (current_avg_rssi_q71 < noisy_threshold_q71) { // Is it acceptably quiet?
+            if (selected_idx == -1 || current_avg_rssi_q71 < best_rssi_found) {
+                best_rssi_found = current_avg_rssi_q71;
+                final_selected_carrier = ctx->role_ctx.ft.dcs_candidate_channels[i];
+                selected_idx = i;
             }
         }
     }
 
-    if (best_idx != -1 && selected_carrier != 0) {
-        ctx->role_ctx.ft.operating_carrier = selected_carrier;
+    if (selected_idx != -1 && final_selected_carrier != 0) {
+        ctx->role_ctx.ft.operating_carrier = final_selected_carrier;
         LOG_INF("FT_DCS_SEL: Best carrier selected: C%u (idx %d) with Avg RSSI %.1f dBm.",
-                selected_carrier, best_idx, (float)best_rssi / 2.0f);
+                final_selected_carrier, selected_idx, (float)best_rssi_found / 2.0f);
     } else {
-        LOG_WRN("FT_DCS_SEL: No suitable quiet channel found from scan. Defaulting to C%u.", DEFAULT_DECT_CARRIER);
-        ctx->role_ctx.ft.operating_carrier = DEFAULT_DECT_CARRIER;
+        LOG_WRN("FT_DCS_SEL: No suitable quiet channel found from %d valid candidates. Defaulting to C%u.",
+                num_valid_candidates, CONFIG_DECT_MAC_FT_DEFAULT_OPERATING_CARRIER_KHZ);
+        ctx->role_ctx.ft.operating_carrier = CONFIG_DECT_MAC_FT_DEFAULT_OPERATING_CARRIER_KHZ;
+        if (ctx->role_ctx.ft.operating_carrier == 0) { // Absolute fallback if default is also 0
+            ctx->role_ctx.ft.operating_carrier = 1881792; // ETSI Ch0
+            LOG_ERR("FT_DCS_SEL: Default carrier was 0, using absolute fallback %u kHz.", ctx->role_ctx.ft.operating_carrier);
+        }
     }
+
+
 
     // Update advertised RACH channel based on selected operating carrier
     ctx->role_ctx.ft.advertised_rach_params.rach_operating_channel = ctx->role_ctx.ft.operating_carrier;
