@@ -287,6 +287,7 @@ void dect_mac_sm_ft_handle_auth_pdu(uint16_t pt_short_id, uint32_t pt_long_id, c
 // It accurately populates all fields for the dect_mac_cluster_beacon_ie_fields_t structure,
 // including deriving ETSI codes for Network and Cluster Beacon periods from Kconfig
 // millisecond values, and using Kconfig for Count To Trigger, Rel Quality, and Min Quality codes.
+
 static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluster_beacon_ie_fields_t *cb_fields) {
     if (!ctx || !cb_fields) {
         LOG_ERR("POP_CB_FIELDS: NULL context or cb_fields pointer.");
@@ -297,32 +298,45 @@ static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluste
     cb_fields->sfn = ctx->role_ctx.ft.sfn;
     cb_fields->tx_power_present = true; 
     cb_fields->clusters_max_tx_power_code = ctx->config.default_tx_power_code; 
-    cb_fields->power_constraints_active = false; // Example: FT has no constraints to impose on PTs via this
+    cb_fields->power_constraints_active = false; 
 
-    // Frame Offset: If FT's transmission is offset from SFN boundary.
-    // TODO: Implement if FT uses frame offset. Requires ft_context to store frame_offset_subslots_val
-    //       and own_phy_params.mu to determine if 8 or 16 bit field.
-    cb_fields->frame_offset_present = false;
-    // if (cb_fields->frame_offset_present) {
-    //    // mu_code 0,1,2 (mu=1,2,4) -> 8-bit offset. mu_code 3 (mu=8) or higher -> 16-bit offset.
-    //    cb_fields->frame_offset_is_16bit = (ctx->own_phy_params.is_valid && ctx->own_phy_params.mu > 2);
-    //    cb_fields->frame_offset_value = ctx->role_ctx.ft.frame_offset_subslots_val;
-    // }
+    // Frame Offset field handling
+    cb_fields->frame_offset_present = IS_ENABLED(CONFIG_DECT_MAC_FT_USE_FRAME_OFFSET); // Example Kconfig
+    if (cb_fields->frame_offset_present) {
+        // ETSI TS 103 636-4, Table 6.4.2.3-1: Frame Offset field is 8 bits if mu <= 4, 16 bits if mu > 4.
+        // mu_code: 0(mu=1), 1(mu=2), 2(mu=4) -> 8-bit FO.
+        // mu_code: 3(mu=8) or higher -> 16-bit FO.
+        // So, 16-bit if mu_code > 2 (i.e., actual mu > 4).
+        if (ctx->own_phy_params.is_valid) {
+            cb_fields->frame_offset_is_16bit = (ctx->own_phy_params.mu > 2);
+             // cb_fields->frame_offset_value = ctx->role_ctx.ft.current_frame_offset_subslots; // Requires this field in ft_context_t
+             // For now, if present, set a placeholder value.
+             cb_fields->frame_offset_value = 0; // Placeholder
+             LOG_DBG("POP_CB_FIELDS: Frame Offset present, %d-bit, val %u (mu_code %u)",
+                     cb_fields->frame_offset_is_16bit ? 16:8,
+                     cb_fields->frame_offset_value,
+                     ctx->own_phy_params.mu);
+        } else {
+            LOG_WRN("POP_CB_FIELDS: Frame Offset present requested, but own_phy_params.mu not valid. Assuming 8-bit FO.");
+            cb_fields->frame_offset_is_16bit = false;
+            cb_fields->frame_offset_value = 0;
+        }
+    } else {
+        cb_fields->frame_offset_is_16bit = false; // Not relevant if not present
+        cb_fields->frame_offset_value = 0;
+    }
 
-    // Next Cluster Channel / Time To Next (for multi-frequency FTs or handover hints - advanced)
-    // TODO: Implement if FT supports these features. Requires ft_context to store these values.
-    cb_fields->next_channel_present = false;
+    // Next Cluster Channel / Time To Next (Advanced Features - currently disabled)
+    cb_fields->next_channel_present = false; // Set to true if FT wants to signal this
     // if (cb_fields->next_channel_present) {
-    //    cb_fields->next_cluster_channel_val = ctx->role_ctx.ft.next_beacon_carrier_val;
+    //    cb_fields->next_cluster_channel_val = ctx->role_ctx.ft.next_beacon_carrier_val_config; // Kconfig or dynamic
     // }
-    cb_fields->time_to_next_present = false;
+    cb_fields->time_to_next_present = false; // Set to true if FT wants to signal this
     // if (cb_fields->time_to_next_present) {
-    //    cb_fields->time_to_next_us = ctx->role_ctx.ft.time_to_next_beacon_us_val;
+    //    cb_fields->time_to_next_us = ctx->role_ctx.ft.time_to_next_beacon_us_config; // Kconfig or dynamic
     // }
 
-    // Convert Kconfig ms periods to ETSI codes for Network Beacon Period
-    // ETSI TS 103 636-4, Table 6.4.2.2-1: Network Beacon Period codes (4-bit field)
-    // 0: 50ms, 1: 100ms, 2: 500ms, 3: 1000ms, 4: 1500ms, 5: 2000ms, 6: 4000ms. 7-15: Reserved.
+    // Populate beacon period codes from Kconfig (logic from previous update)
     uint32_t net_period_ms = ctx->config.ft_network_beacon_period_ms;
     if (net_period_ms <= 50) cb_fields->network_beacon_period_code = 0;
     else if (net_period_ms <= 100) cb_fields->network_beacon_period_code = 1;
@@ -331,15 +345,8 @@ static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluste
     else if (net_period_ms <= 1500) cb_fields->network_beacon_period_code = 4;
     else if (net_period_ms <= 2000) cb_fields->network_beacon_period_code = 5;
     else if (net_period_ms <= 4000) cb_fields->network_beacon_period_code = 6;
-    else { // Value from Kconfig is outside the defined ETSI range for codes 0-6
-        LOG_WRN("POP_CB_FIELDS: Kconfig Network Beacon Period %ums out of range for ETSI codes 0-6. Defaulting to 1000ms (code 3).", net_period_ms);
-        cb_fields->network_beacon_period_code = 3;
-    }
+    else { cb_fields->network_beacon_period_code = 3; /* Default */ }
 
-    // Convert Kconfig ms periods to ETSI codes for Cluster Beacon Period
-    // ETSI TS 103 636-4, Table 6.4.2.2-1: Cluster Beacon Period codes (4-bit field)
-    // 0: 10ms, 1: 50ms, 2: 100ms, 3: 500ms, 4: 1000ms, 5: 1500ms, 6: 2000ms, 7: 4000ms,
-    // 8: 8000ms, 9: 16000ms, 10: 32000ms. 11-15: Reserved.
     uint32_t clus_period_ms = ctx->config.ft_cluster_beacon_period_ms;
     if (clus_period_ms <= 10) cb_fields->cluster_beacon_period_code = 0;
     else if (clus_period_ms <= 50) cb_fields->cluster_beacon_period_code = 1;
@@ -352,27 +359,22 @@ static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluste
     else if (clus_period_ms <= 8000) cb_fields->cluster_beacon_period_code = 8;
     else if (clus_period_ms <= 16000) cb_fields->cluster_beacon_period_code = 9;
     else if (clus_period_ms <= 32000) cb_fields->cluster_beacon_period_code = 10;
-    else { // Value from Kconfig is outside the defined ETSI range for codes 0-10
-        LOG_WRN("POP_CB_FIELDS: Kconfig Cluster Beacon Period %ums out of range for ETSI codes 0-10. Defaulting to 100ms (code 2).", clus_period_ms);
-        cb_fields->cluster_beacon_period_code = 2;
-    }
+    else { cb_fields->cluster_beacon_period_code = 2; /* Default */ }
 
-    // Count To Trigger, Rel Quality, Min Quality (ETSI Table 6.4.2.3-1)
-    // These are directly from Kconfig as codes (0-7 or 0-3).
     cb_fields->count_to_trigger_code = CONFIG_DECT_MAC_FT_COUNT_TO_TRIGGER_CODE & 0x07;
     cb_fields->rel_quality_code = CONFIG_DECT_MAC_FT_REL_QUALITY_CODE & 0x07;
     cb_fields->min_quality_code = CONFIG_DECT_MAC_FT_MIN_QUALITY_CODE & 0x03;
 
-    // Current Cluster Channel field (ETSI Table 6.4.2.3-1):
-    // This field is only present IF cb_fields->next_channel_present is true AND
-    // the cb_fields->next_cluster_channel_val is different from the FT's current operating_carrier.
-    // The serializer (serialize_cluster_beacon_ie_payload) would handle the logic of actually
-    // including this field based on these conditions. Here, we just populate the value if needed.
-    // if (cb_fields->next_channel_present && (cb_fields->next_cluster_channel_val != ctx->role_ctx.ft.operating_carrier)) {
-    //    cb_fields->current_cluster_channel_val = ctx->role_ctx.ft.operating_carrier;
-    //    // The serializer would then check a flag like cb_fields->current_channel_field_present
+    // Current Cluster Channel field logic:
+    // The serializer (serialize_cluster_beacon_ie_payload) should handle the actual inclusion
+    // of the "Current Cluster Channel" field based on these flags and values.
+    // This function just prepares the values for the serializer.
+    // For now, next_channel_present is false, so current channel field is not applicable.
+    // if (cb_fields->next_channel_present &&
+    //     (cb_fields->next_cluster_channel_val != ctx->role_ctx.ft.operating_carrier)) {
+    //     // cb_fields->current_channel_val = ctx->role_ctx.ft.operating_carrier; // Requires this field in struct
+    //     // cb_fields->current_channel_field_present_flag_for_serializer = true; // Helper for serializer
     // }
-    // For now, since next_channel_present is false, Current Cluster Channel is not applicable.
 }
 
 

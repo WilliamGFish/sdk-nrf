@@ -412,7 +412,16 @@ config DECT_MAC_DCS_ACCEPTABLE_BUSY_PERCENT
       Maximum percentage of RSSI samples that can be above the 'busy' threshold
       (rssi_threshold_max_dbm) for a channel to be considered a good candidate
       during Dynamic Channel Selection by the FT.
-            
+
+config DECT_MAC_FT_USE_FRAME_OFFSET
+    bool "FT Beacon: Enable Frame Offset field"
+    default n
+    help
+      If enabled, the FT will include the Frame Offset field in its
+      Cluster Beacon IE. The actual offset value needs to be configured
+      or managed by the FT (e.g. ctx->role_ctx.ft.current_frame_offset_subslots).
+      The field width (8 or 16 bits) depends on FT's mu.
+      
 endif # DECT_MAC_ROLE_IS_FT
 
 # MAC General Parameters (apply to both roles or are general config)
