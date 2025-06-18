@@ -438,81 +438,95 @@ static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sf
 
 
 
-
 static void ft_select_operating_carrier_and_start_beaconing(const struct nrf_modem_dect_phy_rssi_event *optional_last_rssi_event_data) {
     dect_mac_context_t* ctx = get_mac_context();
     if (ctx->state != MAC_STATE_FT_SCANNING) {
         LOG_WRN("FT_DCS_SEL: Not in SCANNING state (%s), ignoring request to select carrier.", dect_mac_state_to_str(ctx->state));
+        // If called unexpectedly, ensure we don't get stuck. Maybe restart scan timer.
+        if (ctx->pending_op_type == PENDING_OP_NONE) { // Only if no scan is ongoing
+             k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_SECONDS(1), K_NO_WAIT); // Retry DCS sequence
+        }
         return;
     }
-    if (!ctx->role_ctx.ft.dcs_scan_complete && optional_last_rssi_event_data == NULL) {
-        LOG_WRN("FT_DCS_SEL: Called to select carrier, but scan not marked complete and no final RSSI event given.");
-        // This might happen if a scan op failed catastrophically.
-        // Attempt to select based on whatever data is available.
-    }
+    // This function is called when all DCS scans are complete (dcs_scan_complete=true) OR
+    // if a scan op failed and we need to select from what we have.
+    // optional_last_rssi_event_data is not directly used here anymore as results are in context.
+    ARG_UNUSED(optional_last_rssi_event_data);
 
 
-    // New selection logic:
-    int16_t best_rssi_found = INT16_MAX; // Lower (more negative) is better
+    int16_t best_rssi_found_q71 = INT16_MAX; // Lower (more negative) is better
     uint16_t final_selected_carrier = 0;
     int selected_idx = -1;
-    int num_valid_candidates = 0;
+    int num_potentially_good_candidates = 0;
 
-    LOG_INF("FT_DCS_SEL: Evaluating %d scanned channels for selection:", CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN);
+    LOG_INF("FT_DCS_SEL: Evaluating %d scanned channels for selection. Busy_Threshold <= %d%%, Noisy_Threshold < %ddBm.",
+            CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN,
+            CONFIG_DECT_MAC_DCS_ACCEPTABLE_BUSY_PERCENT,
+            CONFIG_DECT_MAC_DCS_NOISY_THRESHOLD_DBM);
 
     for (int i = 0; i < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN; i++) {
-        // Ensure channel was actually scanned and has a valid carrier number assigned
-        if (ctx->role_ctx.ft.dcs_candidate_channels[i] == 0 ||
-            ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] == NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED) {
-            LOG_DBG("  Skipping candidate %d: Not scanned or invalid carrier.", i);
+        if (ctx->role_ctx.ft.dcs_candidate_channels[i] == 0 || // Ensure channel was populated
+            ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] == NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED ||
+            ctx->role_ctx.ft.dcs_candidate_busy_percent[i] > 100) { // Ensure scanned
+            LOG_DBG("  Skipping candidate %d: Not scanned or invalid carrier/RSSI.", i);
             continue;
         }
-        num_valid_candidates++;
-        LOG_INF("  Candidate %d: C%u, AvgRSSI: %.1f dBm, Busy%%: %u (TODO)", i,
+
+        LOG_INF("  Candidate %d: C%u, AvgRSSI: %.1f dBm, Busy: %u%%", i,
                 ctx->role_ctx.ft.dcs_candidate_channels[i],
                 (float)ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] / 2.0f,
                 ctx->role_ctx.ft.dcs_candidate_busy_percent[i]);
 
-        // Preference:
-        // 1. Must be below a general "too noisy" threshold (e.g. -70 dBm, from Kconfig).
-        // 2. Among those, pick the one with the lowest average RSSI.
-        // TODO: Factor in dcs_candidate_busy_percent (lower is better).
-        
         int16_t current_avg_rssi_q71 = ctx->role_ctx.ft.dcs_candidate_rssi_avg[i];
-        int16_t noisy_threshold_q71 = CONFIG_DECT_MAC_DCS_NOISY_THRESHOLD_DBM * 2;
+        uint8_t current_busy_pc = ctx->role_ctx.ft.dcs_candidate_busy_percent[i];
+        int16_t noisy_threshold_q71 = CONFIG_DECT_MAC_DCS_NOISY_THRESHOLD_DBM * 2; // Convert dBm to Q7.1
 
-        if (current_avg_rssi_q71 < noisy_threshold_q71) { // Is it acceptably quiet?
-            if (selected_idx == -1 || current_avg_rssi_q71 < best_rssi_found) {
-                best_rssi_found = current_avg_rssi_q71;
-                final_selected_carrier = ctx->role_ctx.ft.dcs_candidate_channels[i];
-                selected_idx = i;
-            }
+        // Criterion 1: Is channel acceptably free of persistent business?
+        if (current_busy_pc > CONFIG_DECT_MAC_DCS_ACCEPTABLE_BUSY_PERCENT) {
+            LOG_DBG("    Rejected: Too busy (%u%% > %d%%).", current_busy_pc, CONFIG_DECT_MAC_DCS_ACCEPTABLE_BUSY_PERCENT);
+            continue;
+        }
+
+        // Criterion 2: Is channel below general "noisy" threshold?
+        if (current_avg_rssi_q71 >= noisy_threshold_q71) {
+            LOG_DBG("    Rejected: Too noisy (%.1f dBm >= %d dBm).", (float)current_avg_rssi_q71 / 2.0f, CONFIG_DECT_MAC_DCS_NOISY_THRESHOLD_DBM);
+            continue;
+        }
+
+        num_potentially_good_candidates++;
+        // Criterion 3: Pick the one with the best (lowest) average RSSI among the good ones
+        if (selected_idx == -1 || current_avg_rssi_q71 < best_rssi_found_q71) {
+            best_rssi_found_q71 = current_avg_rssi_q71;
+            final_selected_carrier = ctx->role_ctx.ft.dcs_candidate_channels[i];
+            selected_idx = i;
+            LOG_DBG("    Provisionally selected: C%u (AvgRSSI %.1f dBm, Busy %u%%)",
+                    final_selected_carrier, (float)best_rssi_found_q71 / 2.0f, current_busy_pc);
         }
     }
 
     if (selected_idx != -1 && final_selected_carrier != 0) {
         ctx->role_ctx.ft.operating_carrier = final_selected_carrier;
-        LOG_INF("FT_DCS_SEL: Best carrier selected: C%u (idx %d) with Avg RSSI %.1f dBm.",
-                final_selected_carrier, selected_idx, (float)best_rssi_found / 2.0f);
+        LOG_INF("FT_DCS_SEL: Best carrier selected: C%u (idx %d) with Avg RSSI %.1f dBm, Busy %u%%.",
+                final_selected_carrier, selected_idx, (float)best_rssi_found_q71 / 2.0f,
+                ctx->role_ctx.ft.dcs_candidate_busy_percent[selected_idx]);
     } else {
-        LOG_WRN("FT_DCS_SEL: No suitable quiet channel found from %d valid candidates. Defaulting to C%u.",
-                num_valid_candidates, CONFIG_DECT_MAC_FT_DEFAULT_OPERATING_CARRIER_KHZ);
+        LOG_WRN("FT_DCS_SEL: No suitable channel found from %d valid candidates after filtering. Defaulting to C%u.",
+                num_potentially_good_candidates, CONFIG_DECT_MAC_FT_DEFAULT_OPERATING_CARRIER_KHZ);
         ctx->role_ctx.ft.operating_carrier = CONFIG_DECT_MAC_FT_DEFAULT_OPERATING_CARRIER_KHZ;
-        if (ctx->role_ctx.ft.operating_carrier == 0) { // Absolute fallback if default is also 0
-            ctx->role_ctx.ft.operating_carrier = 1881792; // ETSI Ch0
+        if (ctx->role_ctx.ft.operating_carrier == 0) { 
+            ctx->role_ctx.ft.operating_carrier = 1881792; // ETSI Ch0 as absolute fallback
             LOG_ERR("FT_DCS_SEL: Default carrier was 0, using absolute fallback %u kHz.", ctx->role_ctx.ft.operating_carrier);
         }
     }
 
-
-
     // Update advertised RACH channel based on selected operating carrier
     ctx->role_ctx.ft.advertised_rach_params.rach_operating_channel = ctx->role_ctx.ft.operating_carrier;
     ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields.channel_abs_freq_num = ctx->role_ctx.ft.operating_carrier;
-    ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields.channel_field_present = true; // Assuming RACH is on op channel
+    ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields.channel_field_present = true;
 
-    ft_start_beaconing_actions(); // This transitions state and starts beacon timer
+    ft_start_beaconing_actions(); // This transitions state to FT_BEACONING and starts beacon timer
 }
+
 
 
 static void ft_start_beaconing_actions(void) {
