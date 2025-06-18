@@ -1568,8 +1568,40 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
         if (ie_type == IE_TYPE_ASSOC_RESP) {
             if (parse_assoc_resp_ie_payload(ie_payload_ptr, ie_payload_len, &resp_fields) == 0) {
                 resp_ie_found = true;
-                LOG_DBG("PT_SM_ASSOC_RESP: Parsed Assoc Resp IE (ACK: %d).", resp_fields.ack_nack);
-            } else { LOG_ERR("PT_SM_ASSOC_RESP: Failed to parse Assoc Resp IE payload."); }
+
+                    LOG_DBG("PT_SM_ASSOC_RESP: Parsed Assoc Resp IE (ACK: %d, HARQMod: %d, NumFlowsAcc: %u, GrpAct: %d).",
+                            resp_fields.ack_nack, resp_fields.harq_mod_present,
+                            resp_fields.number_of_flows_accepted, resp_fields.group_assignment_active);
+                    if (!resp_fields.ack_nack) {
+                        LOG_WRN("PT_SM_ASSOC_RESP: Rejected by FT. Cause: %u, TimerCode: %u",
+                                resp_fields.reject_cause, resp_fields.reject_timer_code);
+                    } else { // ACK
+                        if (resp_fields.harq_mod_present) {
+                            LOG_INF("PT_SM_ASSOC_RESP: FT provided HARQ Params -> TX Procs: %u, ReTX DelayCode: %u; RX Procs: %u, ReRX DelayCode: %u",
+                                    resp_fields.harq_processes_tx_val_ft, resp_fields.max_harq_re_tx_delay_code_ft,
+                                    resp_fields.harq_processes_rx_val_ft, resp_fields.max_harq_re_rx_delay_code_ft);
+                            // TODO: PT should store and use these FT-provided HARQ parameters for the link.
+                        }
+                        if (resp_fields.number_of_flows_accepted <= MAX_FLOW_IDS_IN_ASSOC_REQ && resp_fields.number_of_flows_accepted > 0) {
+                            // char flow_ids_str_pt[MAX_FLOW_IDS_IN_ASSOC_REQ * 3 + 1] = {0};
+                            // for(int k=0; k < resp_fields.number_of_flows_accepted; ++k) { snprintf(flow_ids_str_pt + strlen(flow_ids_str_pt), sizeof(flow_ids_str_pt)-strlen(flow_ids_str_pt), "%u,", resp_fields.accepted_flow_ids[k]); }
+                            // if(strlen(flow_ids_str_pt) > 0) flow_ids_str_pt[strlen(flow_ids_str_pt)-1] = '\0';
+                            // LOG_INF("PT_SM_ASSOC_RESP: FT Accepted Flows (%u): [%s]", resp_fields.number_of_flows_accepted, flow_ids_str_pt);
+                            LOG_INF("PT_SM_ASSOC_RESP: FT Accepted %u specific flows.", resp_fields.number_of_flows_accepted);
+                            // TODO: PT should store these accepted flow_ids and configure DLC/CVG accordingly.
+                        } else if (resp_fields.number_of_flows_accepted == 0x07) {
+                            LOG_INF("PT_SM_ASSOC_RESP: FT accepted all (0) requested flows.");
+                        }
+                        if (resp_fields.group_assignment_active) {
+                            LOG_INF("PT_SM_ASSOC_RESP: FT activated Group Assignment -> GroupID: %u, ResourceTag: %u",
+                                    resp_fields.group_id_val, resp_fields.resource_tag_val);
+                            // TODO: PT should store and use these for group communication.
+                        }
+                    }
+
+                } else { 
+                    LOG_ERR("PT_SM_ASSOC_RESP: Failed to parse Assoc Resp IE payload."); 
+                }
             
         // This modification is for pt_process_association_response_pdu, not pt_handle_phy_pdc_internal's beacon parsing.
         // The context is parsing IEs from an Association Response.
