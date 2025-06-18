@@ -234,6 +234,275 @@ void dect_mac_sm_ft_handle_event(const struct dect_mac_event_msg *msg) {
     }
 }
 
+
+/**
+ * @brief Evaluates resource needs for connected PTs and potentially updates/sends schedules.
+ *
+ * This is a placeholder for a more complex FT scheduler.
+ * For now, it checks if any PT has DL data pending in FT's queues and grants a basic schedule.
+ */
+static void ft_evaluate_and_update_pt_schedules(void) {
+    dect_mac_context_t* ctx = get_mac_context();
+    if (ctx->state != MAC_STATE_FT_BEACONING && ctx->state != MAC_STATE_ASSOCIATED) {
+        return; // Only schedule when FT is operational
+    }
+
+    for (int i = 0; i < MAX_PEERS_PER_FT; i++) {
+        if (ctx->role_ctx.ft.connected_pts[i].is_valid) {
+            dect_mac_peer_info_t *pt_peer_ctx = &ctx->role_ctx.ft.connected_pts[i];
+            dect_mac_schedule_t *current_pt_schedule = &ctx->role_ctx.ft.peer_schedules[i];
+
+            // Check FT's TX queues for this PT (simplified check)
+            bool dl_data_exists = false;
+            if (!k_fifo_is_empty(&ctx->role_ctx.ft.peer_tx_data_fifos[i].high_priority_fifo) ||
+                !k_fifo_is_empty(&ctx->role_ctx.ft.peer_tx_data_fifos[i].reliable_data_fifo) ||
+                !k_fifo_is_empty(&ctx->role_ctx.ft.peer_tx_data_fifos[i].best_effort_fifo)) {
+                dl_data_exists = true;
+            }
+            pt_peer_ctx->dl_data_pending_for_pt = dl_data_exists;
+
+            // Basic dynamic allocation: If DL data pending and no active DL schedule, or to modify existing.
+            // For simplicity, if data is pending, ensure a minimal DL schedule.
+            // A real scheduler would consider QoS, amount of data, fairness, UL requests.
+            if (pt_peer_ctx->dl_data_pending_for_pt && 
+                (!current_pt_schedule->is_active || current_pt_schedule->dl_duration_subslots == 0)) {
+                
+                LOG_INF("FT_SCHED: PT %d (0x%04X) has DL data pending, granting/updating schedule.",
+                        i, pt_peer_ctx->short_rd_id);
+
+                dect_mac_resource_alloc_ie_fields_t new_alloc_fields;
+                memset(&new_alloc_fields, 0, sizeof(new_alloc_fields));
+
+                new_alloc_fields.alloc_type_val = RES_ALLOC_TYPE_DOWNLINK; // Or BIDIR if also granting UL
+                new_alloc_fields.add_allocation = false; // Replace existing schedule for this PT for simplicity
+                new_alloc_fields.id_present = true;      // Target this specific PT
+                new_alloc_fields.short_rd_id_val = pt_peer_ctx->short_rd_id;
+                new_alloc_fields.repeat_val = RES_ALLOC_REPEAT_FRAMES;
+                new_alloc_fields.sfn_present = true;
+                new_alloc_fields.channel_present = false; // Use current operating carrier
+                new_alloc_fields.rlf_present = false;
+
+                uint8_t pt_mu_code = pt_peer_ctx->peer_phy_params_known ? pt_peer_ctx->peer_mu : 0;
+                new_alloc_fields.res1_is_9bit_subslot = (pt_mu_code > 2);
+
+                new_alloc_fields.start_subslot_val_res1 = (i * 4 + 10) % MAX_SUBSLOTS_IN_FRAME_NOMINAL; // Simple staggered start
+                new_alloc_fields.length_type_is_slots_res1 = false;
+                new_alloc_fields.length_val_res1 = 2 - 1; // Grant 2 subslots for DL
+
+                // If also granting UL (e.g. based on pt_peer_ctx->ul_resource_request_pending_from_pt)
+                // new_alloc_fields.alloc_type_val = RES_ALLOC_TYPE_BIDIR;
+                // new_alloc_fields.res2_is_9bit_subslot = (pt_mu_code > 2);
+                // new_alloc_fields.start_subslot_val_res2 = (new_alloc_fields.start_subslot_val_res1 + 2 + 2) % MAX_SUBSLOTS_IN_FRAME_NOMINAL; // Staggered UL
+                // new_alloc_fields.length_type_is_slots_res2 = false;
+                // new_alloc_fields.length_val_res2 = 2 - 1; // Grant 2 subslots for UL
+
+                new_alloc_fields.repetition_value = CONFIG_DECT_MAC_FT_DEFAULT_SCHEDULE_REPEAT_FRAMES;
+                new_alloc_fields.validity_value = CONFIG_DECT_MAC_FT_DEFAULT_SCHEDULE_VALIDITY_FRAMES;
+                new_alloc_fields.sfn_val = (ctx->role_ctx.ft.sfn + CONFIG_DECT_MAC_FT_SCHEDULE_START_SFN_OFFSET) & 0xFF;
+                
+                ft_update_pt_schedule_and_signal(i, &new_alloc_fields);
+            } else if (!pt_peer_ctx->dl_data_pending_for_pt && current_pt_schedule->is_active && current_pt_schedule->dl_duration_subslots > 0) {
+                // No DL data, consider releasing DL part of schedule if PT not requesting UL
+                if (!pt_peer_ctx->ul_resource_request_pending_from_pt) {
+                    LOG_INF("FT_SCHED: No DL data for PT %d (0x%04X) and no UL request. Releasing its schedule.", i, pt_peer_ctx->short_rd_id);
+                    dect_mac_resource_alloc_ie_fields_t release_alloc_fields;
+                    memset(&release_alloc_fields, 0, sizeof(release_alloc_fields));
+                    release_alloc_fields.alloc_type_val = RES_ALLOC_TYPE_RELEASE_ALL;
+                    release_alloc_fields.id_present = true;
+                    release_alloc_fields.short_rd_id_val = pt_peer_ctx->short_rd_id;
+                    ft_update_pt_schedule_and_signal(i, &release_alloc_fields);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief Updates a PT's schedule in context and signals it (e.g., via unicast MAC message).
+ */
+static void ft_update_pt_schedule_and_signal(int peer_slot_idx, const dect_mac_resource_alloc_ie_fields_t *new_schedule_fields)
+{
+    dect_mac_context_t* ctx = get_mac_context();
+    if (peer_slot_idx < 0 || peer_slot_idx >= MAX_PEERS_PER_FT || !ctx->role_ctx.ft.connected_pts[peer_slot_idx].is_valid) {
+        LOG_ERR("FT_SCHED_SIG: Invalid peer_slot_idx %d", peer_slot_idx);
+        return;
+    }
+    dect_mac_peer_info_t *pt_peer_ctx = &ctx->role_ctx.ft.connected_pts[peer_slot_idx];
+    dect_mac_schedule_t *pt_sched = &ctx->role_ctx.ft.peer_schedules[peer_slot_idx];
+
+    // Store/Update the schedule in FT's context
+    if (new_schedule_fields->alloc_type_val == RES_ALLOC_TYPE_RELEASE_ALL) {
+        pt_sched->is_active = false;
+        memset(pt_sched, 0, sizeof(dect_mac_schedule_t)); // Clear schedule
+        LOG_INF("FT_SCHED_SIG: Schedule released for PT %d (0x%04X).", peer_slot_idx, pt_peer_ctx->short_rd_id);
+    } else {
+        pt_sched->is_active = true;
+        pt_sched->alloc_type = new_schedule_fields->alloc_type_val;
+        pt_sched->dl_start_subslot = new_schedule_fields->start_subslot_val_res1;
+        pt_sched->dl_duration_subslots = new_schedule_fields->length_val_res1 + 1;
+        pt_sched->dl_length_is_slots = new_schedule_fields->length_type_is_slots_res1;
+        pt_sched->res1_is_9bit_subslot = new_schedule_fields->res1_is_9bit_subslot;
+
+        if (new_schedule_fields->alloc_type_val == RES_ALLOC_TYPE_BIDIR) {
+            pt_sched->ul_start_subslot = new_schedule_fields->start_subslot_val_res2;
+            pt_sched->ul_duration_subslots = new_schedule_fields->length_val_res2 + 1;
+            pt_sched->ul_length_is_slots = new_schedule_fields->length_type_is_slots_res2;
+            pt_sched->res2_is_9bit_subslot = new_schedule_fields->res2_is_9bit_subslot;
+        } else { // For DL_ONLY or UL_ONLY, clear the other part
+            if(new_schedule_fields->alloc_type_val == RES_ALLOC_TYPE_DOWNLINK) {
+                pt_sched->ul_duration_subslots = 0;
+            } else { // UL_ONLY
+                pt_sched->dl_duration_subslots = 0;
+            }
+        }
+        pt_sched->repeat_type = new_schedule_fields->repeat_val;
+        pt_sched->repetition_value = new_schedule_fields->repetition_value;
+        pt_sched->validity_value = new_schedule_fields->validity_value;
+        pt_sched->channel = new_schedule_fields->channel_present ? new_schedule_fields->channel_val : ctx->role_ctx.ft.operating_carrier;
+        pt_sched->schedule_init_modem_time = ctx->last_known_modem_time;
+        pt_sched->sfn_of_initial_occurrence = new_schedule_fields->sfn_val;
+        
+        // Calculate next occurrence for the primary direction of this schedule (e.g., DL if present)
+        uint16_t primary_start_ss = (pt_sched->dl_duration_subslots > 0) ? pt_sched->dl_start_subslot : pt_sched->ul_start_subslot;
+        pt_sched->next_occurrence_modem_time = calculate_target_modem_time(ctx, ctx->ft_sfn_zero_modem_time_anchor,
+                                                                          0, /* Anchor is for SFN 0 */
+                                                                          new_schedule_fields->sfn_val, primary_start_ss,
+                                                                          ctx->own_phy_params.mu, ctx->own_phy_params.beta);
+        update_next_occurrence(ctx, pt_sched, ctx->last_known_modem_time);
+        LOG_INF("FT_SCHED_SIG: Schedule updated for PT %d (0x%04X). Next primary op @ %llu",
+                peer_slot_idx, pt_peer_ctx->short_rd_id, pt_sched->next_occurrence_modem_time);
+    }
+
+    // New: Implement sending the Resource Allocation IE
+    uint8_t sdu_area_buf[64]; // ResAlloc IE is small + optional SecIE
+    int sdu_area_len_built_bytes = 0;
+    size_t len_of_muxed_sec_ie = 0;
+    int ret;
+
+    bool secure_this_pdu = pt_peer_ctx->is_secure && ctx->role_ctx.ft.keys_provisioned_for_peer[peer_slot_idx];
+    bool include_mac_sec_info_ie = false;
+    uint8_t sec_iv_type_for_tx_ie = SEC_IV_TYPE_MODE1_HPC_PROVIDED;
+
+    if (secure_this_pdu) {
+        // Determine if MAC Sec Info IE is needed for HPC sync
+        if (pt_peer_ctx->self_needs_to_request_hpc_from_peer) { // FT needs PT's HPC
+            include_mac_sec_info_ie = true;
+            sec_iv_type_for_tx_ie = SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE;
+        } else if (pt_peer_ctx->peer_requested_hpc_resync || ctx->send_mac_sec_info_ie_on_next_tx) { // PT needs FT's HPC, or FT HPC wrapped
+            include_mac_sec_info_ie = true;
+            sec_iv_type_for_tx_ie = SEC_IV_TYPE_MODE1_HPC_PROVIDED;
+        }
+
+        if (include_mac_sec_info_ie) {
+            int ie_len = build_mac_security_info_ie_muxed(
+                sdu_area_buf + sdu_area_len_built_bytes, sizeof(sdu_area_buf) - sdu_area_len_built_bytes,
+                0, pt_peer_ctx->current_key_index_for_peer, // Or FT's key index for this PT
+                sec_iv_type_for_tx_ie, ctx->hpc); // FT's current TX HPC
+            if (ie_len < 0) { LOG_ERR("FT_SCHED_SIG: Build SecIE failed: %d", ie_len); return; }
+            sdu_area_len_built_bytes += ie_len;
+            len_of_muxed_sec_ie = ie_len;
+        }
+    }
+
+    // Serialize Resource Allocation IE itself
+    uint8_t temp_res_alloc_payload[32]; // Max size for ResAlloc IE payload
+    int res_alloc_payload_len = serialize_resource_alloc_ie_payload(temp_res_alloc_payload, sizeof(temp_res_alloc_payload), new_schedule_fields);
+    if (res_alloc_payload_len < 0) { LOG_ERR("FT_SCHED_SIG: Serialize ResAlloc payload failed: %d", res_alloc_payload_len); return; }
+
+    int mux_hdr_len = build_mac_mux_header_internal(sdu_area_buf + sdu_area_len_built_bytes,
+                                             sizeof(sdu_area_buf) - sdu_area_len_built_bytes,
+                                             IE_TYPE_RES_ALLOC, (uint16_t)res_alloc_payload_len, 0);
+    if (mux_hdr_len < 0) { LOG_ERR("FT_SCHED_SIG: Build MUX for ResAlloc failed: %d", mux_hdr_len); return; }
+    
+    if (sdu_area_len_built_bytes + mux_hdr_len + res_alloc_payload_len > sizeof(sdu_area_buf)) {
+        LOG_ERR("FT_SCHED_SIG: SDU Area overflow for ResAlloc IE."); return;
+    }
+    memcpy(sdu_area_buf + sdu_area_len_built_bytes + mux_hdr_len, temp_res_alloc_payload, res_alloc_payload_len);
+    sdu_area_len_built_bytes += (mux_hdr_len + res_alloc_payload_len);
+
+    // Prepare MAC Headers
+    dect_mac_header_type_octet_t hdr_type_octet;
+    hdr_type_octet.version = 0;
+    hdr_type_octet.mac_header_type = MAC_COMMON_HEADER_TYPE_UNICAST;
+    hdr_type_octet.mac_security = secure_this_pdu ? (include_mac_sec_info_ie ? MAC_SECURITY_USED_WITH_IE : MAC_SECURITY_USED_NO_IE) : MAC_SECURITY_NONE;
+
+    dect_mac_unicast_header_t common_hdr;
+    increment_psn_and_hpc(ctx); // Use new PSN/HPC for this control message
+    uint16_t current_psn_for_tx = ctx->psn;
+    uint32_t current_hpc_for_iv = ctx->hpc;
+    common_hdr.sequence_num_high_reset_rsv = SET_SEQ_NUM_HIGH_RESET_RSV((current_psn_for_tx >> 8) & 0x0F, 1 /*reset for control typically false unless specific need*/);
+    common_hdr.sequence_num_low = current_psn_for_tx & 0xFF;
+    common_hdr.transmitter_long_rd_id_be = sys_cpu_to_be32(ctx->own_long_rd_id);
+    common_hdr.receiver_long_rd_id_be = sys_cpu_to_be32(pt_peer_ctx->long_rd_id);
+
+    // Assemble full PDU
+    mac_sdu_t *mac_pdu_to_send = dect_mac_api_buffer_alloc(K_NO_WAIT); // Using mac_sdu_t as a generic buffer
+    if (!mac_pdu_to_send) { LOG_ERR("FT_SCHED_SIG: Failed to alloc MAC PDU buffer."); return; }
+
+    uint16_t assembled_pdu_len_pre_mic;
+    ret = dect_mac_phy_ctrl_assemble_final_pdu(
+              mac_pdu_to_send->data, CONFIG_DECT_MAC_PDU_MAX_SIZE, // Use buffer from mac_sdu_t
+              &hdr_type_octet,
+              &common_hdr, sizeof(common_hdr),
+              sdu_area_buf, (size_t)sdu_area_len_built_bytes,
+              &assembled_pdu_len_pre_mic);
+    if (ret != 0) {
+        LOG_ERR("FT_SCHED_SIG: Assemble ResAlloc PDU failed: %d", ret);
+        dect_mac_api_buffer_free(mac_pdu_to_send);
+        return;
+    }
+    mac_pdu_to_send->len = assembled_pdu_len_pre_mic;
+
+    // Apply security if needed
+    if (secure_this_pdu) {
+        uint8_t iv[16];
+        security_build_iv(iv, ctx->own_long_rd_id, pt_peer_ctx->long_rd_id, current_hpc_for_iv, current_psn_for_tx);
+        uint8_t *mic_calc_start = mac_pdu_to_send->data + sizeof(dect_mac_header_type_octet_t);
+        size_t mic_calc_len = sizeof(common_hdr) + sdu_area_len_built_bytes;
+
+        if ((mac_pdu_to_send->len + 5) > CONFIG_DECT_MAC_PDU_MAX_SIZE) { LOG_ERR("FT_SCHED_SIG: No space for MIC."); dect_mac_api_buffer_free(mac_pdu_to_send); return; }
+        ret = security_calculate_mic(mic_calc_start, mic_calc_len, ctx->role_ctx.ft.peer_integrity_keys[peer_slot_idx], mac_pdu_to_send->data + mac_pdu_to_send->len);
+        if (ret != 0) { LOG_ERR("FT_SCHED_SIG: MIC calc failed: %d", ret); dect_mac_api_buffer_free(mac_pdu_to_send); return; }
+        mac_pdu_to_send->len += 5;
+
+        uint8_t *enc_start; size_t enc_len;
+        if (include_mac_sec_info_ie) {
+            enc_start = mac_pdu_to_send->data + sizeof(dect_mac_header_type_octet_t) + sizeof(common_hdr) + len_of_muxed_sec_ie;
+            enc_len = (sdu_area_len_built_bytes - len_of_muxed_sec_ie) + 5;
+        } else {
+            enc_start = mac_pdu_to_send->data + sizeof(dect_mac_header_type_octet_t) + sizeof(common_hdr);
+            enc_len = sdu_area_len_built_bytes + 5;
+        }
+        if (enc_len > 0) {
+            if ((enc_start < mac_pdu_to_send->data) || (enc_start + enc_len > mac_pdu_to_send->data + mac_pdu_to_send->len)) {
+                 LOG_ERR("FT_SCHED_SIG: Encryption range error."); dect_mac_api_buffer_free(mac_pdu_to_send); return;
+            }
+            ret = security_crypt_payload(enc_start, enc_len, ctx->role_ctx.ft.peer_cipher_keys[peer_slot_idx], iv, true);
+            if (ret != 0) { LOG_ERR("FT_SCHED_SIG: Encryption failed: %d", ret); dect_mac_api_buffer_free(mac_pdu_to_send); return; }
+        }
+        // Clear HPC sync flags after deciding to send this PDU
+        if (include_mac_sec_info_ie) {
+            if (sec_iv_type_for_tx_ie == SEC_IV_TYPE_MODE1_HPC_RESYNC_INITIATE) pt_peer_ctx->self_needs_to_request_hpc_from_peer = false;
+            if (sec_iv_type_for_tx_ie == SEC_IV_TYPE_MODE1_HPC_PROVIDED) {
+                pt_peer_ctx->peer_requested_hpc_resync = false;
+                if (ctx->send_mac_sec_info_ie_on_next_tx) ctx->send_mac_sec_info_ie_on_next_tx = false; // Global flag for FT's own HPC wrap
+            }
+        }
+    }
+
+    // Queue to per-PT high priority TX FIFO
+    mac_pdu_to_send->target_peer_short_rd_id = pt_peer_ctx->short_rd_id; // For data_path service_tx
+    ret = dect_mac_api_ft_send_to_pt(mac_pdu_to_send, MAC_FLOW_HIGH_PRIORITY, pt_peer_ctx->short_rd_id);
+    if (ret != 0) {
+        LOG_ERR("FT_SCHED_SIG: Failed to queue ResAlloc PDU to PT 0x%04X: %d", pt_peer_ctx->short_rd_id, ret);
+        dect_mac_api_buffer_free(mac_pdu_to_send); // Free if queueing failed
+    } else {
+        LOG_INF("FT_SCHED_SIG: Queued unicast Resource Allocation IE to PT 0x%04X.", pt_peer_ctx->short_rd_id);
+    }
+
+}
+
+
 // --- FT Static Helper Implementations ---
 static int ft_get_peer_slot_idx(dect_mac_context_t* ctx, uint16_t pt_short_id) {
     for (int i = 0; i < MAX_PEERS_PER_FT; i++) {
