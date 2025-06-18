@@ -1501,6 +1501,34 @@ static void ft_process_association_request_pdu(const uint8_t *mac_sdu_area_data,
                 assoc_req_ie_found = true;
                 LOG_DBG("FT_SM_ASSOC: Parsed Assoc Req IE (Cause %u, Flows %u, FTModeCap %d).",
                         req_fields.setup_cause_val, req_fields.number_of_flows_val, req_fields.ft_mode_capable);
+                    // Log more parsed details if present
+                    if (req_fields.harq_params_present) {
+                        LOG_INF("FT_SM_ASSOC: PT Req HARQ -> TX Procs: %u, ReTX DelayCode: %u; RX Procs: %u, ReRX DelayCode: %u",
+                                req_fields.harq_processes_tx_val, req_fields.max_harq_re_tx_delay_code,
+                                req_fields.harq_processes_rx_val, req_fields.max_harq_re_rx_delay_code);
+                        // TODO: FT should store/consider these requested HARQ params when configuring link for this PT.
+                    }
+                    if (req_fields.number_of_flows_val > 0 && req_fields.number_of_flows_val <= MAX_FLOW_IDS_IN_ASSOC_REQ) {
+                        // char flow_ids_str[MAX_FLOW_IDS_IN_ASSOC_REQ * 3 + 1] = {0}; // For "XX, YY, ZZ"
+                        // for(int k=0; k < req_fields.number_of_flows_val; ++k) { snprintf(flow_ids_str + strlen(flow_ids_str), sizeof(flow_ids_str)-strlen(flow_ids_str), "%u,", req_fields.flow_ids[k]); }
+                        // if(strlen(flow_ids_str) > 0) flow_ids_str[strlen(flow_ids_str)-1] = '\0'; // Remove last comma
+                        // LOG_INF("FT_SM_ASSOC: PT Req Flows (%u): [%s]", req_fields.number_of_flows_val, flow_ids_str);
+                        // For now, just log count, as FT doesn't act on specific flow IDs yet.
+                         LOG_INF("FT_SM_ASSOC: PT Req %u specific flows.", req_fields.number_of_flows_val);
+                    }
+                    if (req_fields.ft_mode_capable) {
+                        LOG_INF("FT_SM_ASSOC: PT is FT Mode Capable.");
+                        if (req_fields.ft_beacon_periods_octet_present) {
+                             LOG_INF("  PT FT Pref NetBeaconPeriodCode: %u, ClusterBeaconPeriodCode: %u",
+                                     req_fields.ft_network_beacon_period_code, req_fields.ft_cluster_beacon_period_code);
+                        }
+                        if (req_fields.ft_param_flags_octet_present) {
+                            if (req_fields.ft_next_channel_present) LOG_INF("  PT FT Pref NextChan: %u", req_fields.ft_next_cluster_channel_val);
+                            if (req_fields.ft_time_to_next_present) LOG_INF("  PT FT Pref TimeToNext: %u us", req_fields.ft_time_to_next_us_val);
+                        }
+                        // TODO: FT could consider these if it supports dynamic FT role handover or coordination.
+                    }
+
             } else {
                 LOG_ERR("FT_SM_ASSOC: Failed to parse Assoc Req IE payload.");
             }

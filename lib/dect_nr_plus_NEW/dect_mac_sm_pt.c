@@ -1351,62 +1351,74 @@ static void pt_send_association_request_action(void) {
     uint8_t sdu_area_buf[128]; 
     dect_mac_assoc_req_ie_t assoc_req_fields;
     memset(&assoc_req_fields, 0, sizeof(assoc_req_fields));
-    dect_mac_rd_capability_ie_t rd_cap_fields; // PT's own capabilities
+    dect_mac_rd_capability_ie_t rd_cap_fields;
     memset(&rd_cap_fields, 0, sizeof(rd_cap_fields));
 
     // --- Populate Association Request IE Fields (dect_mac_assoc_req_ie_t) ---
     assoc_req_fields.setup_cause_val = ASSOC_CAUSE_INITIAL_ASSOCIATION;
-    assoc_req_fields.power_const_active = false; // PT typically doesn't declare power constraints
-    assoc_req_fields.ft_mode_capable = IS_ENABLED(CONFIG_DECT_MAC_PT_CAN_BE_FT); // Kconfig if PT can also be FT
+    assoc_req_fields.power_const_active = false; 
+    assoc_req_fields.ft_mode_capable = IS_ENABLED(CONFIG_DECT_MAC_PT_CAN_BE_FT);
     
-    // Number of flows and Flow IDs
     assoc_req_fields.number_of_flows_val = 0; // Default: Request 0 specific flows.
     // Example if requesting 1 flow with ID 5:
     // assoc_req_fields.number_of_flows_val = 1;
-    // assoc_req_fields.flow_ids[0] = 5; // 6-bit ID
+    // assoc_req_fields.flow_ids[0] = 5 & 0x3F; // Ensure 6-bit
 
-    // HARQ Parameters: PT indicates its capabilities/preferences for the link.
-    assoc_req_fields.harq_params_present = true; // Always include for initial association
-    assoc_req_fields.harq_processes_tx_val = CONFIG_DECT_MAC_PT_HARQ_TX_PROC_CODE; // From Kconfig (0-3 for 1,2,4,8)
-    assoc_req_fields.max_harq_re_tx_delay_code = CONFIG_DECT_MAC_PT_HARQ_RETX_DELAY_CODE; // From Kconfig (0-31)
-    assoc_req_fields.harq_processes_rx_val = CONFIG_DECT_MAC_PT_HARQ_RX_PROC_CODE; // From Kconfig
-    assoc_req_fields.max_harq_re_rx_delay_code = CONFIG_DECT_MAC_PT_HARQ_RERX_DELAY_CODE; // From Kconfig
+    assoc_req_fields.harq_params_present = true; 
+    assoc_req_fields.harq_processes_tx_val = CONFIG_DECT_MAC_PT_HARQ_TX_PROC_CODE & 0x07;
+    assoc_req_fields.max_harq_re_tx_delay_code = CONFIG_DECT_MAC_PT_HARQ_RETX_DELAY_PT_CODE & 0x1F;
+    assoc_req_fields.harq_processes_rx_val = CONFIG_DECT_MAC_PT_HARQ_RX_PROC_CODE & 0x07;
+    assoc_req_fields.max_harq_re_rx_delay_code = CONFIG_DECT_MAC_PT_HARQ_RERX_DELAY_PT_CODE & 0x1F;
 
-    // FT Mode Parameters (if ft_mode_capable is true)
     if (assoc_req_fields.ft_mode_capable) {
-        assoc_req_fields.ft_beacon_periods_octet_present = true; // Example: PT wants to signal its preferred periods
-        assoc_req_fields.ft_network_beacon_period_code = 3; // Example: 1000ms
-        assoc_req_fields.ft_cluster_beacon_period_code = 2; // Example: 100ms
+        assoc_req_fields.ft_beacon_periods_octet_present = true; 
+        assoc_req_fields.ft_network_beacon_period_code = CONFIG_DECT_MAC_PT_FT_MODE_NET_BEACON_PERIOD_CODE & 0x0F;
+        assoc_req_fields.ft_cluster_beacon_period_code = CONFIG_DECT_MAC_PT_FT_MODE_CLUS_BEACON_PERIOD_CODE & 0x0F;
 
-        assoc_req_fields.ft_param_flags_octet_present = true; // Example: PT wants to signal next channel
-        assoc_req_fields.ft_next_channel_present = true;
-        assoc_req_fields.ft_next_cluster_channel_val = ctx->config.default_operating_carrier_if_ft; // Kconfig
-        assoc_req_fields.ft_time_to_next_present = false; // Example
-        assoc_req_fields.ft_current_channel_present = false; // Example
+        // Only include FT Param Flags octet if at least one sub-field is present
+        assoc_req_fields.ft_next_channel_present = IS_ENABLED(CONFIG_DECT_MAC_PT_FT_MODE_NEXT_CHAN_PRESENT);
+        assoc_req_fields.ft_time_to_next_present = IS_ENABLED(CONFIG_DECT_MAC_PT_FT_MODE_TIME_TO_NEXT_PRESENT);
+        assoc_req_fields.ft_current_channel_present = false; // Typically not set by PT in request
+
+        if (assoc_req_fields.ft_next_channel_present || assoc_req_fields.ft_time_to_next_present || assoc_req_fields.ft_current_channel_present) {
+            assoc_req_fields.ft_param_flags_octet_present = true;
+        } else {
+            assoc_req_fields.ft_param_flags_octet_present = false;
+        }
+
+        if (assoc_req_fields.ft_next_channel_present) {
+            assoc_req_fields.ft_next_cluster_channel_val = CONFIG_DECT_MAC_PT_FT_MODE_NEXT_CLUSTER_CHANNEL_VAL & 0x1FFF;
+        }
+        if (assoc_req_fields.ft_time_to_next_present) {
+            assoc_req_fields.ft_time_to_next_us_val = CONFIG_DECT_MAC_PT_FT_MODE_TIME_TO_NEXT_US_VAL;
+        }
+        // Current channel not typically set by PT in request
+    } else {
+        assoc_req_fields.ft_beacon_periods_octet_present = false;
+        assoc_req_fields.ft_param_flags_octet_present = false;
     }
 
     // --- Populate PT's RD Capability IE Fields (dect_mac_rd_capability_ie_t) ---
-    rd_cap_fields.release_version = 1; // ETSI DECT NR+ Release 2 (code 1)
-    rd_cap_fields.num_phy_capabilities = 1; // PT provides one explicit 5-octet PHY capability set
+    rd_cap_fields.release_version = 1; 
+    rd_cap_fields.num_phy_capabilities = 1; 
 
     rd_cap_fields.supports_group_assignment = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_GROUP_ASSIGNMENT);
     rd_cap_fields.supports_paging = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_PAGING);
-    rd_cap_fields.operating_modes_code = assoc_req_fields.ft_mode_capable ? 0b10 : 0b00; // 00=PTonly, 10=Both
+    rd_cap_fields.operating_modes_code = assoc_req_fields.ft_mode_capable ? 0b10 : 0b00; 
     rd_cap_fields.supports_mesh = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_MESH);
     rd_cap_fields.supports_sched_data = true;
     rd_cap_fields.mac_security_modes_code = IS_ENABLED(CONFIG_DECT_MAC_SECURITY_ENABLE) ? 0b01 : 0b00;
 
-    // Populate the first explicit PHY capability set for the PT
     dect_mac_phy_capability_set_t *pt_phy_set0 = &rd_cap_fields.phy_variants[0];
-    pt_phy_set0->dlc_service_type_support_code = CONFIG_DECT_MAC_PT_DLC_SERVICE_SUPPORT_CODE;
-    pt_phy_set0->rx_for_tx_diversity_code = CONFIG_DECT_MAC_PT_RX_TX_DIVERSITY_CODE;
-    pt_phy_set0->mu_value = ctx->own_phy_params.is_valid ? ctx->own_phy_params.mu : CONFIG_DECT_MAC_OWN_MU_CODE;
-    pt_phy_set0->beta_value = ctx->own_phy_params.is_valid ? ctx->own_phy_params.beta : CONFIG_DECT_MAC_OWN_BETA_CODE;
-    pt_phy_set0->max_nss_for_rx_code = CONFIG_DECT_MAC_PT_MAX_NSS_RX_CODE;
-    pt_phy_set0->max_mcs_code = CONFIG_DECT_MAC_PT_MAX_MCS_CODE;
-    pt_phy_set0->harq_soft_buffer_size_code = CONFIG_DECT_MAC_PT_HARQ_BUFFER_CODE;
-    pt_phy_set0->num_harq_processes_code = CONFIG_DECT_MAC_PT_NUM_HARQ_PROC_CODE;
-    pt_phy_set0->harq_feedback_delay_code = CONFIG_DECT_MAC_PT_HARQ_FEEDBACK_DELAY_CODE;
+    pt_phy_set0->dlc_service_type_support_code = CONFIG_DECT_MAC_PT_DLC_SERVICE_SUPPORT_CODE & 0x07;
+    pt_phy_set0->rx_for_tx_diversity_code = CONFIG_DECT_MAC_PT_RX_TX_DIVERSITY_CODE & 0x07;
+    pt_phy_set0->mu_value = (ctx->own_phy_params.is_valid ? ctx->own_phy_params.mu : CONFIG_DECT_MAC_OWN_MU_CODE) & 0x07;
+    pt_phy_set0->beta_value = (ctx->own_phy_params.is_valid ? ctx->own_phy_params.beta : CONFIG_DECT_MAC_OWN_BETA_CODE) & 0x0F;
+    pt_phy_set0->max_nss_for_rx_code = CONFIG_DECT_MAC_PT_MAX_NSS_RX_CODE & 0x07;
+    pt_phy_set0->max_mcs_code = CONFIG_DECT_MAC_PT_MAX_MCS_CODE & 0x0F;
+    pt_phy_set0->harq_soft_buffer_size_code = CONFIG_DECT_MAC_PT_HARQ_BUFFER_CODE & 0x0F;
+    pt_phy_set0->num_harq_processes_code = CONFIG_DECT_MAC_PT_NUM_HARQ_PROC_CODE & 0x03;
+    pt_phy_set0->harq_feedback_delay_code = CONFIG_DECT_MAC_PT_HARQ_FEEDBACK_DELAY_CODE & 0x0F;
     pt_phy_set0->supports_dect_delay = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_DECT_DELAY);
     pt_phy_set0->supports_half_duplex = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_HALF_DUPLEX);
 
@@ -1419,13 +1431,11 @@ static void pt_send_association_request_action(void) {
         return;
     }
 
-    // 2. Prepare MAC Header Type Octet
     dect_mac_header_type_octet_t hdr_type_octet;
     hdr_type_octet.version = 0;
     hdr_type_octet.mac_security = MAC_SECURITY_NONE;
     hdr_type_octet.mac_header_type = MAC_COMMON_HEADER_TYPE_UNICAST;
 
-    // 3. Prepare MAC Common Unicast Header
     dect_mac_unicast_header_t common_hdr;
     increment_psn_and_hpc(ctx);
     common_hdr.sequence_num_high_reset_rsv = SET_SEQ_NUM_HIGH_RESET_RSV((ctx->psn >> 8) & 0x0F, 1 /*reset*/);
@@ -1433,7 +1443,6 @@ static void pt_send_association_request_action(void) {
     common_hdr.transmitter_long_rd_id_be = sys_cpu_to_be32(ctx->own_long_rd_id);
     common_hdr.receiver_long_rd_id_be = sys_cpu_to_be32(ctx->role_ctx.pt.target_ft.long_rd_id);
 
-    // 4. Assemble the full MAC PDU
     uint8_t *full_mac_pdu_for_phy_slab = NULL;
     int ret = k_mem_slab_alloc(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab, K_MSEC(10));
     if(ret != 0 || full_mac_pdu_for_phy_slab == NULL) {
@@ -1455,17 +1464,19 @@ static void pt_send_association_request_action(void) {
         return;
     }
 
-    // Check against Max RACH PDU length from FT's RACH Info IE
-    uint8_t pcc_pkt_len_f, pcc_mcs_f, pcc_pkt_len_type_f;
-    uint8_t rach_tx_mcs = 0; // RACH typically uses robust MCS
+    uint8_t pcc_pkt_len_f, pcc_mcs_f_ignored, pcc_pkt_len_type_f; // mcs is fixed for RACH
+    uint8_t rach_tx_mcs = 0; // RACH typically uses robust MCS0
+    uint8_t ft_mu_for_rach_timing = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon;
+    if (ft_mu_for_rach_timing > 7) ft_mu_for_rach_timing = 0; // Sanitize, use mu_code 0 for mu=1 as default
+    uint8_t ft_beta_for_rach_timing = 0; // Assume beta_code 0 (beta=1) for RACH for now
+
     dect_mac_phy_ctrl_calculate_pcc_params(pdu_len - sizeof(dect_mac_header_type_octet_t),
-                                           ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon, // Use FT's mu
-                                           0, // Beta for RACH (assuming default or from FT caps if specified for RACH)
+                                           ft_mu_for_rach_timing,
+                                           ft_beta_for_rach_timing,
                                            &pcc_pkt_len_f, &rach_tx_mcs, &pcc_pkt_len_type_f);
     uint32_t assoc_req_tx_duration_actual_units = pcc_pkt_len_f + 1;
-    if (pcc_pkt_len_type_f == 1) { // Length is in slots
-        assoc_req_tx_duration_actual_units *= get_subslots_per_etsi_slot_for_mu(
-            ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon);
+    if (pcc_pkt_len_type_f == 1) {
+        assoc_req_tx_duration_actual_units *= get_subslots_per_etsi_slot_for_mu(ft_mu_for_rach_timing);
     }
 
     if (assoc_req_tx_duration_actual_units > ft_max_rach_len_actual_units) {
@@ -1476,7 +1487,6 @@ static void pt_send_association_request_action(void) {
         return;
     }
 
-    // 5. Schedule TX operation
     uint32_t phy_op_handle = sys_rand32_get();
     ret = dect_mac_phy_ctrl_start_tx_assembled(
         ctx->role_ctx.pt.current_ft_rach_params.rach_operating_channel,
@@ -1491,9 +1501,7 @@ static void pt_send_association_request_action(void) {
         LOG_ERR("PT_SM_ASSOC_REQ: Failed to schedule AssocReq TX: %d. OpComplete/timeout will handle.", ret);
         if (ret == -EBUSY && ctx->state == MAC_STATE_PT_ASSOCIATING) {
             dect_mac_change_state(MAC_STATE_PT_RACH_BACKOFF);
-            // Use mu-aware backoff slot duration
-            uint8_t ft_mu_for_rach_bk = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon;
-            uint32_t rach_contention_slot_ticks = get_subslot_duration_ticks_for_mu(ft_mu_for_rach_bk > 0 ? ft_mu_for_rach_bk : 0);
+            uint32_t rach_contention_slot_ticks = get_subslot_duration_ticks_for_mu(ft_mu_for_rach_timing > 0 ? ft_mu_for_rach_timing : 0);
             if (rach_contention_slot_ticks == 0) rach_contention_slot_ticks = NRF_MODEM_DECT_LBT_PERIOD_MIN;
             uint32_t backoff_ms = (1 + (sys_rand32_get()%4)) * ((rach_contention_slot_ticks * 1000U) / NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ + 1);
             k_timer_start(&ctx->rach_context.rach_backoff_timer, K_MSEC(MAX(10, backoff_ms)), K_NO_WAIT);
@@ -1503,8 +1511,6 @@ static void pt_send_association_request_action(void) {
                 phy_op_handle, ctx->role_ctx.pt.target_ft.short_rd_id);
     }
 }
-
-
 
 
 
