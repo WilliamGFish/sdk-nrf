@@ -650,10 +650,13 @@ static int send_data_mac_sdu_via_phy_internal(dect_mac_context_t* ctx,
                 encryption_length = (current_sdu_area_len - muxed_sec_ie_actual_len_in_sdu_area) + 5; // (Rest of SDU Area) + MIC
             }
         } else { // MAC_SECURITY_USED_NO_IE (or MAC_SECURITY_NONE, but caught by security_active_for_this_pdu)
-            // Encrypt: Entire MAC SDU Area + MIC
+            // MAC Hdr Type, Common Hdr are cleartext.
+            // Encryption starts *after* the MAC Common Header.
             encryption_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) + common_hdr_len;
-            encryption_length = current_sdu_area_len + 5; // Full SDU Area + MIC
+            // Encryption covers: Entire SDU Area + MIC
+            encryption_length = current_sdu_area_len + 5; // 5 for MIC
         }
+
 
         if (encryption_length > 0) {
             // Boundary check for encryption
