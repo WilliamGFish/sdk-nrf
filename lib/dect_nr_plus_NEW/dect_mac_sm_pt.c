@@ -1786,11 +1786,15 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
 
             if (res_alloc_fields.sfn_present) {
                 dl_sched->sfn_of_initial_occurrence = res_alloc_fields.sfn_val;
+                uint8_t ft_mu_for_sched = ctx->role_ctx.pt.associated_ft.peer_phy_params_known ? ctx->role_ctx.pt.associated_ft.peer_mu : 0;
+                uint8_t ft_beta_for_sched = ctx->role_ctx.pt.associated_ft.peer_phy_params_known ? ctx->role_ctx.pt.associated_ft.peer_beta : 0;
                 dl_sched->next_occurrence_modem_time =
                     calculate_target_modem_time(ctx, ctx->ft_sfn_zero_modem_time_anchor,
-                                                ctx->current_sfn_at_anchor_update, // SFN when anchor was last updated
-                                                res_alloc_fields.sfn_val,          // Target SFN for schedule start
-                                                dl_sched->dl_start_subslot);
+                                                ctx->current_sfn_at_anchor_update,
+                                                res_alloc_fields.sfn_val,
+                                                dl_sched->dl_start_subslot,
+                                                ft_mu_for_sched,
+                                                ft_beta_for_sched);
             } else { // SFN not present, schedule relative to current time + processing
                 dl_sched->sfn_of_initial_occurrence = ctx->current_sfn_at_anchor_update; // Or SFN of current frame
                 uint64_t now_plus_processing_delay = assoc_resp_pcc_rx_time +
@@ -1835,11 +1839,14 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
 
                 if (res_alloc_fields.sfn_present) {
                     ul_sched->sfn_of_initial_occurrence = res_alloc_fields.sfn_val;
+                    // ft_mu_for_sched and ft_beta_for_sched are already defined from DL part
                     ul_sched->next_occurrence_modem_time =
                         calculate_target_modem_time(ctx, ctx->ft_sfn_zero_modem_time_anchor,
                                                     ctx->current_sfn_at_anchor_update,
                                                     res_alloc_fields.sfn_val,
-                                                    ul_sched->ul_start_subslot);
+                                                    ul_sched->ul_start_subslot,
+                                                    ft_mu_for_sched,
+                                                    ft_beta_for_sched);
                 } else {
                     ul_sched->sfn_of_initial_occurrence = ctx->current_sfn_at_anchor_update;
                     uint64_t now_plus_processing_delay = assoc_resp_pcc_rx_time +

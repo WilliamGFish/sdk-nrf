@@ -375,21 +375,23 @@ static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluste
 
 static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sfn_zero_anchor_time,
                                             uint8_t sfn_of_anchor_relevance, uint8_t target_sfn_val,
-                                            uint16_t target_subslot_idx)
+                                            uint16_t target_subslot_idx,
+                                            uint8_t link_mu_code, uint8_t link_beta_code)
 {
+    ARG_UNUSED(link_beta_code); // Beta currently not used in subslot/frame duration calculations here
+
     if (!ctx) {
         LOG_ERR("CALC_TIME: NULL MAC context provided!");
-        return UINT64_MAX; // Indicate error
+        return UINT64_MAX; 
     }
 
     if (sfn_zero_anchor_time == 0 && ctx->last_known_modem_time == 0) {
-        LOG_WRN("CALC_TIME: SFN Zero Anchor and last_known_modem_time are both 0. Cannot calculate precise target time. Returning large future estimate.");
-        // Return a time far enough in the future to likely be valid once modem time is known
-        return modem_us_to_ticks(500000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); // 500ms
+        LOG_WRN("CALC_TIME: SFN Zero Anchor and last_known_modem_time are both 0. Cannot calculate. Returning large future estimate.");
+        return modem_us_to_ticks(500000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
     }
     if (sfn_zero_anchor_time == 0) {
         LOG_WRN("CALC_TIME: SFN Zero Anchor is 0. Using last_known_modem_time + fallback delay.");
-        uint32_t fallback_delay_ticks = modem_us_to_ticks(FRAME_DURATION_MS_NOMINAL * 1000 * 2, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); // e.g. 2 frames
+        uint32_t fallback_delay_ticks = modem_us_to_ticks(FRAME_DURATION_MS_NOMINAL * 1000 * 2, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
         return ctx->last_known_modem_time + fallback_delay_ticks;
     }
 
@@ -398,72 +400,42 @@ static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sf
         frame_duration_ticks_val = (uint32_t)FRAME_DURATION_MS_NOMINAL * (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
     }
     if (frame_duration_ticks_val == 0) {
-        LOG_ERR("CALC_TIME: Calculated frame_duration_ticks is 0! Modem tick rate likely 0. Cannot calculate target time.");
-        return UINT64_MAX; // Indicate error
+        LOG_ERR("CALC_TIME: Calculated frame_duration_ticks is 0! Modem tick rate likely 0.");
+        return UINT64_MAX;
     }
 
-    // Determine the relevant mu_code for this timing calculation.
-    // This depends on whose schedule/timing we are calculating (FT's own, or for a PT link).
-    uint8_t mu_code_for_timing_calc = 0; // Default to mu-code 0 (actual mu=1)
-
-    if (ctx->role == MAC_ROLE_FT) {
-        // If FT is calculating for its own beacon or RACH listen based on its own parameters.
-        if (ctx->own_phy_params.is_valid) {
-            mu_code_for_timing_calc = ctx->own_phy_params.mu;
-        } else {
-            LOG_WRN("CALC_TIME (FT): Own PHY params not valid, using default mu_code=0.");
-        }
-    } else { // PT role
-        // If PT is calculating for a schedule received from FT, or for RACH to FT, use FT's mu.
-        if (ctx->role_ctx.pt.associated_ft.is_valid && ctx->role_ctx.pt.associated_ft.peer_phy_params_known) {
-            mu_code_for_timing_calc = ctx->role_ctx.pt.associated_ft.peer_mu;
-        } else if (ctx->role_ctx.pt.target_ft.is_valid && ctx->role_ctx.pt.target_ft.peer_phy_params_known) {
-            // For RACH to a target FT before full association, if its capabilities (mu) are known
-            mu_code_for_timing_calc = ctx->role_ctx.pt.target_ft.peer_mu;
-        } else if (ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon != 0 &&
-                   ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon <= 7) {
-            // Fallback to mu from the RACH IE itself if peer_phy_params not yet fully known
-            mu_code_for_timing_calc = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon;
-        } else {
-            LOG_WRN("CALC_TIME (PT): Peer FT mu not known, using default mu_code=0.");
-        }
+    // Use the provided link_mu_code for subslot duration calculation
+    uint8_t mu_code_for_calc = link_mu_code;
+    if (mu_code_for_calc > 7) { // Max mu_code for 2^7=128, typical DECT NR+ 0-3
+        LOG_WRN("CALC_TIME: Invalid link_mu_code %u provided, defaulting to 0 (mu=1).", link_mu_code);
+        mu_code_for_calc = 0;
     }
-    // Sanitize mu_code (0-7 maps to mu=1,2,4,8,16,32,64,128. DECT NR+ typically uses 0-3 for mu=1,2,4,8)
-    if (mu_code_for_timing_calc > 3) { // If using mu beyond typical DECT NR+ range
-        LOG_WRN("CALC_TIME: mu_code %u is high, ensure NRF_MODEM_DECT_SYMBOL_DURATION scaling is correct.", mu_code_for_timing_calc);
-    }
-    // get_subslot_duration_ticks_for_mu expects mu_code 0-7.
 
-    uint32_t subslot_duration_ticks_val = get_subslot_duration_ticks_for_mu(mu_code_for_timing_calc);
+    uint32_t subslot_duration_ticks_val = get_subslot_duration_ticks_for_mu(mu_code_for_calc);
     if (subslot_duration_ticks_val == 0) {
-        LOG_ERR("CALC_TIME: Calculated subslot_duration_ticks is 0 for mu_code %u! Cannot calculate target time.", mu_code_for_timing_calc);
-        return UINT64_MAX; // Indicate error
+        LOG_ERR("CALC_TIME: Calculated subslot_duration_ticks is 0 for mu_code %u!", mu_code_for_calc);
+        return UINT64_MAX;
     }
 
-    // Modem time of the start of the frame where SFN was sfn_of_anchor_relevance
     uint64_t anchor_relevance_frame_start_time = sfn_zero_anchor_time +
                                                  ((uint64_t)sfn_of_anchor_relevance * frame_duration_ticks_val);
 
-    // Calculate the shortest signed difference in frames from anchor SFN to target SFN
     int16_t sfn_diff = (int16_t)target_sfn_val - (int16_t)sfn_of_anchor_relevance;
-    if (sfn_diff > 128) {      // e.g., anchor=5, target=250. True diff is -11 frames (wraps backward).
-        sfn_diff -= 256;
-    } else if (sfn_diff < -128) { // e.g., anchor=250, target=5. True diff is +11 frames (wraps forward).
-        sfn_diff += 256;
-    }
-    // Now sfn_diff is in the range [-128, 127] representing the shortest path.
+    if (sfn_diff > 128) { sfn_diff -= 256; }
+    else if (sfn_diff < -128) { sfn_diff += 256; }
 
     uint64_t target_frame_start_time = anchor_relevance_frame_start_time + ((int64_t)sfn_diff * frame_duration_ticks_val);
-
     uint64_t target_subslot_offset_in_frame_ticks = (uint64_t)target_subslot_idx * subslot_duration_ticks_val;
     uint64_t final_target_time = target_frame_start_time + target_subslot_offset_in_frame_ticks;
 
-    LOG_DBG("CALC_TIME: AnchorSFN %u (rel. to SFN0@%llu), TargetSFN %u, TargetSS %u (using mu_code %u) => FinalTime %llu",
+    LOG_DBG("CALC_TIME: AnchorSFN %u (rel. to SFN0@%llu), TargetSFN %u, TargetSS %u (using link_mu_code %u) => FinalTime %llu",
             sfn_of_anchor_relevance, sfn_zero_anchor_time,
-            target_sfn_val, target_subslot_idx, mu_code_for_timing_calc, final_target_time);
+            target_sfn_val, target_subslot_idx, mu_code_for_calc, final_target_time);
 
     return final_target_time;
 }
+
+
 
 
 
@@ -578,86 +550,75 @@ static void ft_start_beaconing_actions(void) {
 
 
 
-
 static void ft_send_beacon_action(void) {
     dect_mac_context_t* ctx = get_mac_context();
     if (ctx->state != MAC_STATE_FT_BEACONING) {
         LOG_WRN("FT SM: Beacon TX attempt, but not in BEACONING state (%s). Aborting.",
                 dect_mac_state_to_str(ctx->state));
-        // Restart timer with a sensible period if it was stopped or for next attempt
-        // Ensure ft_cluster_beacon_period_ms is not zero to avoid K_MSEC(0) which might be K_NO_WAIT
         uint32_t beacon_period_ms = ctx->config.ft_cluster_beacon_period_ms;
-        if (beacon_period_ms == 0) {
-            beacon_period_ms = 100; // Fallback default if config is 0
-            LOG_WRN("FT_BEACON_ACT: ft_cluster_beacon_period_ms is 0, using fallback %ums", beacon_period_ms);
-        }
+        if (beacon_period_ms == 0) beacon_period_ms = 100;
         k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_MSEC(beacon_period_ms), K_MSEC(beacon_period_ms));
         return;
     }
 
-    uint8_t mac_sdu_area_buf[128]; // Sufficient for MUXed (Cluster Beacon IE + RACH Info IE)
+    if (ctx->pending_op_type != PENDING_OP_NONE) {
+        LOG_WRN("FT SM: Beacon TX time, but op %s pending. Delaying beacon.",
+                dect_pending_op_to_str(ctx->pending_op_type));
+        // Reschedule beacon timer for a short delay to retry
+        uint32_t short_delay_ms = ctx->config.ft_cluster_beacon_period_ms / 10;
+        if (short_delay_ms < 20) short_delay_ms = 20; // Min 20ms retry
+        if (short_delay_ms > 100) short_delay_ms = 100; // Max 100ms retry for this case
+        k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_MSEC(short_delay_ms), K_MSEC(ctx->config.ft_cluster_beacon_period_ms));
+        return;
+    }
+
+
+    uint8_t mac_sdu_area_buf[128]; 
     int sdu_area_len;
 
     dect_mac_cluster_beacon_ie_fields_t cb_fields;
     populate_cb_fields_from_ctx(ctx, &cb_fields); // Populates cb_fields based on current FT context
 
-    // Pointer to the RACH Info IE fields that the FT will advertise.
-    // This structure is part of the FT's context and should be updated by DCS/configuration.
     dect_mac_rach_info_ie_fields_t *rach_adv_fields = &ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields;
     
-    // Ensure mu_value_for_ft_beacon is set correctly based on FT's operational mu.
-    // This 'mu' should reflect the numerology the FT is currently operating with and advertising.
-    // It should be stored in the MAC context, e.g., ctx->own_phy_params.mu.
-    uint8_t ft_operational_mu_code = 0; // Default to mu-code 0 (actual mu=1)
-    if (ctx->own_phy_params.is_valid && ctx->own_phy_params.mu <= 7) { // mu_code is 0-7
+    // Ensure mu_value_for_ft_beacon is set correctly based on FT's operational mu
+    uint8_t ft_operational_mu_code = 0; 
+    if (ctx->own_phy_params.is_valid && ctx->own_phy_params.mu <= 7) {
         ft_operational_mu_code = ctx->own_phy_params.mu;
     } else {
-        LOG_WRN("FT_BEACON_ACT: FT's own operational mu_code not valid or not set in context (is_valid:%d, mu_code:%u). Defaulting to mu_code=0 for RACH IE.",
-                ctx->own_phy_params.is_valid, ctx->own_phy_params.mu);
+        LOG_WRN("FT_BEACON_ACT: FT's own operational mu_code not valid in context. Defaulting to mu_code=0 for RACH IE.");
     }
     rach_adv_fields->mu_value_for_ft_beacon = ft_operational_mu_code;
-    LOG_DBG("FT_BEACON_ACT: Setting RACH IE mu_value_for_ft_beacon (mu_code) to %u for beacon SFN %u",
-            ft_operational_mu_code, ctx->role_ctx.ft.sfn);
-
-    // Ensure other critical RACH params like operating channel are also up-to-date before serialization.
+    
     if (rach_adv_fields->channel_abs_freq_num != ctx->role_ctx.ft.operating_carrier || !rach_adv_fields->channel_field_present) {
-        LOG_INF("FT_BEACON_ACT: Updating RACH IE channel to current FT operating_carrier %u.", ctx->role_ctx.ft.operating_carrier);
         rach_adv_fields->channel_abs_freq_num = ctx->role_ctx.ft.operating_carrier;
         rach_adv_fields->channel_field_present = true;
     }
 
-    // Other fields like start_subslot_index, num_subslots_or_slots, repetition_code, validity_frames,
-    // response_window_subslots_val_minus_1, cwmin_sig_code, cwmax_sig_code, etc.,
-    // are assumed to be correctly populated in ctx->role_ctx.ft.advertised_rach_params
-    // by dect_mac_core_init or by the DCS logic (ft_select_operating_carrier_and_start_beaconing).
-
     sdu_area_len = build_beacon_sdu_area_content(mac_sdu_area_buf, sizeof(mac_sdu_area_buf),
                                                 &cb_fields,
-                                                rach_adv_fields); // Pass pointer to the (now updated) struct
+                                                rach_adv_fields);
     if (sdu_area_len < 0) {
-        LOG_ERR("FT SM: Failed to build beacon SDU area content: %d", sdu_area_len);
-        // Timer will fire again as it's periodic.
-        return;
+        LOG_ERR("FT SM: Failed to build beacon SDU area content: %d. Skipping this beacon.", sdu_area_len);
+        return; // Timer will fire again
     }
 
     dect_mac_header_type_octet_t hdr_type_octet;
-    hdr_type_octet.version = 0; // ETSI TS 103 636-4 Release 2
-    hdr_type_octet.mac_security = MAC_SECURITY_NONE; // Beacons often unsecure for initial discovery
-                                                    // TODO: Add logic for secured beacons if needed
+    hdr_type_octet.version = 0; 
+    hdr_type_octet.mac_security = MAC_SECURITY_NONE; 
     hdr_type_octet.mac_header_type = MAC_COMMON_HEADER_TYPE_BEACON;
 
     dect_mac_beacon_header_t common_beacon_hdr;
-    // Network ID: MS24 bits from context, LSB part is in PHY Control Channel (PCC)
     common_beacon_hdr.network_id_ms24[0] = (uint8_t)((ctx->network_id_32bit >> 24) & 0xFF);
     common_beacon_hdr.network_id_ms24[1] = (uint8_t)((ctx->network_id_32bit >> 16) & 0xFF);
     common_beacon_hdr.network_id_ms24[2] = (uint8_t)((ctx->network_id_32bit >> 8) & 0xFF);
     common_beacon_hdr.transmitter_long_rd_id_be = sys_cpu_to_be32(ctx->own_long_rd_id);
 
     uint8_t *full_mac_pdu_for_phy_slab = NULL;
-    int ret = k_mem_slab_alloc(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab, K_MSEC(10)); // Timeout for buffer
+    int ret = k_mem_slab_alloc(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab, K_MSEC(10));
     if(ret != 0 || full_mac_pdu_for_phy_slab == NULL) {
         LOG_ERR("FT SM: Failed to alloc PDU buf for beacon TX: %d. Skipping this beacon.", ret);
-        return; // Timer will fire again
+        return; 
     }
     uint8_t * const full_mac_pdu_for_phy = full_mac_pdu_for_phy_slab;
 
@@ -672,12 +633,11 @@ static void ft_send_beacon_action(void) {
     if (ret != 0) {
         LOG_ERR("FT SM: Failed to assemble final beacon PDU: %d", ret);
         k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab);
-        return; // Timer will fire again
+        return; 
     }
 
-
     uint32_t phy_op_handle = sys_rand32_get();
-    ctx->role_ctx.ft.sfn_for_last_beacon_tx = ctx->role_ctx.ft.sfn; // Record SFN for this beacon attempt
+    ctx->role_ctx.ft.sfn_for_last_beacon_tx = ctx->role_ctx.ft.sfn;
     uint64_t beacon_target_start_time;
     uint32_t frame_duration_ticks_val = 0;
 
@@ -685,70 +645,54 @@ static void ft_send_beacon_action(void) {
         frame_duration_ticks_val = (uint32_t)FRAME_DURATION_MS_NOMINAL * (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
     }
     if (frame_duration_ticks_val == 0) {
-        LOG_ERR("FT_BEACON_ACT: Frame duration ticks is zero! Cannot schedule beacon precisely. Skipping.");
-        k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); // Free buffer allocated earlier
-        return; // Timer will fire again
-    }
-
-    if (ctx->ft_sfn_zero_modem_time_anchor == 0) { // First beacon, establish anchor precisely
-        // Schedule this first beacon a bit into the future to allow PHY prep and establish a stable anchor.
-        // An initial delay was already applied by k_timer_start in ft_start_beaconing_actions.
-        // We use current modem time + a small additional scheduling margin for the very first beacon.
-        uint32_t scheduling_margin_ticks = modem_us_to_ticks(2000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); // e.g., 2ms margin
-        uint64_t current_time_estimate = (ctx->last_known_modem_time > 0) ? \
-                                          ctx->last_known_modem_time : \
-                                          modem_us_to_ticks(1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); // Base if no modem time known
-
-        beacon_target_start_time = current_time_estimate + scheduling_margin_ticks;
+        LOG_ERR("FT_BEACON_ACT: Frame duration ticks is zero! Cannot schedule beacon precisely. Sending immediate-ish.");
+        beacon_target_start_time = 0; // Fallback
+    } else if (ctx->ft_sfn_zero_modem_time_anchor == 0) { 
+        uint32_t initial_tx_delay_ticks = modem_us_to_ticks(5000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); 
+        beacon_target_start_time = (ctx->last_known_modem_time > 0 ? ctx->last_known_modem_time : modem_us_to_ticks(1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ)) + initial_tx_delay_ticks;
         
-        // This beacon is for SFN 0 (ctx->role_ctx.ft.sfn was initialized to 0 for the first beacon)
-        // So, beacon_target_start_time is the modem time of SFN 0's start.
-        ctx->ft_sfn_zero_modem_time_anchor = beacon_target_start_time;
-        // ctx->current_sfn_at_anchor_update is already 0 from ft_start_beaconing_actions
-        LOG_INF("FT_BEACON_ACT: Establishing SFN0 anchor at %llu for SFN %u.",
-                ctx->ft_sfn_zero_modem_time_anchor, ctx->role_ctx.ft.sfn);
+        ctx->ft_sfn_zero_modem_time_anchor = beacon_target_start_time; // SFN is 0 for the first beacon
+        ctx->current_sfn_at_anchor_update = 0; 
+        LOG_INF("FT_BEACON_ACT: Establishing SFN0 anchor at %llu for SFN %u (mu_c %u, beta_c %u).",
+                ctx->ft_sfn_zero_modem_time_anchor, ctx->role_ctx.ft.sfn,
+                ctx->own_phy_params.mu, ctx->own_phy_params.beta);
     } else {
-        // Anchor exists, calculate target time for current SFN relative to the SFN 0 anchor.
-        // SFN is ctx->role_ctx.ft.sfn. Beacon is at subslot 0 of this SFN.
-        beacon_target_start_time = ctx->ft_sfn_zero_modem_time_anchor +
-                                   ((uint64_t)ctx->role_ctx.ft.sfn * frame_duration_ticks_val);
+        beacon_target_start_time = calculate_target_modem_time(ctx,
+                                                                  ctx->ft_sfn_zero_modem_time_anchor,
+                                                                  0, /* Anchor is for SFN 0 */
+                                                                  ctx->role_ctx.ft.sfn,
+                                                                  0, /* Beacon at subslot 0 */
+                                                                  ctx->own_phy_params.mu, /* FT's own mu */
+                                                                  ctx->own_phy_params.beta);/* FT's own beta */
     }
 
-    // Check if calculated target time is too soon (already passed or not enough prep time)
-    uint32_t min_prep_time_ticks = modem_us_to_ticks(ctx->phy_latency.idle_to_active_tx_us +
-                                                     ctx->phy_latency.scheduled_operation_startup_us,
-                                                     NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
-    if (ctx->last_known_modem_time > 0 && beacon_target_start_time < (ctx->last_known_modem_time + min_prep_time_ticks)) {
-        LOG_WRN("FT_BEACON_ACT: Target SFN %u start %llu is too soon (current %llu, prep %u). Adjusting to next possible frame.",
-                ctx->role_ctx.ft.sfn, beacon_target_start_time, ctx->last_known_modem_time, min_prep_time_ticks);
-        
-        // Calculate how many full frames into the future from the SFN0 anchor the earliest possible start is
-        uint64_t earliest_possible_start_from_now = ctx->last_known_modem_time + min_prep_time_ticks;
-        uint64_t ticks_from_sfn0_to_earliest_start;
-        if (earliest_possible_start_from_now >= ctx->ft_sfn_zero_modem_time_anchor) {
-            ticks_from_sfn0_to_earliest_start = earliest_possible_start_from_now - ctx->ft_sfn_zero_modem_time_anchor;
-        } else { // Current time is before SFN0 anchor (should not happen if anchor is set)
-            LOG_ERR("FT_BEACON_ACT: Current time before SFN0 anchor during adjustment. Using 0 delay.");
-            ticks_from_sfn0_to_earliest_start = 0; // Fallback
-        }
+    if (beacon_target_start_time != 0) { // Only adjust if not already immediate
+        uint32_t min_prep_time_ticks = modem_us_to_ticks(ctx->phy_latency.idle_to_active_tx_us +
+                                                        ctx->phy_latency.scheduled_operation_startup_us,
+                                                        NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+        if (ctx->last_known_modem_time > 0 && beacon_target_start_time < (ctx->last_known_modem_time + min_prep_time_ticks)) {
+            LOG_WRN("FT_BEACON_ACT: Target start %llu for SFN %u is too soon (current %llu, prep %u). Adjusting.",
+                    beacon_target_start_time, ctx->role_ctx.ft.sfn, ctx->last_known_modem_time, min_prep_time_ticks);
+            
+            uint64_t earliest_possible_start_from_now = ctx->last_known_modem_time + min_prep_time_ticks;
+            uint64_t frames_since_anchor = 0;
+            if (earliest_possible_start_from_now >= ctx->ft_sfn_zero_modem_time_anchor) {
+                 frames_since_anchor = (earliest_possible_start_from_now - ctx->ft_sfn_zero_modem_time_anchor + frame_duration_ticks_val -1) / frame_duration_ticks_val;
+            } // Else, SFN0 anchor is in future, something is odd, but calculate_target_modem_time would have used fallback.
 
-        uint64_t frames_to_advance_from_sfn0 = (ticks_from_sfn0_to_earliest_start + frame_duration_ticks_val - 1) / frame_duration_ticks_val;
-        
-        ctx->role_ctx.ft.sfn = (uint8_t)(frames_to_advance_from_sfn0 % 256); // New target SFN
-        beacon_target_start_time = ctx->ft_sfn_zero_modem_time_anchor + (frames_to_advance_from_sfn0 * frame_duration_ticks_val);
-        ctx->role_ctx.ft.sfn_for_last_beacon_tx = ctx->role_ctx.ft.sfn; // Update SFN for this beacon
-        LOG_INF("FT_BEACON_ACT: Adjusted target SFN to %u, new start_time %llu.", ctx->role_ctx.ft.sfn, beacon_target_start_time);
+            ctx->role_ctx.ft.sfn = (uint8_t)((ctx->current_sfn_at_anchor_update + frames_since_anchor) % 256);
+            beacon_target_start_time = ctx->ft_sfn_zero_modem_time_anchor + (frames_since_anchor * frame_duration_ticks_val);
+            ctx->role_ctx.ft.sfn_for_last_beacon_tx = ctx->role_ctx.ft.sfn;
+            LOG_INF("FT_BEACON_ACT: Adjusted target SFN to %u, start_time %llu.", ctx->role_ctx.ft.sfn, beacon_target_start_time);
+        }
     }
 
 
     ret = dect_mac_phy_ctrl_start_tx_assembled(
         ctx->role_ctx.ft.operating_carrier,
         full_mac_pdu_for_phy, cleartext_pdu_len,
-        0xFFFF, /* target_receiver_short_id for beacon is broadcast */
-        true,   /* is_beacon = true */
-        phy_op_handle, PENDING_OP_FT_BEACON,
-        false,  /* use_lbt = false for beacons (typically on dedicated resources or FT manages CCA) */
-        beacon_target_start_time);
+        0xFFFF, true, phy_op_handle, PENDING_OP_FT_BEACON,
+        false, beacon_target_start_time);
 
     k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab);
 
@@ -758,11 +702,8 @@ static void ft_send_beacon_action(void) {
         LOG_INF("FT SM: Beacon SFN %u TX scheduled on C%u (Hdl %u), TargetStart %llu",
                 ctx->role_ctx.ft.sfn, ctx->role_ctx.ft.operating_carrier, phy_op_handle, beacon_target_start_time);
     }
-    // Increment SFN for the next beacon period.
     ctx->role_ctx.ft.sfn = (ctx->role_ctx.ft.sfn + 1) & 0xFF;
-    // The periodic timer will re-trigger ft_beacon_timer_expired_action for the next beacon.
 }
-
 
 
 /**
@@ -866,11 +807,16 @@ static void ft_schedule_rach_listen_action(void) {
         // For now, if SFN not present, assume it's for the current/next frame and repetition is not strictly SFN-locked beyond that.
     }
 
+    uint8_t ft_own_mu_code_for_rach = rach_adv_fields->mu_value_for_ft_beacon; // Mu advertised in RACH IE
+    uint8_t ft_own_beta_code_for_rach = ctx->own_phy_params.is_valid ? ctx->own_phy_params.beta : 0; // FT's beta
+
     uint64_t rach_listen_start_time = calculate_target_modem_time(ctx,
                                                                   ctx->ft_sfn_zero_modem_time_anchor,
                                                                   ctx->current_sfn_at_anchor_update,
                                                                   target_sfn_for_rach,
-                                                                  rach_adv_fields->start_subslot_index);
+                                                                  rach_adv_fields->start_subslot_index,
+                                                                  ft_own_mu_code_for_rach,
+                                                                  ft_own_beta_code_for_rach);
     
     uint32_t listen_duration_subslots = rach_resource_len_subslots + 2; // Listen a bit longer
     uint32_t listen_duration_modem_units = listen_duration_subslots * ft_subslot_duration_ticks;
@@ -898,11 +844,16 @@ static void ft_schedule_rach_listen_action(void) {
                 return;
             }
         }
+        // Recalculate start time for the new target SFN, using same mu/beta as initial calc
         rach_listen_start_time = calculate_target_modem_time(ctx,
                                                               ctx->ft_sfn_zero_modem_time_anchor,
                                                               ctx->current_sfn_at_anchor_update,
                                                               target_sfn_for_rach,
-                                                              rach_adv_fields->start_subslot_index);
+                                                              rach_adv_fields->start_subslot_index,
+                                                              ft_own_mu_code_for_rach, // from earlier in this function
+                                                              ft_own_beta_code_for_rach); // from earlier in this function
+
+
         LOG_INF("FT_RACH_LSN: Advanced to next RACH opportunity: SFN %u, new start_time %llu",
                 target_sfn_for_rach, rach_listen_start_time);
         if (target_sfn_for_rach == initial_target_sfn_for_log && repetition_interval_frames > 0) {
