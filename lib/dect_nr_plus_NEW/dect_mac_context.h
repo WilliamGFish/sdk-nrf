@@ -101,32 +101,6 @@ typedef struct mac_sdu {
 #endif
 
 
-/** @brief Information about a peer device. */
-typedef struct {
-    bool is_valid;
-    bool is_secure;
-    bool is_fully_identified;
-    uint32_t long_rd_id;
-    uint16_t short_rd_id;
-    int16_t rssi_2; // Q7.1 format
-    uint16_t operating_carrier;
-
-    // Security related per peer
-    uint32_t hpc; // Peer's last known TX HPC (tracked by us for IV construction on RX)
-    uint32_t highest_rx_peer_hpc; // Highest validated HPC received from this peer in a MAC Sec Info IE
-                                  // Used for window-based validation. Initialized to 0 or first valid HPC.
-    bool peer_requested_hpc_resync; // True if this peer sent us a Resync Request for our TX HPC
-    uint8_t consecutive_mic_failures; // Count of MIC failures for PDUs from this peer
-
-    // ... (pending_feedback_to_send and num_pending_feedback_items as before) ...
-    struct {
-        bool valid;
-        bool is_ack;
-        uint8_t harq_process_num_for_peer;
-    } pending_feedback_to_send[2];
-    uint8_t num_pending_feedback_items;
-
-} dect_mac_peer_info_t;
 
 
 // ETSI TS 103 636-4, Table 6.4.3.3-1 Resource Allocation Bitmap related enums
@@ -201,45 +175,29 @@ typedef struct {
     uint16_t operating_carrier;     // Primary operating carrier of this peer (if known, e.g., for an FT).
 
     // --- HPC and Security Synchronization State with this Peer ---
-    // For RX path: Tracking the HPC of PDUs received *from* this peer.
-    uint32_t hpc;                   // HPC value used for the IV of the *current or last successfully processed PDU* received from this peer.
-                                    // This is updated from a MAC Sec Info IE or incremented based on PSN wrap from this peer.
+    uint32_t hpc;                   // HPC value from the peer (from SecIE or inferred) used for the *current or last successfully processed PDU's IV* received from this peer.
     uint32_t highest_rx_peer_hpc;   // Highest HPC value ever validated and received *in a MAC Sec Info IE* from this peer.
-                                    // This is the primary reference for the anti-replay receive window. Initialized to 0.
-    
-    // For TX path: Flags related to HPC synchronization *initiated by either side*.
-    bool peer_requested_hpc_resync; // True if this peer sent *us* a MAC Sec Info IE with SecIVType HPC_RESYNC_INITIATE,
-                                    // meaning *we* should send our current TX HPC to them.
-                                    // (For PT: this flag on associated_ft means FT wants PT's HPC)
-                                    // (For FT: this flag on a connected_pt means that PT wants FT's HPC) -> This interpretation needs care.
-                                    // Let's clarify: This flag on peer_info means THE PEER requested OUR HPC.
-                                    // So, if PT's associated_ft has this true, FT requested PT's HPC.
-                                    // If FT's connected_pts[i] has this true, PT[i] requested FT's HPC.
-
-    bool self_needs_to_request_hpc_from_peer; // True if *we* (this local device) need to send a MAC Sec Info IE
-                                              // with SecIVType HPC_RESYNC_INITIATE to *this peer* (e.g., due to our MIC failures on RX from them).
+    bool peer_requested_hpc_resync; // True if this peer sent *us* a MAC Sec Info IE with SecIVType HPC_RESYNC_INITIATE.
+    bool self_needs_to_request_hpc_from_peer; // True if *we* need to send RESYNC_INITIATE to *this peer*.
     uint8_t consecutive_mic_failures; // Count of consecutive MIC failures on PDUs received from this peer.
-
-    uint8_t current_key_index_for_peer; // The key index this peer is currently using for TX to us (if known from SecIE).
-                                        // Or the key index we should use for TX *to* this peer. Context dependent.
-                                        // For simplicity, this could be the key index *we* use for TX to this peer.
+    uint8_t current_key_index_for_peer; // Key index the peer is using/we should use for TX to peer. (Context dependent)
 
     // --- Peer's PHY Parameters (learned from its RD Capability IE) ---
-    uint8_t peer_mu;                // Peer's operational mu (subcarrier scaling factor code, e.g., 0 for mu=1 (2^0)).
-    uint8_t peer_beta;              // Peer's operational beta (FFT scaling factor code, e.g., 0 for beta=1 (code+1)).
+    uint8_t peer_mu;                // Peer's operational mu_code (0-7 => actual mu = 2^code).
+    uint8_t peer_beta;              // Peer's operational beta_code (0-15 => actual beta = code+1).
     uint8_t peer_max_mcs_code;      // Peer's max supported MCS for reception (code 0-11).
-    // Add other relevant parsed capabilities from peer's RD_Capability_IE.phy_variants[0] as needed:
+    // TODO: Add other relevant parsed capabilities from peer's RD_Capability_IE.phy_variants[0] as needed:
     // uint8_t peer_dlc_service_support_code;
     // uint8_t peer_rx_for_tx_diversity_code;
     // uint8_t peer_max_nss_for_rx_code;
     // uint8_t peer_harq_soft_buffer_size_code;
-    // uint8_t peer_num_harq_processes_code;
+    // uint8_t peer_num_harq_processes_code; // Number of HARQ processes peer supports for its RX
     // uint8_t peer_harq_feedback_delay_code;
     // bool    peer_supports_dect_delay;
     // bool    peer_supports_half_duplex;
     bool peer_phy_params_known;     // True if RD Capability IE has been successfully parsed for this peer.
 
-    // --- Parameters Requested by PT in Association Request ---
+    // --- Parameters Requested by PT in Association Request (stored by FT for this PT peer) ---
     bool pt_requested_harq_params_valid; // True if PT included HARQ params in its request
     uint8_t pt_req_harq_procs_tx;        // PT's requested number of TX HARQ processes (code)
     uint8_t pt_req_max_harq_retx_delay;  // PT's requested max re-TX delay (code)
@@ -251,22 +209,32 @@ typedef struct {
 
     bool pt_is_ft_capable;              // From PT's AssocReq ft_mode_capable flag
     // TODO: Add fields for pt_req_ft_beacon_periods, pt_req_ft_next_channel etc. if FT needs to store them.
-    // For now, FT might just log these if PT is FT capable.
+
+    // --- Dynamic Resource Allocation Tracking (for FT's view of PT) ---
+    bool dl_data_pending_for_pt;      // True if FT has downlink data in its queues for this PT
+    uint32_t current_dl_throughput_bps; // Estimated or actual throughput to this PT (for advanced scheduler)
+    bool ul_resource_request_pending_from_pt; // True if PT has signaled need for UL resources (e.g. via control PDU)
+    uint16_t pt_requested_ul_duration_subslots; // If PT explicitly requested a duration
+    uint16_t pt_granted_ul_duration_subslots;   // Currently granted UL duration by FT for this PT
+    uint16_t pt_granted_dl_duration_subslots;   // Currently granted DL duration by FT for this PT
+
 
     // --- Pending HARQ Feedback TO SEND to this peer (for PDUs *we* received from *them*) ---
     struct {
-        bool valid;
-        bool is_ack;
-        uint8_t harq_process_num_for_peer;
-    } pending_feedback_to_send[2];
+        bool valid;                 // True if this feedback slot is pending
+        bool is_ack;                // True for ACK, false for NACK
+        uint8_t harq_process_num_for_peer; // The HARQ process number *of the peer's transmission* that this feedback is for.
+    } pending_feedback_to_send[2];  // Max 2 feedback items can be sent in one nRF PHY Type 2 PCC feedback field (using Format 3)
     uint8_t num_pending_feedback_items;
 
     // Other peer-specific state (timers for link supervision, QoS parameters, active schedules for this peer, etc.)
     // struct k_timer link_supervision_timer_for_peer; // Example
-    // dect_mac_schedule_t peer_dl_schedule; // If FT, schedule for DL to this PT
-    // dect_mac_schedule_t peer_ul_schedule; // If FT, schedule for UL from this PT
+    // dect_mac_schedule_t peer_dl_schedule; // If FT, schedule for DL to this PT (already in ft_context_t.peer_schedules)
+    // dect_mac_schedule_t peer_ul_schedule; // If FT, schedule for UL from this PT (already in ft_context_t.peer_schedules)
 
 } dect_mac_peer_info_t;
+
+
 
 /** @brief Stores a parsed resource allocation schedule for a link. */
 typedef struct {

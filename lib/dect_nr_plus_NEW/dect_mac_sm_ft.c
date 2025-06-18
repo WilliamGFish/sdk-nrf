@@ -34,6 +34,8 @@ static void ft_process_association_request_pdu(const uint8_t *mac_sdu_area_data,
                                                uint16_t pt_tx_short_rd_id, uint32_t pt_tx_long_rd_id, int16_t rssi_from_pcc);
 static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t pt_short_rd_id, bool accept_association, int peer_slot_idx);
 static int  ft_find_and_init_peer_slot(uint32_t pt_long_id, uint16_t pt_short_id, int16_t rssi);
+static void ft_update_pt_schedule_and_signal(int peer_slot_idx, const dect_mac_resource_alloc_ie_fields_t *new_schedule_fields);
+static void ft_evaluate_and_update_pt_schedules(void);
 static int ft_get_peer_slot_idx(dect_mac_context_t* ctx, uint16_t pt_short_id);
 static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluster_beacon_ie_fields_t *cb_fields);
 static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sfn_zero_anchor_time, uint8_t anchor_sfn_val, uint8_t target_sfn_val, uint16_t target_subslot_idx);
