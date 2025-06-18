@@ -421,7 +421,28 @@ config DECT_MAC_FT_USE_FRAME_OFFSET
       Cluster Beacon IE. The actual offset value needs to be configured
       or managed by the FT (e.g. ctx->role_ctx.ft.current_frame_offset_subslots).
       The field width (8 or 16 bits) depends on FT's mu.
-      
+
+config DECT_MAC_FT_DEFAULT_SCHEDULE_REPEAT_FRAMES
+    int "FT Default Schedule: Repetition Interval (Frames)"
+    default 10
+    help
+      Default repetition interval in frames for initial schedules assigned to PTs.
+      (Corresponds to Repetition field in Resource Allocation IE if repeat_type is frames).
+
+config DECT_MAC_FT_DEFAULT_SCHEDULE_VALIDITY_FRAMES
+    int "FT Default Schedule: Validity Duration (Frames)"
+    default 100
+    help
+      Default validity duration in frames for initial schedules assigned to PTs.
+      (0xFF for permanent).
+
+config DECT_MAC_FT_SCHEDULE_START_SFN_OFFSET
+    int "FT Default Schedule: Start SFN Offset from current SFN"
+    default 2
+    help
+      Offset from the FT's current SFN for the SFN_val field in the initial
+      Resource Allocation IE sent to a newly associated PT. (e.g., 2 means SFN_current + 2).
+
 endif # DECT_MAC_ROLE_IS_FT
 
 # MAC General Parameters (apply to both roles or are general config)

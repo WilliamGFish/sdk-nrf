@@ -1930,27 +1930,84 @@ static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t
 
 
         // Populate and add Resource Allocation IE
-        dect_mac_resource_alloc_ie_fields_t local_res_alloc_fields;
-        // ... (Populate local_res_alloc_fields, including setting resX_is_9bit_subslot based on PT's mu, as in previous full function output) ...
-        // ... (Store schedule in ctx->role_ctx.ft.peer_schedules[peer_slot_idx]) ...
-        // ... (Serialize, MUX and copy Resource Allocation IE, as in previous full function output) ...
-        memset(&local_res_alloc_fields, 0, sizeof(local_res_alloc_fields));
-        local_res_alloc_fields.alloc_type_val = RES_ALLOC_TYPE_BIDIR;
-        local_res_alloc_fields.sfn_present = true;
-        uint8_t target_pt_mu_code = 0; 
+        // For AssocResp, we create a new basic schedule for the PT.
+        dect_mac_resource_alloc_ie_fields_t res_alloc_to_send;
+        memset(&res_alloc_to_send, 0, sizeof(res_alloc_to_send));
+
+        res_alloc_to_send.alloc_type_val = RES_ALLOC_TYPE_BIDIR; // Provide both DL and UL
+        res_alloc_to_send.add_allocation = false;    // This is a new allocation, not additive
+        res_alloc_to_send.id_present = false;        // Sent unicast, ID not needed in IE itself for AssocResp
+        res_alloc_to_send.repeat_val = RES_ALLOC_REPEAT_FRAMES; // Example: schedule repeats per frame
+        res_alloc_to_send.sfn_present = true;       // Schedule starts at a specific SFN
+        res_alloc_to_send.channel_present = false;  // Assumes allocation is on FT's current operating carrier
+        res_alloc_to_send.rlf_present = false;      // No dectScheduledResourceFailure timer info for now
+
+        // Determine PT's mu for setting 9-bit flags
+        uint8_t target_pt_mu_code = 0; // Default mu_code 0 (mu=1)
         if (peer_slot_idx != -1 && ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known) {
             target_pt_mu_code = ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu;
+        } else {
+            LOG_WRN("FT_ASSOC_RESP: Target PT (slot %d) mu not known for ResAlloc. Defaulting to 8-bit StartSubslot format.", peer_slot_idx);
         }
-        local_res_alloc_fields.res1_is_9bit_subslot = (target_pt_mu_code > 2);
-        local_res_alloc_fields.res2_is_9bit_subslot = (target_pt_mu_code > 2);
-        local_res_alloc_fields.start_subslot_val_res1 = 10; local_res_alloc_fields.length_val_res1 = 2 - 1;
-        local_res_alloc_fields.start_subslot_val_res2 = 14; local_res_alloc_fields.length_val_res2 = 2 - 1;
-        local_res_alloc_fields.repeat_val = RES_ALLOC_REPEAT_FRAMES;
-        local_res_alloc_fields.repetition_value = 10; local_res_alloc_fields.validity_value = 100;
-        local_res_alloc_fields.sfn_val = (ctx->role_ctx.ft.sfn + 2) & 0xFF;
-        if (peer_slot_idx != -1) { /* ... store schedule ... */ }
+        // ETSI: 9-bit if mu > 4. mu_code 0,1,2 for mu=1,2,4. mu_code 3 for mu=8. So, 9-bit if mu_code > 2.
+        bool pt_uses_9bit_ss = (target_pt_mu_code > 2);
+        res_alloc_to_send.res1_is_9bit_subslot = pt_uses_9bit_ss;
+        res_alloc_to_send.res2_is_9bit_subslot = pt_uses_9bit_ss; // Assuming symmetric for BIDIR
 
-        ie_payload_len = serialize_resource_alloc_ie_payload(temp_ie_payload_buf, sizeof(temp_ie_payload_buf), &local_res_alloc_fields);
+        // Define a simple static schedule (e.g., 2 subslots for DL, 2 for UL)
+        // TODO: This should be dynamic based on FT's scheduler logic and PT's needs/capabilities
+        res_alloc_to_send.start_subslot_val_res1 = 10; // Example: DL for PT at subslot 10
+        res_alloc_to_send.length_type_is_slots_res1 = false;
+        res_alloc_to_send.length_val_res1 = 2 - 1;     // 2 subslots long (N-1 coded)
+
+        res_alloc_to_send.start_subslot_val_res2 = 14; // Example: UL from PT at subslot 14
+        res_alloc_to_send.length_type_is_slots_res2 = false;
+        res_alloc_to_send.length_val_res2 = 2 - 1;     // 2 subslots long
+
+        res_alloc_to_send.repetition_value = CONFIG_DECT_MAC_FT_DEFAULT_SCHEDULE_REPEAT_FRAMES; // e.g., Kconfig for 10 frames
+        res_alloc_to_send.validity_value = CONFIG_DECT_MAC_FT_DEFAULT_SCHEDULE_VALIDITY_FRAMES;   // e.g., Kconfig for 100 frames
+        // Schedule starts a few frames in the future to allow PT to process
+        res_alloc_to_send.sfn_val = (ctx->role_ctx.ft.sfn + CONFIG_DECT_MAC_FT_SCHEDULE_START_SFN_OFFSET) & 0xFF;
+
+        // Store this schedule in FT's context for this PT
+        if (peer_slot_idx != -1) {
+            dect_mac_schedule_t *pt_sched = &ctx->role_ctx.ft.peer_schedules[peer_slot_idx];
+            pt_sched->is_active = true;
+            pt_sched->alloc_type = res_alloc_to_send.alloc_type_val; // BIDIR
+            // DL part (Res1 from FT's perspective is DL to PT)
+            pt_sched->dl_start_subslot = res_alloc_to_send.start_subslot_val_res1;
+            pt_sched->dl_duration_subslots = res_alloc_to_send.length_val_res1 + 1;
+            pt_sched->dl_length_is_slots = res_alloc_to_send.length_type_is_slots_res1;
+            pt_sched->res1_is_9bit_subslot = res_alloc_to_send.res1_is_9bit_subslot;
+            // UL part (Res2 from FT's perspective is UL from PT)
+            pt_sched->ul_start_subslot = res_alloc_to_send.start_subslot_val_res2;
+            pt_sched->ul_duration_subslots = res_alloc_to_send.length_val_res2 + 1;
+            pt_sched->ul_length_is_slots = res_alloc_to_send.length_type_is_slots_res2;
+            pt_sched->res2_is_9bit_subslot = res_alloc_to_send.res2_is_9bit_subslot;
+
+            pt_sched->repeat_type = res_alloc_to_send.repeat_val;
+            pt_sched->repetition_value = res_alloc_to_send.repetition_value;
+            pt_sched->validity_value = res_alloc_to_send.validity_value;
+            pt_sched->channel = res_alloc_to_send.channel_present ? res_alloc_to_send.channel_val : ctx->role_ctx.ft.operating_carrier;
+            pt_sched->schedule_init_modem_time = ctx->last_known_modem_time; // Time this schedule is being defined
+            pt_sched->sfn_of_initial_occurrence = res_alloc_to_send.sfn_val;
+            
+            // Calculate next occurrence for FT's DL part to PT
+            pt_sched->next_occurrence_modem_time = calculate_target_modem_time(ctx, ctx->ft_sfn_zero_modem_time_anchor,
+                                                                              0, /* Anchor is for SFN 0 */
+                                                                              res_alloc_to_send.sfn_val,
+                                                                              res_alloc_to_send.start_subslot_val_res1,
+                                                                              ctx->own_phy_params.mu, // FT's mu for its DL TX
+                                                                              ctx->own_phy_params.beta);
+            update_next_occurrence(ctx, pt_sched, ctx->last_known_modem_time); // Ensure it's future
+            LOG_INF("FT_ASSOC_RESP: Stored initial schedule for PT slot %d. Next DL op @ %llu", peer_slot_idx, pt_sched->next_occurrence_modem_time);
+        }
+
+        ie_payload_len = serialize_resource_alloc_ie_payload(temp_ie_payload_buf, sizeof(temp_ie_payload_buf), &res_alloc_to_send);
+
+
+
+
         if (ie_payload_len < 0) { LOG_ERR("FT_ASSOC_RESP: Serialize Res Alloc IE failed: %d", ie_payload_len); return; }
         mux_hdr_len = build_mac_mux_header_internal(sdu_area_buf + sdu_area_len_built_bytes, sizeof(sdu_area_buf) - sdu_area_len_built_bytes, IE_TYPE_RES_ALLOC, (uint16_t)ie_payload_len, 0);
         if (mux_hdr_len < 0) { LOG_ERR("FT_ASSOC_RESP: Build MUX for Res Alloc failed: %d", mux_hdr_len); return; }
