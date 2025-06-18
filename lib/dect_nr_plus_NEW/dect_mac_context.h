@@ -416,9 +416,10 @@ typedef struct {
 
     // DCS (Dynamic Channel Selection) state
     uint8_t dcs_current_channel_scan_index; // Index into a list of channels to scan
-    uint16_t dcs_candidate_channels[CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN]; // Array to store channels
-    int16_t dcs_candidate_rssi_avg[CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN]; // Avg RSSI for scanned channels
-    uint8_t dcs_candidate_busy_percent[CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN]; // Placeholder for occupancy
+    uint16_t dcs_candidate_channels[CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN];
+    int16_t dcs_candidate_rssi_avg[CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN];
+    uint8_t dcs_candidate_busy_percent[CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN];
+    uint8_t dcs_num_valid_candidate_channels; // Actual number of channels populated from Kconfig
     bool dcs_scan_complete;
 } ft_context_t;
 

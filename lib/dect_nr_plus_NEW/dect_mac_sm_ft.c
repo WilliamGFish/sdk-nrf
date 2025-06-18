@@ -69,96 +69,100 @@ void dect_mac_sm_ft_start_operation(void) {
     // Initialize DCS context
     ctx->role_ctx.ft.dcs_current_channel_scan_index = 0;
     ctx->role_ctx.ft.dcs_scan_complete = false;
+    ctx->role_ctx.ft.dcs_num_valid_candidate_channels = 0; // Initialize
     for (int i = 0; i < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN; i++) {
-        ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] = NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED; // Indicates not scanned or invalid
-        ctx->role_ctx.ft.dcs_candidate_busy_percent[i] = 101; // Indicates not scanned
+        ctx->role_ctx.ft.dcs_candidate_channels[i] = 0; // Mark as unpopulated
+        ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] = NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED;
+        ctx->role_ctx.ft.dcs_candidate_busy_percent[i] = 101; // Mark as not scanned
     }
 
-    // Populate candidate channels - TODO: Get this from Kconfig or a fixed list
+    // Populate candidate channels from Kconfig string
     if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN > 0) {
         const char *chan_list_str = CONFIG_DECT_MAC_DCS_CHANNEL_LIST;
         char *next_chan_str;
         char *search_start = (char *)chan_list_str;
-        int count = 0;
+        int parsed_count = 0;
 
-        for (count = 0; count < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN; count++) {
+        while (parsed_count < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN && *search_start != '\0') {
             long chan_val = strtol(search_start, &next_chan_str, 10); // Assuming kHz are decimal
-            if (search_start == next_chan_str) { // No number parsed
-                if (count == 0) LOG_ERR("FT_DCS_INIT: No valid channels in Kconfig list '%s'", chan_list_str);
-                break; // Stop if no more numbers
+
+            if (search_start == next_chan_str) { // No number was parsed from this segment
+                if (*search_start != ',' && *search_start != '\0') { // Invalid character encountered
+                    LOG_WRN("FT_DCS_INIT: Invalid character '%c' in Kconfig channel list. Stopping parse.", *search_start);
+                } // If it was ',' or '\0', it's fine, loop will handle.
+                break; 
             }
-            if (chan_val <= 0 || chan_val > UINT16_MAX) { // Basic validation for carrier frequency
-                LOG_WRN("FT_DCS_INIT: Invalid channel value %ld from Kconfig list. Skipping.", chan_val);
+            
+            // Basic validation for carrier frequency (e.g. 1-2 GHz range in kHz)
+            if (chan_val >= 100000 && chan_val <= 3000000) { // Example valid range in kHz
+                ctx->role_ctx.ft.dcs_candidate_channels[parsed_count] = (uint16_t)chan_val;
+                LOG_DBG("FT_DCS_INIT: Added candidate channel %u kHz to scan list (idx %d).",
+                        (uint16_t)chan_val, parsed_count);
+                parsed_count++;
             } else {
-                ctx->role_ctx.ft.dcs_candidate_channels[count] = (uint16_t)chan_val;
-                LOG_DBG("FT_DCS_INIT: Added candidate channel %u kHz", (uint16_t)chan_val);
+                LOG_WRN("FT_DCS_INIT: Parsed channel value %ld kHz from Kconfig list is out of plausible range. Skipping.", chan_val);
             }
 
             if (*next_chan_str == ',') {
                 search_start = next_chan_str + 1;
+                if (*search_start == '\0' && parsed_count < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN) {
+                    // Trailing comma with no more numbers
+                    LOG_WRN("FT_DCS_INIT: Trailing comma in Kconfig channel list.");
+                    break;
+                }
             } else if (*next_chan_str == '\0') { // End of string
-                count++; // Account for the last parsed channel
                 break;
-            } else { // Invalid format
-                LOG_WRN("FT_DCS_INIT: Invalid format in Kconfig channel list near '%s'", next_chan_str);
+            } else { // Invalid character after number, not a comma or null terminator
+                LOG_WRN("FT_DCS_INIT: Invalid format in Kconfig channel list after number '%ld', found '%c'. Stopping parse.", chan_val, *next_chan_str);
                 break;
             }
         }
-        if (count < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN && count > 0) {
-            LOG_WRN("FT_DCS_INIT: Kconfig provided %d channels, but configured to scan %d. Will scan %d.",
-                    count, CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, count);
-            // Effectively reduce the number of channels to scan if Kconfig list is shorter
-            // This requires CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN to be non-const or use a runtime var.
-            // For simplicity, we assume Kconfig list provides at least NUM_CHANNELS_TO_SCAN,
-            // or the loop naturally stops. The scan loop uses CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN.
-            // It's better if the loop limit is min(CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, actual_parsed_count).
-            // For now, the scan loop will just use uninitialized entries if count < CONFIG_...
-            // Let's ensure we only scan validly populated channels.
-            // A dynamic count_to_scan could be added to ft_context.
-        } else if (count == 0) {
-             LOG_ERR("FT_DCS_INIT: Failed to parse any valid channels from Kconfig. Using default carrier.");
-             ctx->role_ctx.ft.dcs_candidate_channels[0] = CONFIG_DECT_MAC_FT_DEFAULT_OPERATING_CARRIER_KHZ;
-             // Set a runtime count of channels to scan to 1.
-             // This needs a field like ctx->role_ctx.ft.dcs_actual_channels_to_scan = 1;
-             // And the scan loop should use this runtime count.
-        }
+        ctx->role_ctx.ft.dcs_num_valid_candidate_channels = parsed_count;
+        LOG_INF("FT_DCS_INIT: Parsed %u valid candidate channels from Kconfig for DCS.", parsed_count);
     }
 
-    if (CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN == 0) {
-        LOG_WRN("FT SM: DCS channel scan count is 0. Defaulting to operating_carrier %u and starting beaconing.", ctx->role_ctx.ft.operating_carrier);
-        // Fallback to immediate beaconing on default configured carrier if no scan channels
-        if (ctx->role_ctx.ft.operating_carrier == 0) ctx->role_ctx.ft.operating_carrier = DEFAULT_DECT_CARRIER;
-        ft_start_beaconing_actions(); // This will transition to FT_BEACONING
+
+    if (ctx->role_ctx.ft.dcs_num_valid_candidate_channels == 0) {
+        LOG_WRN("FT SM: DCS: No valid channels to scan from Kconfig or count is 0. Defaulting to operating_carrier %u and starting beaconing.",
+                CONFIG_DECT_MAC_FT_DEFAULT_OPERATING_CARRIER_KHZ);
+        ctx->role_ctx.ft.operating_carrier = CONFIG_DECT_MAC_FT_DEFAULT_OPERATING_CARRIER_KHZ;
+        if (ctx->role_ctx.ft.operating_carrier == 0) { // Absolute fallback
+             ctx->role_ctx.ft.operating_carrier = 1881792; // ETSI Ch0
+        }
+        ft_start_beaconing_actions();
         return;
     }
 
+    // Start scanning the first valid candidate channel
+    ctx->role_ctx.ft.dcs_current_channel_scan_index = 0; // Already 0, but for clarity
     uint16_t scan_carrier = ctx->role_ctx.ft.dcs_candidate_channels[0];
-    LOG_INF("FT SM: Starting DCS scan, 1/%d on carrier %u.", CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, scan_carrier);
+    LOG_INF("FT SM: Starting DCS scan, 1/%u on carrier %u.",
+            ctx->role_ctx.ft.dcs_num_valid_candidate_channels, scan_carrier);
 
     uint32_t phy_op_handle = sys_rand32_get();
-    // Duration calculation logic from previous ft_start_operation
-    uint32_t scan_duration_total_subslots = SCAN_MEAS_DURATION_SLOTS_CONFIG * SUB_SLOTS_PER_ETSI_SLOT;
-    uint32_t subslot_ticks = get_subslot_duration_ticks(ctx);
+    uint32_t scan_duration_total_subslots = SCAN_MEAS_DURATION_SLOTS_CONFIG * get_subslots_per_etsi_slot_for_mu(ctx->own_phy_params.mu);
+    uint32_t subslot_ticks = get_subslot_duration_ticks_for_mu(ctx->own_phy_params.mu);
     uint32_t scan_duration_modem_units = scan_duration_total_subslots * subslot_ticks;
-    if (subslot_ticks == 0) scan_duration_modem_units = modem_us_to_ticks(10000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
-    else if (scan_duration_modem_units < subslot_ticks) scan_duration_modem_units = subslot_ticks * SUB_SLOTS_PER_ETSI_SLOT;
+
+    if (subslot_ticks == 0 || scan_duration_modem_units < ft_subslot_duration_ticks) { // Use ft_subslot_duration_ticks from context if available
+        scan_duration_modem_units = modem_us_to_ticks(10000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); // Default 10ms
+        LOG_WRN("FT_DCS_INIT: Subslot/scan duration calc error, using default %u TU.", scan_duration_modem_units);
+    }
+
 
     int ret = dect_mac_phy_ctrl_start_rssi_scan(
         scan_carrier,
         scan_duration_modem_units,
-        NRF_MODEM_DECT_PHY_RSSI_INTERVAL_24_SLOTS, // Or a value that gives enough samples
+        NRF_MODEM_DECT_PHY_RSSI_INTERVAL_24_SLOTS,
         phy_op_handle,
         PENDING_OP_FT_INITIAL_SCAN);
 
     if (ret != 0) {
         LOG_ERR("FT SM: Failed to start initial RSSI scan for DCS (channel %u): %d. Retrying after delay.", scan_carrier, ret);
-        // Use beacon_timer for generic retry, or a dedicated DCS retry mechanism
         k_timer_start(&ctx->role_ctx.ft.beacon_timer, K_SECONDS(1), K_NO_WAIT);
-        dect_mac_change_state(MAC_STATE_IDLE); // Go back to IDLE to retry init sequence
+        dect_mac_change_state(MAC_STATE_IDLE);
     }
 }
-
-
 
 
 void dect_mac_sm_ft_handle_event(const struct dect_mac_event_msg *msg) {
@@ -459,16 +463,16 @@ static void ft_select_operating_carrier_and_start_beaconing(const struct nrf_mod
     int selected_idx = -1;
     int num_potentially_good_candidates = 0;
 
-    LOG_INF("FT_DCS_SEL: Evaluating %d scanned channels for selection. Busy_Threshold <= %d%%, Noisy_Threshold < %ddBm.",
-            CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN,
+    LOG_INF("FT_DCS_SEL: Evaluating %u scanned channels for selection. Busy_Threshold <= %d%%, Noisy_Threshold < %ddBm.",
+            ctx->role_ctx.ft.dcs_num_valid_candidate_channels, // Use actual count
             CONFIG_DECT_MAC_DCS_ACCEPTABLE_BUSY_PERCENT,
             CONFIG_DECT_MAC_DCS_NOISY_THRESHOLD_DBM);
 
-    for (int i = 0; i < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN; i++) {
-        if (ctx->role_ctx.ft.dcs_candidate_channels[i] == 0 || // Ensure channel was populated
-            ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] == NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED ||
-            ctx->role_ctx.ft.dcs_candidate_busy_percent[i] > 100) { // Ensure scanned
-            LOG_DBG("  Skipping candidate %d: Not scanned or invalid carrier/RSSI.", i);
+    for (int i = 0; i < ctx->role_ctx.ft.dcs_num_valid_candidate_channels; i++) { // Use actual count
+        // dcs_candidate_channels[i] should be valid if i < dcs_num_valid_candidate_channels
+        if (ctx->role_ctx.ft.dcs_candidate_rssi_avg[i] == NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED ||
+            ctx->role_ctx.ft.dcs_candidate_busy_percent[i] > 100) { // Check if this specific entry has valid scan data
+            LOG_DBG("  Skipping candidate %d (C%u): RSSI/Busy data invalid.", i, ctx->role_ctx.ft.dcs_candidate_channels[i]);
             continue;
         }
 
@@ -503,6 +507,11 @@ static void ft_select_operating_carrier_and_start_beaconing(const struct nrf_mod
                     final_selected_carrier, (float)best_rssi_found_q71 / 2.0f, current_busy_pc);
         }
     }
+
+
+
+
+
 
     if (selected_idx != -1 && final_selected_carrier != 0) {
         ctx->role_ctx.ft.operating_carrier = final_selected_carrier;
@@ -950,52 +959,56 @@ static void ft_handle_phy_op_complete_ft(const struct nrf_modem_dect_phy_op_comp
     dect_mac_context_t* ctx = get_mac_context();
     switch (completed_op_type) {
         case PENDING_OP_FT_INITIAL_SCAN:
-            LOG_INF("FT SM: DCS Scan for channel %u (idx %u) completed (err %d).",
-                    ctx->role_ctx.ft.dcs_candidate_channels[ctx->role_ctx.ft.dcs_current_channel_scan_index],
-                    ctx->role_ctx.ft.dcs_current_channel_scan_index,
-                    event->err);
+            if (ctx->role_ctx.ft.dcs_current_channel_scan_index < ctx->role_ctx.ft.dcs_num_valid_candidate_channels) {
+                 LOG_INF("FT SM: DCS Scan for channel %u (idx %u of %u) completed (err %d).",
+                        ctx->role_ctx.ft.dcs_candidate_channels[ctx->role_ctx.ft.dcs_current_channel_scan_index],
+                        ctx->role_ctx.ft.dcs_current_channel_scan_index + 1, // 1-based for logging
+                        ctx->role_ctx.ft.dcs_num_valid_candidate_channels,
+                        event->err);
+            } // else, this might be a stale completion if dcs_current_channel_scan_index was reset.
 
             if (event->err != NRF_MODEM_DECT_PHY_SUCCESS && event->err != NRF_MODEM_DECT_PHY_ERR_OP_CANCELED) {
-                LOG_ERR("FT_DCS: Scan op for C%u failed (err %d). Marking as unusable.",
-                         ctx->role_ctx.ft.dcs_candidate_channels[ctx->role_ctx.ft.dcs_current_channel_scan_index], event->err);
-                // Mark this channel as bad in results, e.g. very high RSSI
-                ctx->role_ctx.ft.dcs_candidate_rssi_avg[ctx->role_ctx.ft.dcs_current_channel_scan_index] = 127*2; // Effectively +127dBm
+                if (ctx->role_ctx.ft.dcs_current_channel_scan_index < ctx->role_ctx.ft.dcs_num_valid_candidate_channels) {
+                    LOG_ERR("FT_DCS: Scan op for C%u failed (err %d). Marking as unusable.",
+                            ctx->role_ctx.ft.dcs_candidate_channels[ctx->role_ctx.ft.dcs_current_channel_scan_index], event->err);
+                    ctx->role_ctx.ft.dcs_candidate_rssi_avg[ctx->role_ctx.ft.dcs_current_channel_scan_index] = INT16_MAX; // Mark as very noisy
+                    ctx->role_ctx.ft.dcs_candidate_busy_percent[ctx->role_ctx.ft.dcs_current_channel_scan_index] = 100;
+                }
             }
-            // Note: RSSI results themselves are processed in ft_handle_phy_rssi_ft
 
             ctx->role_ctx.ft.dcs_current_channel_scan_index++;
-            if (ctx->role_ctx.ft.dcs_current_channel_scan_index < CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN) {
-                // Scan next channel
+            if (ctx->role_ctx.ft.dcs_current_channel_scan_index < ctx->role_ctx.ft.dcs_num_valid_candidate_channels) {
                 uint16_t next_scan_carrier = ctx->role_ctx.ft.dcs_candidate_channels[ctx->role_ctx.ft.dcs_current_channel_scan_index];
                 LOG_INF("FT SM: Starting DCS scan %u/%u on carrier %u.",
-                        ctx->role_ctx.ft.dcs_current_channel_scan_index + 1, CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, next_scan_carrier);
+                        ctx->role_ctx.ft.dcs_current_channel_scan_index + 1,
+                        ctx->role_ctx.ft.dcs_num_valid_candidate_channels, next_scan_carrier);
 
                 uint32_t phy_op_handle = sys_rand32_get();
-                uint32_t scan_duration_total_subslots = SCAN_MEAS_DURATION_SLOTS_CONFIG * SUB_SLOTS_PER_ETSI_SLOT;
-                uint32_t subslot_ticks = get_subslot_duration_ticks(ctx);
+                uint32_t scan_duration_total_subslots = SCAN_MEAS_DURATION_SLOTS_CONFIG * get_subslots_per_etsi_slot_for_mu(ctx->own_phy_params.mu);
+                uint32_t subslot_ticks = get_subslot_duration_ticks_for_mu(ctx->own_phy_params.mu);
                 uint32_t scan_duration_modem_units = scan_duration_total_subslots * subslot_ticks;
-                if (subslot_ticks == 0) scan_duration_modem_units = modem_us_to_ticks(10000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
-                else if (scan_duration_modem_units < subslot_ticks) scan_duration_modem_units = subslot_ticks * SUB_SLOTS_PER_ETSI_SLOT;
+                if (subslot_ticks == 0 || scan_duration_modem_units < ft_subslot_duration_ticks) { // Use local var for safety
+                     scan_duration_modem_units = modem_us_to_ticks(10000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+                }
 
                 int ret = dect_mac_phy_ctrl_start_rssi_scan(
-                    next_scan_carrier,
-                    scan_duration_modem_units,
-                    NRF_MODEM_DECT_PHY_RSSI_INTERVAL_24_SLOTS, // Or other suitable interval
-                    phy_op_handle,
-                    PENDING_OP_FT_INITIAL_SCAN); // Same op type for iterative scanning
+                    next_scan_carrier, scan_duration_modem_units,
+                    NRF_MODEM_DECT_PHY_RSSI_INTERVAL_24_SLOTS,
+                    phy_op_handle, PENDING_OP_FT_INITIAL_SCAN);
                 if (ret != 0) {
-                    LOG_ERR("FT SM: Failed to start next DCS scan (C%u): %d. Aborting DCS.", next_scan_carrier, ret);
-                    // Fallback: Try to use default carrier or best found so far if any
-                    ctx->role_ctx.ft.dcs_scan_complete = true; // Mark as complete to trigger selection
-                    ft_select_operating_carrier_and_start_beaconing(NULL); // Pass NULL, selection uses stored results
+                    LOG_ERR("FT SM: Failed to start next DCS scan (C%u): %d. Proceeding with selection based on current results.", next_scan_carrier, ret);
+                    ctx->role_ctx.ft.dcs_scan_complete = true;
+                    ft_select_operating_carrier_and_start_beaconing(NULL);
                 }
             } else {
-                // All channels scanned
-                LOG_INF("FT SM: DCS scan sequence complete.");
+                LOG_INF("FT SM: DCS scan sequence complete (%u channels scanned).", ctx->role_ctx.ft.dcs_num_valid_candidate_channels);
                 ctx->role_ctx.ft.dcs_scan_complete = true;
-                ft_select_operating_carrier_and_start_beaconing(NULL); // Pass NULL, selection logic uses stored results
+                ft_select_operating_carrier_and_start_beaconing(NULL);
             }
             break;
+
+
+
         case PENDING_OP_FT_BEACON:
             if (event->err != NRF_MODEM_DECT_PHY_SUCCESS) {
                 LOG_ERR("FT SM: Beacon TX failed (err %d). Next beacon by timer.", event->err);
