@@ -497,27 +497,25 @@ static void ft_send_beacon_action(void) {
     
     // Ensure mu_value_for_ft_beacon is set correctly based on FT's operational mu.
     // This 'mu' should reflect the numerology the FT is currently operating with and advertising.
-    // It should be stored in the MAC context, e.g., ctx->phy_link_params.mu (assuming such a field exists and is valid).
-    // TODO: Ensure ctx->phy_link_params.mu (or equivalent for FT's own PHY config) is correctly initialized/updated.
-    uint8_t ft_operational_mu = 1; // Default/Placeholder if not found in context for FT's own mu
-    if (ctx->phy_link_params.is_valid && ctx->phy_link_params.mu > 0 && ctx->phy_link_params.mu <= 8) { // Example check
-        ft_operational_mu = ctx->phy_link_params.mu;
+    // It should be stored in the MAC context, e.g., ctx->own_phy_params.mu.
+    uint8_t ft_operational_mu_code = 0; // Default to mu-code 0 (actual mu=1)
+    if (ctx->own_phy_params.is_valid && ctx->own_phy_params.mu <= 7) { // mu_code is 0-7
+        ft_operational_mu_code = ctx->own_phy_params.mu;
     } else {
-        LOG_WRN("FT_BEACON_ACT: FT operational mu not available or invalid in context (is_valid:%d, mu:%d). Defaulting to mu=1 for RACH IE.",
-                ctx->phy_link_params.is_valid, ctx->phy_link_params.mu);
-        // Consider if this warning should be an error or if defaulting is acceptable.
+        LOG_WRN("FT_BEACON_ACT: FT's own operational mu_code not valid or not set in context (is_valid:%d, mu_code:%u). Defaulting to mu_code=0 for RACH IE.",
+                ctx->own_phy_params.is_valid, ctx->own_phy_params.mu);
     }
-    rach_adv_fields->mu_value_for_ft_beacon = ft_operational_mu;
-    LOG_DBG("FT_BEACON_ACT: Setting RACH IE mu_value_for_ft_beacon to %u for beacon SFN %u",
-            ft_operational_mu, ctx->role_ctx.ft.sfn);
+    rach_adv_fields->mu_value_for_ft_beacon = ft_operational_mu_code;
+    LOG_DBG("FT_BEACON_ACT: Setting RACH IE mu_value_for_ft_beacon (mu_code) to %u for beacon SFN %u",
+            ft_operational_mu_code, ctx->role_ctx.ft.sfn);
 
     // Ensure other critical RACH params like operating channel are also up-to-date before serialization.
-    // This should have been set by ft_select_operating_carrier_and_start_beaconing or similar config logic.
     if (rach_adv_fields->channel_abs_freq_num != ctx->role_ctx.ft.operating_carrier || !rach_adv_fields->channel_field_present) {
         LOG_INF("FT_BEACON_ACT: Updating RACH IE channel to current FT operating_carrier %u.", ctx->role_ctx.ft.operating_carrier);
         rach_adv_fields->channel_abs_freq_num = ctx->role_ctx.ft.operating_carrier;
-        rach_adv_fields->channel_field_present = true; // RACH typically on op channel
+        rach_adv_fields->channel_field_present = true;
     }
+
     // Other fields like start_subslot_index, num_subslots_or_slots, repetition_code, validity_frames,
     // response_window_subslots_val_minus_1, cwmin_sig_code, cwmax_sig_code, etc.,
     // are assumed to be correctly populated in ctx->role_ctx.ft.advertised_rach_params

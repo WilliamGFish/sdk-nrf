@@ -111,7 +111,7 @@ typedef struct { // ETSI 6.3.3.3 - Unicast Header
 
 // --- Information Element Structures (Payloads AFTER MAC Mux Header) ---
 typedef struct { // ETSI TS 103 636-4, Table 6.4.3.3-1 Resource Allocation IE fields
-    // --- Bitmap fields (as previously defined or to be defined) ---
+    // --- Bitmap fields ---
     dect_alloc_type_t alloc_type_val;
     bool add_allocation;
     bool id_present;
@@ -130,7 +130,7 @@ typedef struct { // ETSI TS 103 636-4, Table 6.4.3.3-1 Resource Allocation IE fi
     bool length_type_is_slots_res2;
     uint8_t length_val_res2;
 
-    // --- Optional fields based on bitmap (as previously defined or to be defined) ---
+    // --- Optional fields based on bitmap ---
     uint16_t short_rd_id_val;
     uint8_t repetition_value;       // Actual value (e.g. 1 means every frame/subslot)
     uint8_t validity_value;         // 0xFF for permanent
@@ -138,7 +138,7 @@ typedef struct { // ETSI TS 103 636-4, Table 6.4.3.3-1 Resource Allocation IE fi
     uint16_t channel_val;           // 13 MSB are channel, 3 LSB reserved (0)
     uint8_t dect_sched_res_fail_timer_code; // 4 MSB are code, 4 LSB reserved (0)
 
-    // --- Helper flags for (de)serialization, set by caller based on link's mu ---
+    // --- Helper flags for (de)serialization, set by caller/parser based on link's mu ---
     bool res1_is_9bit_subslot; // True if Start Subslot for Res1 should be 9 bits
     bool res2_is_9bit_subslot; // True if Start Subslot for Res2 should be 9 bits
 } dect_mac_resource_alloc_ie_fields_t;
