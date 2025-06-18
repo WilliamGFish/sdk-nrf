@@ -731,6 +731,7 @@ static void ft_send_beacon_action(void) {
 }
 
 
+
 /**
  * @brief Schedules a PHY RX operation for the FT to listen on its advertised RACH resources.
  */
@@ -748,6 +749,8 @@ static void ft_schedule_rach_listen_action(void) {
 
     const dect_mac_rach_info_ie_fields_t *rach_adv_fields = &ctx->role_ctx.ft.advertised_rach_params.advertised_beacon_ie_fields;
 
+    // Point 1: Uses Advertised Parameters - YES (rach_adv_fields)
+
     uint16_t rach_carrier = rach_adv_fields->channel_field_present ?
                             rach_adv_fields->channel_abs_freq_num :
                             ctx->role_ctx.ft.operating_carrier;
@@ -756,11 +759,11 @@ static void ft_schedule_rach_listen_action(void) {
         return;
     }
 
-    // Use the mu advertised by the FT for its RACH resources (stored when RACH IE fields were populated)
+    // Point 4 & 5 (partially): Duration and mu-awareness for timing
     uint8_t ft_mu_for_rach = rach_adv_fields->mu_value_for_ft_beacon;
-    if (ft_mu_for_rach > 7) { // mu_code is 0-7. Max typical DECT NR+ mu_code is 3 (mu=8)
+    if (ft_mu_for_rach > 7) { 
         LOG_WRN("FT_RACH_LSN: Invalid mu_code (%u) in FT's advertised RACH IE. Defaulting to mu_code=0 (mu=1).", ft_mu_for_rach);
-        ft_mu_for_rach = 0; // Default to mu_code 0 (actual mu=1)
+        ft_mu_for_rach = 0; 
     }
     uint32_t ft_subslot_duration_ticks = get_subslot_duration_ticks_for_mu(ft_mu_for_rach);
     if (ft_subslot_duration_ticks == 0) {
@@ -768,7 +771,7 @@ static void ft_schedule_rach_listen_action(void) {
         return;
     }
 
-    uint32_t rach_resource_len_actual_units = rach_adv_fields->num_subslots_or_slots; // This is N (actual units, 0-127)
+    uint32_t rach_resource_len_actual_units = rach_adv_fields->num_subslots_or_slots;
     uint32_t rach_resource_len_subslots = rach_resource_len_actual_units;
     if (rach_adv_fields->length_type_is_slots) {
         uint8_t subslots_per_etsi_slot_for_ft_mu = get_subslots_per_etsi_slot_for_mu(ft_mu_for_rach);
@@ -779,82 +782,84 @@ static void ft_schedule_rach_listen_action(void) {
         return;
     }
 
+    // Point 2: SFN Alignment (Target SFN Calculation)
     uint8_t target_sfn_for_rach;
-    uint8_t sfn_of_initial_rach_advertisement; // SFN where this RACH allocation definition starts
+    uint8_t sfn_of_initial_rach_advertisement; 
 
     if (rach_adv_fields->sfn_validity_present) {
         sfn_of_initial_rach_advertisement = rach_adv_fields->sfn_value;
-        target_sfn_for_rach = sfn_of_initial_rach_advertisement; // Start with the SFN specified in IE
+        target_sfn_for_rach = sfn_of_initial_rach_advertisement; 
 
-        uint8_t repetition_interval_frames = 1U << rach_adv_fields->repetition_code; // 00->1, 01->2, 10->4, 11->8
-
-        // Advance target_sfn_for_rach until it's at or after current FT SFN (ctx->role_ctx.ft.sfn),
-        // respecting the repetition interval.
-        while (1) {
+        uint8_t repetition_interval_frames = 1U << rach_adv_fields->repetition_code; 
+        if (repetition_interval_frames == 0 || repetition_interval_frames > 8) { // Code 0-3 maps to 1,2,4,8
+            LOG_WRN("FT_RACH_LSN: Invalid repetition_code %u, defaulting interval to 1 frame.", rach_adv_fields->repetition_code);
+            repetition_interval_frames = 1; 
+        }
+        
+        uint8_t sfn_loop_guard = 0; // To prevent potential infinite loop with bad params
+        while (sfn_loop_guard < 256) { // Max SFN cycle
             int16_t sfn_diff_to_current = (int16_t)target_sfn_for_rach - (int16_t)ctx->role_ctx.ft.sfn;
-            // Normalize diff to be shortest path, positive if target is in future/same SFN
-            if (sfn_diff_to_current < -128) sfn_diff_to_current += 256;
-            else if (sfn_diff_to_current > 128 && target_sfn_for_rach < ctx->role_ctx.ft.sfn) sfn_diff_to_current -=256;
+            if (sfn_diff_to_current > 128) sfn_diff_to_current -=256; 
+            else if (sfn_diff_to_current < -128) sfn_diff_to_current += 256;
 
-
-            if (sfn_diff_to_current >= 0) { // Target SFN is at or after current SFN
-                // Now check if it aligns with repetition from sfn_of_initial_rach_advertisement
+            if (sfn_diff_to_current >= 0) { 
                 int16_t frames_from_initial_adv = (int16_t)target_sfn_for_rach - (int16_t)sfn_of_initial_rach_advertisement;
                 if (frames_from_initial_adv < 0) frames_from_initial_adv += 256;
 
                 if ((uint8_t)frames_from_initial_adv % repetition_interval_frames == 0) {
-                    break; // Found a valid, upcoming, aligned SFN
+                    break; 
                 }
             }
-            target_sfn_for_rach = (target_sfn_for_rach + 1) & 0xFF; // Try next SFN
-            if (target_sfn_for_rach == sfn_of_initial_rach_advertisement && repetition_interval_frames > 1) {
-                 // Full cycle without finding aligned slot, something is wrong or validity expired.
-                 LOG_WRN("FT_RACH_LSN: Cycled SFNs without finding repetition match for SFN-based RACH.");
-                 return; // Avoid infinite loop
-            }
+            target_sfn_for_rach = (target_sfn_for_rach + 1) & 0xFF; // Check next SFN
+            sfn_loop_guard++;
+        }
+        if (sfn_loop_guard >= 256) {
+             LOG_ERR("FT_RACH_LSN: Could not find aligned SFN for SFN-based RACH. Check repetition/validity. Skipping.");
+             return;
         }
 
+
         int16_t frames_from_initial_validity_sfn = (int16_t)target_sfn_for_rach - (int16_t)sfn_of_initial_rach_advertisement;
-        if (frames_from_initial_validity_sfn < 0) frames_from_initial_validity_sfn += 256;
+        if (frames_from_initial_validity_sfn < 0) frames_from_initial_validity_sfn += 256; 
 
         if (rach_adv_fields->validity_frames != 0xFF && (uint8_t)frames_from_initial_validity_sfn >= rach_adv_fields->validity_frames) {
             LOG_WRN("FT_RACH_LSN: Advertised RACH validity expired for target SFN %u. Not listening.", target_sfn_for_rach);
             return;
         }
-    } else { // SFN field not present in RACH IE
-        // RACH is valid in frames relative to the beacon that advertised it.
-        // Repetition code still applies.
-        // FT should listen in the SFNs where this RACH instance would fall after its beacon.
-        // Simplification: listen in the current SFN (assuming beacon just went out or is about to).
-        target_sfn_for_rach = ctx->role_ctx.ft.sfn;
-        sfn_of_initial_rach_advertisement = ctx->role_ctx.ft.sfn_for_last_beacon_tx; // Repetition relative to this
-        // TODO: More robust logic for repetition if sfn_validity_present is false.
-        // For now, if SFN not present, assume it's for the current/next frame and repetition is not strictly SFN-locked beyond that.
+    } else { 
+        target_sfn_for_rach = ctx->role_ctx.ft.sfn; // Listen in current SFN cycle
+        sfn_of_initial_rach_advertisement = ctx->role_ctx.ft.sfn_for_last_beacon_tx; 
+        // TODO: If repetition_code is non-zero and sfn_validity_present is false, how is the repetition anchored?
+        // Assuming for now it means "every X frames/subslots starting from this beacon's frame context".
+        // The "too soon" loop will handle advancing if current SFN is already past the immediate opportunity.
+        LOG_DBG("FT_RACH_LSN: SFN not in RACH IE, targeting current SFN %u, repetition relative to beacon SFN %u",
+                target_sfn_for_rach, sfn_of_initial_rach_advertisement);
     }
 
-    uint8_t ft_own_mu_code_for_rach = rach_adv_fields->mu_value_for_ft_beacon; // Mu advertised in RACH IE
-    uint8_t ft_own_beta_code_for_rach = ctx->own_phy_params.is_valid ? ctx->own_phy_params.beta : 0; // FT's beta
-
+    // Point 3 & 5: Subslot Alignment & Modem Time Calculation
     uint64_t rach_listen_start_time = calculate_target_modem_time(ctx,
                                                                   ctx->ft_sfn_zero_modem_time_anchor,
-                                                                  ctx->current_sfn_at_anchor_update,
+                                                                  ctx->current_sfn_at_anchor_update, 
                                                                   target_sfn_for_rach,
                                                                   rach_adv_fields->start_subslot_index,
-                                                                  ft_own_mu_code_for_rach,
-                                                                  ft_own_beta_code_for_rach);
+                                                                  ft_mu_for_rach, /* FT's own mu for its RACH */
+                                                                  ctx->own_phy_params.beta /* FT's own beta */);
     
-    uint32_t listen_duration_subslots = rach_resource_len_subslots + 2; // Listen a bit longer
+    // Point 4: Duration
+    uint32_t listen_duration_subslots = rach_resource_len_subslots + 2; 
     uint32_t listen_duration_modem_units = listen_duration_subslots * ft_subslot_duration_ticks;
 
+    // Point 6: "Too Soon" Handling
     uint32_t min_prep_time_ticks = modem_us_to_ticks(ctx->phy_latency.idle_to_active_rx_us +
                                                      ctx->phy_latency.scheduled_operation_startup_us,
                                                      NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
     uint8_t initial_target_sfn_for_log = target_sfn_for_rach;
+    uint8_t advance_loop_guard = 0; // Prevent potential infinite loop in "too soon"
 
-    while (ctx->last_known_modem_time > 0 && rach_listen_start_time < (ctx->last_known_modem_time + min_prep_time_ticks)) {
-        LOG_WRN("FT_RACH_LSN: Target RACH listen SFN %u, SS %u at time %llu is too soon (curr %llu, prep %u). Advancing.",
-                target_sfn_for_rach, rach_adv_fields->start_subslot_index, rach_listen_start_time,
-                ctx->last_known_modem_time, min_prep_time_ticks);
+    while (ctx->last_known_modem_time > 0 && rach_listen_start_time < (ctx->last_known_modem_time + min_prep_time_ticks) && advance_loop_guard < 255) {
+        advance_loop_guard++;
+        LOG_WRN("FT_RACH_LSN: Target RACH listen SFN %u, SS %u at time %llu is too soon. Advancing by repetition.",
+                target_sfn_for_rach, rach_adv_fields->start_subslot_index, rach_listen_start_time);
 
         uint8_t repetition_interval_frames = 1U << rach_adv_fields->repetition_code;
         if (repetition_interval_frames == 0) repetition_interval_frames = 1; 
@@ -865,30 +870,28 @@ static void ft_schedule_rach_listen_action(void) {
             int16_t frames_from_initial_validity_sfn = (int16_t)target_sfn_for_rach - (int16_t)sfn_of_initial_rach_advertisement;
             if (frames_from_initial_validity_sfn < 0) frames_from_initial_validity_sfn += 256;
             if ((uint8_t)frames_from_initial_validity_sfn >= rach_adv_fields->validity_frames) {
-                LOG_WRN("FT_RACH_LSN: Next RACH repetition (SFN %u) would exceed validity period. Stopping listen attempts.", target_sfn_for_rach);
+                LOG_WRN("FT_RACH_LSN: Next RACH repetition (SFN %u) would exceed validity. Stopping listen.", target_sfn_for_rach);
                 return;
             }
         }
-        // Recalculate start time for the new target SFN, using same mu/beta as initial calc
         rach_listen_start_time = calculate_target_modem_time(ctx,
                                                               ctx->ft_sfn_zero_modem_time_anchor,
                                                               ctx->current_sfn_at_anchor_update,
                                                               target_sfn_for_rach,
                                                               rach_adv_fields->start_subslot_index,
-                                                              ft_own_mu_code_for_rach, // from earlier in this function
-                                                              ft_own_beta_code_for_rach); // from earlier in this function
-
-
-        LOG_INF("FT_RACH_LSN: Advanced to next RACH opportunity: SFN %u, new start_time %llu",
+                                                              ft_mu_for_rach,
+                                                              ctx->own_phy_params.beta);
+        LOG_INF("FT_RACH_LSN: Advanced to next RACH opp: SFN %u, new start_time %llu",
                 target_sfn_for_rach, rach_listen_start_time);
-        if (target_sfn_for_rach == initial_target_sfn_for_log && repetition_interval_frames > 0) {
-            LOG_WRN("FT_RACH_LSN: Cycled SFNs fully while advancing for 'too soon'. Check RACH params/timing. Skipping.");
-            return; // Avoid potential infinite loop if conditions are strange
-        }
+    }
+    if (advance_loop_guard >= 255) {
+        LOG_ERR("FT_RACH_LSN: Cycled SFNs fully while advancing for 'too soon'. Check RACH params/timing. Skipping.");
+        return;
     }
 
+
     if (listen_duration_modem_units == 0) {
-        LOG_ERR("FT_RACH_LSN: Calculated listen duration is 0 for mu_code %u. Aborting.", ft_mu);
+        LOG_ERR("FT_RACH_LSN: Calculated listen duration is 0 for mu_code %u. Aborting.", ft_mu_for_rach);
         return;
     }
 
@@ -911,8 +914,6 @@ static void ft_schedule_rach_listen_action(void) {
         LOG_ERR("FT_SM: Failed to schedule RACH RX window (SFN %u): %d", target_sfn_for_rach, ret);
     }
 }
-
-
 
 
 static int  ft_find_and_init_peer_slot(uint32_t pt_long_id, uint16_t pt_short_id, int16_t rssi) {
