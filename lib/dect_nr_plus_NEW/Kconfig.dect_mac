@@ -404,6 +404,15 @@ config DECT_MAC_FT_MIN_QUALITY_CODE
       Code for Min_Quality field in Cluster Beacon IE.
       Minimum quality for PT to consider associating.
 
+config DECT_MAC_DCS_ACCEPTABLE_BUSY_PERCENT
+    int "DCS Acceptable Channel Busy Percentage"
+    default 20 # Channels busier than this are heavily penalized or avoided
+    range 0 100
+    help
+      Maximum percentage of RSSI samples that can be above the 'busy' threshold
+      (rssi_threshold_max_dbm) for a channel to be considered a good candidate
+      during Dynamic Channel Selection by the FT.
+            
 endif # DECT_MAC_ROLE_IS_FT
 
 # MAC General Parameters (apply to both roles or are general config)

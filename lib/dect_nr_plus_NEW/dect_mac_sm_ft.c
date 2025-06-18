@@ -1072,25 +1072,37 @@ static void ft_handle_phy_rssi_ft(const struct nrf_modem_dect_phy_rssi_event *rs
     if (rssi_event->meas_len > 0) {
         int32_t rssi_sum = 0;
         int valid_count = 0;
+        // New calculation including busy percentage:
+        int busy_sample_count = 0;
+        int16_t busy_threshold_q71 = ctx->config.rssi_threshold_max_dbm * 2; // Convert dBm to Q7.1
+
         for (uint16_t i = 0; i < rssi_event->meas_len; ++i) {
             if (rssi_event->meas[i] != NRF_MODEM_DECT_PHY_RSSI_NOT_MEASURED) {
-                rssi_sum += rssi_event->meas[i];
-                valid_count++;
+                rssi_sum_q71 += rssi_event->meas[i];
+                valid_sample_count++;
+                if (rssi_event->meas[i] > busy_threshold_q71) {
+                    busy_sample_count++;
+                }
             }
         }
-        if (valid_count > 0) {
-            ctx->role_ctx.ft.dcs_candidate_rssi_avg[current_scan_idx] = rssi_sum / valid_count;
-            LOG_INF("FT_DCS: Scan %u/%u on C%u: Avg RSSI %.1f dBm (%d valid samples).",
+
+        if (valid_sample_count > 0) {
+            ctx->role_ctx.ft.dcs_candidate_rssi_avg[current_scan_idx] = rssi_sum_q71 / valid_sample_count;
+            ctx->role_ctx.ft.dcs_candidate_busy_percent[current_scan_idx] = (busy_sample_count * 100) / valid_sample_count;
+            LOG_INF("FT_DCS: Scan %u/%u on C%u: AvgRSSI %.1f dBm, Busy %u%% (%d/%d samples).",
                     current_scan_idx + 1, CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN,
-                    scanned_carrier, (float)ctx->role_ctx.ft.dcs_candidate_rssi_avg[current_scan_idx] / 2.0f,
-                    valid_count);
-            // TODO: Calculate busy percentage based on thresholds
-            // ctx->role_ctx.ft.dcs_candidate_busy_percent[current_scan_idx] = calculated_busy_pc;
+                    scanned_carrier,
+                    (float)ctx->role_ctx.ft.dcs_candidate_rssi_avg[current_scan_idx] / 2.0f,
+                    ctx->role_ctx.ft.dcs_candidate_busy_percent[current_scan_idx],
+                    busy_sample_count, valid_sample_count);
         } else {
             LOG_WRN("FT_DCS: Scan %u/%u on C%u: No valid RSSI samples.",
                     current_scan_idx + 1, CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, scanned_carrier);
-            ctx->role_ctx.ft.dcs_candidate_rssi_avg[current_scan_idx] = 0; // Or some other marker for no valid data
+            ctx->role_ctx.ft.dcs_candidate_rssi_avg[current_scan_idx] = 0; // Or INT16_MAX to mark as unusable
+            ctx->role_ctx.ft.dcs_candidate_busy_percent[current_scan_idx] = 101; // Mark as unscanned/invalid
         }
+
+
     } else {
         LOG_WRN("FT_DCS: Scan %u/%u on C%u: RSSI event with no measurements.",
                 current_scan_idx + 1, CONFIG_DECT_MAC_DCS_NUM_CHANNELS_TO_SCAN, scanned_carrier);
