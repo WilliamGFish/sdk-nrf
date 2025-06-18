@@ -1600,10 +1600,26 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
                 LOG_DBG("PT_SM_ASSOC_RESP: Parsed FT RD Capability IE.");
             } else { LOG_ERR("PT_SM_ASSOC_RESP: Failed to parse FT RD Cap IE."); }
         } else if (ie_type == IE_TYPE_RES_ALLOC) {
-            if (parse_resource_alloc_ie_payload(ie_payload_ptr, ie_payload_len, &res_alloc_fields) == 0) {
+            // Determine the mu of the FT that sent this Resource Allocation IE.
+            // This should have been parsed from the FT's RD Capability IE (if ft_caps_found is true).
+            uint8_t ft_mu_for_res_alloc_parse = 0; // Default to mu_code 0 (actual mu=1)
+            if (ft_caps_found && ft_caps_parsed.num_phy_capabilities >= 1 && // Check if explicit set was parsed
+                ft_caps_parsed.phy_variants[0].mu_value <= 7) { // mu_code is 0-7
+                ft_mu_for_res_alloc_parse = ft_caps_parsed.phy_variants[0].mu_value;
+            } else {
+                LOG_WRN("PT_SM_ASSOC_RESP: FT mu not available from RD Cap for ResAlloc parse. Defaulting to mu_code=0 (mu=1).");
+            }
+
+            if (parse_resource_alloc_ie_payload(ie_payload_data, ie_len,
+                                                ft_mu_for_res_alloc_parse, /* Pass FT's mu code */
+                                                &res_alloc_fields) == 0) {
                 res_alloc_found = true;
-                LOG_DBG("PT_SM_ASSOC_RESP: Parsed Resource Allocation IE (Type %u).", res_alloc_fields.alloc_type_val);
-            } else { LOG_ERR("PT_SM_ASSOC_RESP: Failed to parse Res Alloc IE."); }
+                LOG_DBG("PT_SM_ASSOC_RESP: Parsed Resource Allocation IE (Type %u) using FT_mu_code=%u.",
+                        res_alloc_fields.alloc_type_val, ft_mu_for_res_alloc_parse);
+                // The res_alloc_fields.resX_is_9bit_subslot flags are now set by the parser based on ft_mu_for_res_alloc_parse
+            } else {
+                LOG_ERR("PT_SM_ASSOC_RESP: Failed to parse Res Alloc IE (using FT_mu_code=%u).", ft_mu_for_res_alloc_parse);
+            }
         } else {
             LOG_DBG("PT_SM_ASSOC_RESP: Skipping MUX IE type 0x%X.", ie_type);
         }

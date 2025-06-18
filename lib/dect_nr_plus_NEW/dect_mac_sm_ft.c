@@ -1607,18 +1607,23 @@ static void ft_process_association_request_pdu(const uint8_t *mac_sdu_area_data,
     ft_send_association_response_action(pt_tx_long_rd_id, pt_tx_short_rd_id, accept_association, peer_slot_idx);
 }
 
+
 static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t pt_short_rd_id,
-                                                bool accept_association, int peer_slot_idx) // peer_slot_idx is valid if accept_association is true
+                                                bool accept_association, int peer_slot_idx)
 {
     dect_mac_context_t* ctx = get_mac_context();
-    uint8_t sdu_area_buf[256]; // Buffer for MUXed IEs. Max size for:
-                               // [SecIE(6)] + [AssocResp(2-10)] + [RDCap(2-~60)] + [ResAlloc(4-~10)]
-    int sdu_area_len_cleartext = 0;
+    uint8_t sdu_area_buf[256]; // Increased size for potentially more IEs
+    int sdu_area_len_built_bytes = 0; // Tracks total length of MUXed IEs in sdu_area_buf
+    int ret; // For error codes from functions
+
+    // This variable will hold the length of the MUXed MAC Security Info IE if it's included.
+    // It's needed for calculating the encryption start point.
+    size_t len_of_muxed_sec_ie_for_crypto_calc = 0;
 
     bool secure_this_response = false;
     if (accept_association && peer_slot_idx != -1 &&
-        ctx->config.ft_policy_secure_on_assoc && // FT wants to secure this link
-        ctx->role_ctx.ft.keys_provisioned_for_peer[peer_slot_idx]) { // Keys were successfully derived
+        ctx->config.ft_policy_secure_on_assoc &&
+        ctx->role_ctx.ft.keys_provisioned_for_peer[peer_slot_idx]) {
         secure_this_response = true;
     }
 
@@ -1626,156 +1631,165 @@ static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t
     dect_mac_assoc_resp_ie_t resp_fields;
     memset(&resp_fields, 0, sizeof(resp_fields));
     resp_fields.ack_nack = accept_association;
-    resp_fields.harq_mod_present = false; // Simplification for Phase 5
-    resp_fields.number_of_flows_accepted = accept_association ? 0x07 : 0; // 7 = all requested flows accepted (0 for now)
-    resp_fields.group_assignment_active = false; // Simplification
-    resp_fields.reserved_3bits = 0;
-
+    // For initial association ACK, FT typically doesn't modify HARQ params requested by PT unless necessary.
+    // If PT requested specific HARQ params in its AssocReq, FT would evaluate them.
+    // For now, assume FT accepts PT's implicit/default HARQ request, so harq_mod_present = false.
+    resp_fields.harq_mod_present = false;
+    resp_fields.number_of_flows_accepted = accept_association ? 0x07 : 0; // 7 = all requested flows accepted (PT requested 0)
+    resp_fields.group_assignment_active = false; // Not using group assignment in this phase
+    resp_fields.reserved_3bits = 0; // Ensure reserved bits are zero
 
     if (!accept_association) {
-        resp_fields.reject_cause = ASSOC_REJECT_CAUSE_OTHER; // Example: Could be NO_RADIO_CAP, NO_HW_CAP etc.
+        resp_fields.reject_cause = ASSOC_REJECT_CAUSE_OTHER; // Example Could be NO_RADIO_CAP, NO_HW_CAP etc.
         resp_fields.reject_timer_code = 1; // Example: 5s (ETSI Table 6.4.2.5-2 maps code 1 to 5s)
     }
 
-    // 2. Populate FT's RD Capability IE fields (only if accepting)
-    dect_mac_rd_capability_ie_t ft_cap_fields; // Sent if accept_association is true
-    if (accept_association) {
-        memset(&ft_cap_fields, 0, sizeof(ft_cap_fields));
-        ft_cap_fields.num_phy_capabilities = 0;    // Minimal: 0 means 1 set described by common fields/PHY default
-        ft_cap_fields.release_version = 1;         // DECT NR+ Release 2 (code 1)
-        ft_cap_fields.supports_group_assignment = false; // Example
-        ft_cap_fields.supports_paging = true;            // Example: FT supports paging PTs
-        ft_cap_fields.operating_modes_code = 0b01;     // FT mode only
-        ft_cap_fields.supports_mesh = false;           // Example
-        ft_cap_fields.supports_sched_data = true;
-        ft_cap_fields.mac_security_modes_code = secure_this_response ? 0b01 : 0b00; // Supports Mode 1 if link will be secure
-    }
-
-    // 3. Populate Resource Allocation IE fields (only if accepting)
-    dect_mac_resource_alloc_ie_fields_t res_alloc_fields; // Sent if accept_association is true
-    if (accept_association) {
-        memset(&res_alloc_fields, 0, sizeof(res_alloc_fields));
-        res_alloc_fields.alloc_type_val = RES_ALLOC_TYPE_BIDIR;
-        res_alloc_fields.add_allocation = false; // New allocation
-        res_alloc_fields.id_present = false;     // This response is unicast to the PT
-        res_alloc_fields.repeat_val = RES_ALLOC_REPEAT_FRAMES;
-        res_alloc_fields.sfn_present = true;
-        res_alloc_fields.channel_present = false; // Use current FT operating carrier
-        res_alloc_fields.rlf_present = false;     // No dectScheduledResourceFailure timer info for now
-
-        // Example: Resource 1 (Downlink for PT)
-        res_alloc_fields.res1_is_9bit_subslot = false; // Assume mu <= 4 for PT link initially
-        res_alloc_fields.start_subslot_val_res1 = 10;  // Example: DL for PT starts at subslot 10
-        res_alloc_fields.length_type_is_slots_res1 = false;
-        res_alloc_fields.length_val_res1 = 2 - 1;      // 2 subslots long (N-1 coded)
-
-        // Example: Resource 2 (Uplink from PT)
-        res_alloc_fields.res2_is_9bit_subslot = false;
-        res_alloc_fields.start_subslot_val_res2 = 14;  // Example: UL from PT starts at subslot 14
-        res_alloc_fields.length_type_is_slots_res2 = false;
-        res_alloc_fields.length_val_res2 = 2 - 1;      // 2 subslots long
-
-        res_alloc_fields.repetition_value = 10; // Example: Repeat every 10 frames
-        res_alloc_fields.validity_value = 100;  // Example: Valid for 100 frames
-        uint8_t target_start_sfn = (ctx->role_ctx.ft.sfn + 2) & 0xFF; // Schedule starts in SFN+2 (example)
-        res_alloc_fields.sfn_val = target_start_sfn;
-
-        // FT also stores this schedule for the PT internally for its own scheduler
-        if (peer_slot_idx != -1) {
-            dect_mac_schedule_t *pt_sched_dl = &ctx->role_ctx.ft.peer_schedules[peer_slot_idx]; // Assuming one schedule for bi-dir
-            pt_sched_dl->is_active = true;
-            pt_sched_dl->alloc_type = RES_ALLOC_TYPE_DOWNLINK; // From FT's TX perspective
-            pt_sched_dl->dl_start_subslot = res_alloc_fields.start_subslot_val_res1;
-            pt_sched_dl->dl_duration_subslots = res_alloc_fields.length_val_res1 + 1;
-            pt_sched_dl->dl_length_is_slots = res_alloc_fields.length_type_is_slots_res1;
-            pt_sched_dl->ul_start_subslot = res_alloc_fields.start_subslot_val_res2; // Store UL info too
-            pt_sched_dl->ul_duration_subslots = res_alloc_fields.length_val_res2 + 1;
-            pt_sched_dl->ul_length_is_slots = res_alloc_fields.length_type_is_slots_res2;
-            pt_sched_dl->repeat_type = res_alloc_fields.repeat_val;
-            pt_sched_dl->repetition_value = res_alloc_fields.repetition_value;
-            pt_sched_dl->validity_value = res_alloc_fields.validity_value;
-            pt_sched_dl->channel = res_alloc_fields.channel_present ? res_alloc_fields.channel_val : ctx->role_ctx.ft.operating_carrier;
-            pt_sched_dl->schedule_init_modem_time = ctx->last_known_modem_time;
-            pt_sched_dl->sfn_of_initial_occurrence = target_start_sfn;
-            pt_sched_dl->next_occurrence_modem_time = calculate_target_modem_time(ctx, ctx->ft_sfn_zero_modem_time_anchor, ctx->role_ctx.ft.sfn, target_start_sfn, res_alloc_fields.start_subslot_val_res1);
-            update_next_occurrence(ctx, pt_sched_dl, ctx->last_known_modem_time);
-        }
-    }
-
     // --- SDU Area Construction ---
-    int current_sdu_area_offset = 0;
-    // int ie_len_written_val; // Declared later as needed
-    uint8_t temp_ie_payload_buf_resp[64]; // Temp buffer for individual IE payloads
-    size_t len_of_muxed_sec_ie_for_crypto_calc = 0; // Initialize
-
     // Prepend MAC Security Info IE if this response is secured
     if (secure_this_response) {
-        // For an Association Response that establishes security, FT *provides* its current HPC.
-        uint8_t sec_iv_type_for_assoc_resp = SEC_IV_TYPE_MODE1_HPC_PROVIDED;
-        // Check if FT also needs to request PT's HPC (e.g. if PT's AssocReq was unsecure but FT wants secure link)
-        // This is less common for AssocResp; usually, PT initiates HPC sync if needed after this.
-        // For now, FT just provides its HPC.
+        uint8_t ft_key_index_for_pt = ctx->role_ctx.ft.connected_pts[peer_slot_idx].current_key_index_for_peer; // Or a global FT key index if not per-peer index
+        uint8_t sec_iv_type_for_assoc_resp = SEC_IV_TYPE_MODE1_HPC_PROVIDED; // FT provides its HPC
 
         int ie_len_sec_info = build_mac_security_info_ie_muxed(
-            sdu_area_buf + current_sdu_area_offset,
-            sizeof(sdu_area_buf) - current_sdu_area_offset,
+            sdu_area_buf + sdu_area_len_built_bytes,
+            sizeof(sdu_area_buf) - sdu_area_len_built_bytes,
             0, // Version for SecIE
-            ctx->role_ctx.ft.connected_pts[peer_slot_idx].current_key_index_for_peer, // Use key index for this peer
+            ft_key_index_for_pt,
             sec_iv_type_for_assoc_resp,
-            ctx->hpc); // FT's own current global TX HPC
+            ctx->hpc); // FT's own current global TX HPC for this PDU
         
         if (ie_len_sec_info < 0) {
-            LOG_ERR("FT_ASSOC_RESP: Failed to build MAC Sec Info IE for secure response: %d", ie_len_sec_info);
-            return; // Cannot send secured response without it
+            LOG_ERR("FT_ASSOC_RESP: Failed to build MAC Sec Info IE: %d", ie_len_sec_info);
+            // Cannot send secured response without it. Could try unsecure or fail.
+            // For now, fail the operation if security was intended.
+            if (peer_slot_idx != -1) ctx->role_ctx.ft.connected_pts[peer_slot_idx].is_valid = false; // Invalidate slot
+            return;
         }
-        current_sdu_area_offset += ie_len_sec_info;
-        len_of_muxed_sec_ie_for_crypto_calc = ie_len_sec_info;
-        LOG_DBG("FT_ASSOC_RESP: Including MAC Sec Info IE (FT_HPC: %u, SecIVType: %u) in secure response.",
-                ctx->hpc, sec_iv_type_for_assoc_resp);
+        sdu_area_len_built_bytes += ie_len_sec_info;
+        len_of_muxed_sec_ie_for_crypto_calc = ie_len_sec_info; // Store for encryption calculation
+        LOG_DBG("FT_ASSOC_RESP: Added MUXed MAC Sec Info IE (len %d, FT_HPC: %u). Total SDU Area now: %d",
+                ie_len_sec_info, ctx->hpc, sdu_area_len_built_bytes);
 
         // If FT's global HPC wrap flag was set, sending this SecIE (which includes current HPC) consumes the flag.
         if(ctx->send_mac_sec_info_ie_on_next_tx && sec_iv_type_for_assoc_resp == SEC_IV_TYPE_MODE1_HPC_PROVIDED) {
             ctx->send_mac_sec_info_ie_on_next_tx = false;
-            LOG_DBG("FT_ASSOC_RESP: Cleared global send_mac_sec_info_ie_on_next_tx flag.");
         }
-        // If FT needed to request PT's HPC (self_needs_to_request_hpc_from_peer for this PT),
-        // and we sent RESYNC_INITIATE, clear that flag. (Not typical for AssocResp from FT).
+        // Clear peer-specific request if FT was responding to one (not typical for AssocResp)
+        if (peer_slot_idx != -1 && ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_requested_hpc_resync &&
+            sec_iv_type_for_assoc_resp == SEC_IV_TYPE_MODE1_HPC_PROVIDED) {
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_requested_hpc_resync = false;
+        }
     }
-
-
 
     // Add Association Response IE
-    ie_len_written_val = serialize_assoc_resp_ie_payload(temp_ie_payload_buf_resp, sizeof(temp_ie_payload_buf_resp), &resp_fields);
-    if (ie_len_written_val < 0) { LOG_ERR("FT_ASSOC_RESP: Serialize AssocResp IE failed: %d", ie_len_written_val); return; }
-    int mux_hdr_len_val = build_mac_mux_header_internal(sdu_area_buf + current_sdu_area_offset, sizeof(sdu_area_buf) - current_sdu_area_offset, IE_TYPE_ASSOC_RESP, ie_len_written_val, 0);
-    if (mux_hdr_len_val < 0) { LOG_ERR("FT_ASSOC_RESP: Build MUX for AssocResp IE failed: %d", mux_hdr_len_val); return; }
-    current_sdu_area_offset += mux_hdr_len_val;
-    if (current_sdu_area_offset + ie_len_written_val > sizeof(sdu_area_buf)) { LOG_ERR("FT_ASSOC_RESP: SDU area overflow for AssocResp IE."); return; }
-    memcpy(sdu_area_buf + current_sdu_area_offset, temp_ie_payload_buf_resp, ie_len_written_val);
-    current_sdu_area_offset += ie_len_written_val;
+    uint8_t temp_ie_payload_buf[64]; // Temp buffer for individual IE payloads
+    int ie_payload_len = serialize_assoc_resp_ie_payload(temp_ie_payload_buf, sizeof(temp_ie_payload_buf), &resp_fields);
+    if (ie_payload_len < 0) { LOG_ERR("FT_ASSOC_RESP: Serialize AssocResp IE payload failed: %d", ie_payload_len); return; }
+    
+    int mux_hdr_len = build_mac_mux_header_internal(sdu_area_buf + sdu_area_len_built_bytes,
+                                             sizeof(sdu_area_buf) - sdu_area_len_built_bytes,
+                                             IE_TYPE_ASSOC_RESP, (uint16_t)ie_payload_len, 0);
+    if (mux_hdr_len < 0) { LOG_ERR("FT_ASSOC_RESP: Build MUX for AssocResp IE failed: %d", mux_hdr_len); return; }
+    
+    if (sdu_area_len_built_bytes + mux_hdr_len + ie_payload_len > sizeof(sdu_area_buf)) { LOG_ERR("FT_ASSOC_RESP: SDU area overflow for AssocResp IE."); return; }
+    memcpy(sdu_area_buf + sdu_area_len_built_bytes + mux_hdr_len, temp_ie_payload_buf, ie_payload_len);
+    sdu_area_len_built_bytes += (mux_hdr_len + ie_payload_len);
+    LOG_DBG("FT_ASSOC_RESP: Added MUXed AssocRespIE. Total SDU Area now: %d", sdu_area_len_built_bytes);
 
     if (accept_association) {
-        // Add FT RD Capability IE
-        ie_len_written_val = serialize_rd_capability_ie_payload(temp_ie_payload_buf_resp, sizeof(temp_ie_payload_buf_resp), &ft_cap_fields);
-        if (ie_len_written_val < 0) { LOG_ERR("FT_ASSOC_RESP: Serialize FT RD Cap IE failed: %d", ie_len_written_val); return; }
-        mux_hdr_len_val = build_mac_mux_header_internal(sdu_area_buf + current_sdu_area_offset, sizeof(sdu_area_buf) - current_sdu_area_offset, IE_TYPE_RD_CAPABILITY, ie_len_written_val, 0);
-        if (mux_hdr_len_val < 0) { LOG_ERR("FT_ASSOC_RESP: Build MUX for RD Cap failed: %d", mux_hdr_len_val); return; }
-        current_sdu_area_offset += mux_hdr_len_val;
-        if (current_sdu_area_offset + ie_len_written_val > sizeof(sdu_area_buf)) { LOG_ERR("FT_ASSOC_RESP: SDU area overflow for RD Cap IE."); return; }
-        memcpy(sdu_area_buf + current_sdu_area_offset, temp_ie_payload_buf_resp, ie_len_written_val);
-        current_sdu_area_offset += ie_len_written_val;
+        // Populate and add FT's RD Capability IE
+        dect_mac_rd_capability_ie_t ft_cap_fields;
+        memset(&ft_cap_fields, 0, sizeof(ft_cap_fields));
+        ft_cap_fields.release_version = 1; // ETSI DECT NR+ Release 2
+        ft_cap_fields.num_phy_capabilities = 1; // FT provides one explicit 5-octet set
+        ft_cap_fields.supports_group_assignment = IS_ENABLED(CONFIG_DECT_MAC_FT_SUPPORTS_GROUP_ASSIGNMENT); // Kconfig
+        ft_cap_fields.supports_paging = IS_ENABLED(CONFIG_DECT_MAC_FT_SUPPORTS_PAGING);             // Kconfig
+        ft_cap_fields.operating_modes_code = 0b01; // FT mode only
+        ft_cap_fields.supports_mesh = IS_ENABLED(CONFIG_DECT_MAC_FT_SUPPORTS_MESH);               // Kconfig
+        ft_cap_fields.supports_sched_data = true;
+        ft_cap_fields.mac_security_modes_code = IS_ENABLED(CONFIG_DECT_MAC_SECURITY_ENABLE) ? 0b01 : 0b00;
 
-        // Add Resource Allocation IE
-        ie_len_written_val = serialize_resource_alloc_ie_payload(temp_ie_payload_buf_resp, sizeof(temp_ie_payload_buf_resp), &res_alloc_fields);
-        if (ie_len_written_val < 0) { LOG_ERR("FT_ASSOC_RESP: Serialize Res Alloc IE failed: %d", ie_len_written_val); return; }
-        mux_hdr_len_val = build_mac_mux_header_internal(sdu_area_buf + current_sdu_area_offset, sizeof(sdu_area_buf) - current_sdu_area_offset, IE_TYPE_RES_ALLOC, ie_len_written_val, 0);
-        if (mux_hdr_len_val < 0) { LOG_ERR("FT_ASSOC_RESP: Build MUX for Res Alloc failed: %d", mux_hdr_len_val); return; }
-        current_sdu_area_offset += mux_hdr_len_val;
-        if (current_sdu_area_offset + ie_len_written_val > sizeof(sdu_area_buf)) { LOG_ERR("FT_ASSOC_RESP: SDU area overflow for Res Alloc IE."); return; }
-        memcpy(sdu_area_buf + current_sdu_area_offset, temp_ie_payload_buf_resp, ie_len_written_val);
-        current_sdu_area_offset += ie_len_written_val;
+        dect_mac_phy_capability_set_t *ft_phy_set0 = &ft_cap_fields.phy_variants[0];
+        ft_phy_set0->dlc_service_type_support_code = CONFIG_DECT_MAC_FT_DLC_SERVICE_SUPPORT_CODE; // Kconfig
+        ft_phy_set0->rx_for_tx_diversity_code = CONFIG_DECT_MAC_FT_RX_TX_DIVERSITY_CODE;       // Kconfig
+        ft_phy_set0->mu_value = ctx->own_phy_params.is_valid ? ctx->own_phy_params.mu : 0; // FT's own mu_code
+        ft_phy_set0->beta_value = ctx->own_phy_params.is_valid ? ctx->own_phy_params.beta : 0; // FT's own beta_code
+        ft_phy_set0->max_nss_for_rx_code = CONFIG_DECT_MAC_FT_MAX_NSS_RX_CODE;               // Kconfig
+        ft_phy_set0->max_mcs_code = CONFIG_DECT_MAC_FT_MAX_MCS_CODE;                         // Kconfig
+        ft_phy_set0->harq_soft_buffer_size_code = CONFIG_DECT_MAC_FT_HARQ_BUFFER_CODE;       // Kconfig
+        ft_phy_set0->num_harq_processes_code = CONFIG_DECT_MAC_FT_NUM_HARQ_PROC_CODE;       // Kconfig
+        ft_phy_set0->harq_feedback_delay_code = CONFIG_DECT_MAC_FT_HARQ_FEEDBACK_DELAY_CODE; // Kconfig
+        ft_phy_set0->supports_dect_delay = IS_ENABLED(CONFIG_DECT_MAC_FT_SUPPORTS_DECT_DELAY);
+        ft_phy_set0->supports_half_duplex = IS_ENABLED(CONFIG_DECT_MAC_FT_SUPPORTS_HALF_DUPLEX);
+
+        ie_payload_len = serialize_rd_capability_ie_payload(temp_ie_payload_buf, sizeof(temp_ie_payload_buf), &ft_cap_fields);
+        if (ie_payload_len < 0) { LOG_ERR("FT_ASSOC_RESP: Serialize FT RD Cap IE failed: %d", ie_payload_len); return; }
+        mux_hdr_len = build_mac_mux_header_internal(sdu_area_buf + sdu_area_len_built_bytes, sizeof(sdu_area_buf) - sdu_area_len_built_bytes, IE_TYPE_RD_CAPABILITY, (uint16_t)ie_payload_len, 0);
+        if (mux_hdr_len < 0) { LOG_ERR("FT_ASSOC_RESP: Build MUX for RD Cap failed: %d", mux_hdr_len); return; }
+        if (sdu_area_len_built_bytes + mux_hdr_len + ie_payload_len > sizeof(sdu_area_buf)) { LOG_ERR("FT_ASSOC_RESP: SDU area overflow for RD Cap IE."); return; }
+        memcpy(sdu_area_buf + sdu_area_len_built_bytes + mux_hdr_len, temp_ie_payload_buf, ie_payload_len);
+        sdu_area_len_built_bytes += (mux_hdr_len + ie_payload_len);
+        LOG_DBG("FT_ASSOC_RESP: Added MUXed FT_RDCapIE. Total SDU Area now: %d", sdu_area_len_built_bytes);
+
+        // Populate and add Resource Allocation IE
+        dect_mac_resource_alloc_ie_fields_t local_res_alloc_fields;
+        memset(&local_res_alloc_fields, 0, sizeof(local_res_alloc_fields));
+        local_res_alloc_fields.alloc_type_val = RES_ALLOC_TYPE_BIDIR;
+        local_res_alloc_fields.sfn_present = true;
+        uint8_t target_pt_mu_code = 0; // Default mu_code 0 (mu=1)
+        if (peer_slot_idx != -1 && ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known) {
+            target_pt_mu_code = ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu;
+        } else {
+            LOG_WRN("FT_ASSOC_RESP: Target PT mu not known for ResAlloc. Defaulting to 8-bit StartSubslot.");
+        }
+        local_res_alloc_fields.res1_is_9bit_subslot = (target_pt_mu_code > 2); // mu_code 3 (mu=8) or higher
+        local_res_alloc_fields.res2_is_9bit_subslot = (target_pt_mu_code > 2);
+
+        local_res_alloc_fields.start_subslot_val_res1 = 10; // Example DL for PT
+        local_res_alloc_fields.length_val_res1 = 2 - 1;     // 2 subslots
+        local_res_alloc_fields.start_subslot_val_res2 = 14; // Example UL from PT
+        local_res_alloc_fields.length_val_res2 = 2 - 1;     // 2 subslots
+        local_res_alloc_fields.repeat_val = RES_ALLOC_REPEAT_FRAMES;
+        local_res_alloc_fields.repetition_value = 10; // Every 10 frames
+        local_res_alloc_fields.validity_value = 100;  // For 100 frames
+        local_res_alloc_fields.sfn_val = (ctx->role_ctx.ft.sfn + 2) & 0xFF; // Starts in SFN+2
+
+        // Store this schedule for the PT internally
+        if (peer_slot_idx != -1) {
+            dect_mac_schedule_t *pt_sched = &ctx->role_ctx.ft.peer_schedules[peer_slot_idx];
+            pt_sched->is_active = true;
+            pt_sched->alloc_type = local_res_alloc_fields.alloc_type_val;
+            pt_sched->dl_start_subslot = local_res_alloc_fields.start_subslot_val_res1;
+            pt_sched->dl_duration_subslots = local_res_alloc_fields.length_val_res1 + 1;
+            pt_sched->dl_length_is_slots = local_res_alloc_fields.length_type_is_slots_res1;
+            pt_sched->res1_is_9bit_subslot = local_res_alloc_fields.res1_is_9bit_subslot;
+            pt_sched->ul_start_subslot = local_res_alloc_fields.start_subslot_val_res2;
+            pt_sched->ul_duration_subslots = local_res_alloc_fields.length_val_res2 + 1;
+            pt_sched->ul_length_is_slots = local_res_alloc_fields.length_type_is_slots_res2;
+            pt_sched->res2_is_9bit_subslot = local_res_alloc_fields.res2_is_9bit_subslot;
+            pt_sched->repeat_type = local_res_alloc_fields.repeat_val;
+            pt_sched->repetition_value = local_res_alloc_fields.repetition_value;
+            pt_sched->validity_value = local_res_alloc_fields.validity_value;
+            pt_sched->channel = local_res_alloc_fields.channel_present ? local_res_alloc_fields.channel_val : ctx->role_ctx.ft.operating_carrier;
+            pt_sched->schedule_init_modem_time = ctx->last_known_modem_time; // Or beacon TX time
+            pt_sched->sfn_of_initial_occurrence = local_res_alloc_fields.sfn_val;
+            // Calculate next_occurrence_modem_time for DL part first
+            pt_sched->next_occurrence_modem_time = calculate_target_modem_time(ctx, ctx->ft_sfn_zero_modem_time_anchor,
+                                                                              ctx->current_sfn_at_anchor_update, // SFN of anchor
+                                                                              local_res_alloc_fields.sfn_val,
+                                                                              local_res_alloc_fields.start_subslot_val_res1);
+            update_next_occurrence(ctx, pt_sched, ctx->last_known_modem_time); // Ensure it's future
+        }
+
+        ie_payload_len = serialize_resource_alloc_ie_payload(temp_ie_payload_buf, sizeof(temp_ie_payload_buf), &local_res_alloc_fields);
+        if (ie_payload_len < 0) { LOG_ERR("FT_ASSOC_RESP: Serialize Res Alloc IE failed: %d", ie_payload_len); return; }
+        mux_hdr_len = build_mac_mux_header_internal(sdu_area_buf + sdu_area_len_built_bytes, sizeof(sdu_area_buf) - sdu_area_len_built_bytes, IE_TYPE_RES_ALLOC, (uint16_t)ie_payload_len, 0);
+        if (mux_hdr_len < 0) { LOG_ERR("FT_ASSOC_RESP: Build MUX for Res Alloc failed: %d", mux_hdr_len); return; }
+        if (sdu_area_len_built_bytes + mux_hdr_len + ie_payload_len > sizeof(sdu_area_buf)) { LOG_ERR("FT_ASSOC_RESP: SDU area overflow for Res Alloc IE."); return; }
+        memcpy(sdu_area_buf + sdu_area_len_built_bytes + mux_hdr_len, temp_ie_payload_buf, ie_payload_len);
+        sdu_area_len_built_bytes += (mux_hdr_len + ie_payload_len);
+        LOG_DBG("FT_ASSOC_RESP: Added MUXed ResAllocIE. Total SDU Area now: %d", sdu_area_len_built_bytes);
     }
-    sdu_area_len_cleartext = current_sdu_area_offset;
 
     // --- MAC Header Type & Common Header ---
     dect_mac_header_type_octet_t hdr_type_octet;
@@ -1789,14 +1803,14 @@ static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t
 
     dect_mac_unicast_header_t common_hdr;
     increment_psn_and_hpc(ctx); // FT increments its own PSN/HPC for this TX
-    common_hdr.sequence_num_high_reset_rsv = SET_SEQ_NUM_HIGH_RESET_RSV((ctx->psn >> 8) & 0x0F, 1 /*reset*/);
+    common_hdr.sequence_num_high_reset_rsv = SET_SEQ_NUM_HIGH_RESET_RSV((ctx->psn >> 8) & 0x0F, 1 /*reset bit for first response*/);
     common_hdr.sequence_num_low = ctx->psn & 0xFF;
     common_hdr.transmitter_long_rd_id_be = sys_cpu_to_be32(ctx->own_long_rd_id);
     common_hdr.receiver_long_rd_id_be = sys_cpu_to_be32(pt_long_rd_id);
 
     // --- Assemble PDU (pre-security application) ---
     uint8_t *full_mac_pdu_for_phy_slab = NULL;
-    int ret = k_mem_slab_alloc(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab, K_NO_WAIT);
+    ret = k_mem_slab_alloc(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab, K_MSEC(10));
     if(ret != 0 || full_mac_pdu_for_phy_slab == NULL) { LOG_ERR("FT_ASSOC_RESP: Failed to alloc PDU buf for PT 0x%04X", pt_short_rd_id); return; }
     uint8_t * const full_mac_pdu_for_phy = full_mac_pdu_for_phy_slab;
 
@@ -1805,21 +1819,23 @@ static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t
               full_mac_pdu_for_phy, CONFIG_DECT_MAC_PDU_MAX_SIZE,
               &hdr_type_octet,
               &common_hdr, sizeof(common_hdr),
-              sdu_area_buf, sdu_area_len_cleartext,
+              sdu_area_buf, (size_t)sdu_area_len_built_bytes,
               &assembled_pdu_len_pre_mic);
-    if (ret != 0) { LOG_ERR("FT_ASSOC_RESP: Assemble PDU failed for PT 0x%04X: %d", pt_short_rd_id,ret); k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab); return; }
+    if (ret != 0) {
+        LOG_ERR("FT_ASSOC_RESP: Assemble PDU failed for PT 0x%04X: %d", pt_short_rd_id,ret);
+        k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab);
+        return;
+    }
+
+    uint16_t final_tx_pdu_len = assembled_pdu_len_pre_mic;
 
     // --- Apply Security if active ---
-    uint16_t final_tx_pdu_len = assembled_pdu_len_pre_mic; // Length before MIC
-
-    if (secure_this_response) { // secure_this_response was set earlier based on policy and key availability
+    if (secure_this_response) {
         uint8_t iv[16];
-        // ctx->hpc and ctx->psn are FT's own current TX HPC/PSN
         security_build_iv(iv, ctx->own_long_rd_id, pt_long_rd_id, ctx->hpc, ctx->psn);
 
-        // MIC Calculation: Covers MAC Common Header + entire MAC SDU Area (cleartext).
         uint8_t *mic_calculation_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t);
-        size_t mic_calculation_length = sizeof(common_hdr) + sdu_area_len_cleartext; // common_hdr is dect_mac_unicast_header_t
+        size_t mic_calculation_length = sizeof(common_hdr) + sdu_area_len_built_bytes;
 
         if ((assembled_pdu_len_pre_mic + 5) > CONFIG_DECT_MAC_PDU_MAX_SIZE) {
             LOG_ERR("FT_ASSOC_RESP: No space for MIC for PT 0x%04X.", pt_short_rd_id);
@@ -1834,21 +1850,15 @@ static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t
         }
         final_tx_pdu_len = assembled_pdu_len_pre_mic + 5;
 
-        // Encryption:
         uint8_t *encryption_start_ptr;
         size_t encryption_length;
-        // len_of_muxed_sec_ie_for_crypto_calc was determined when sdu_area_buf was populated
-
         if (hdr_type_octet.mac_security == MAC_SECURITY_USED_WITH_IE) {
-            // Encrypt: (Rest of MAC SDU Area, i.e., SDU Area - MUXed SecIE) + MIC
             encryption_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) +
                                    sizeof(common_hdr) + len_of_muxed_sec_ie_for_crypto_calc;
-            encryption_length = (sdu_area_len_cleartext - len_of_muxed_sec_ie_for_crypto_calc) + 5;
-        } else { // MAC_SECURITY_USED_NO_IE (or MAC_SECURITY_NONE, but secure_this_response is true)
-            // This case (secure_this_response=true but mac_security!=MAC_SECURITY_USED_WITH_IE)
-            // implies MAC_SECURITY_USED_NO_IE.
+            encryption_length = (sdu_area_len_built_bytes - len_of_muxed_sec_ie_for_crypto_calc) + 5;
+        } else {
             encryption_start_ptr = full_mac_pdu_for_phy + sizeof(dect_mac_header_type_octet_t) + sizeof(common_hdr);
-            encryption_length = sdu_area_len_cleartext + 5;
+            encryption_length = sdu_area_len_built_bytes + 5;
         }
 
         if (encryption_length > 0) {
@@ -1871,16 +1881,16 @@ static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t
 
     // --- Schedule TX ---
     uint32_t phy_op_handle = sys_rand32_get();
-    ctx->role_ctx.ft.last_assoc_resp_pt_short_id = pt_short_rd_id;
+    ctx->role_ctx.ft.last_assoc_resp_pt_short_id = pt_short_rd_id; // Store for OP_COMPLETE context
 
     ret = dect_mac_phy_ctrl_start_tx_assembled(
-        ctx->role_ctx.ft.operating_carrier,
+        ctx->role_ctx.ft.operating_carrier, // Send on FT's current operating carrier
         full_mac_pdu_for_phy, final_tx_pdu_len,
-        pt_short_rd_id,
-        false, /* is_beacon */
+        pt_short_rd_id, // Target PT's short ID for PCC Type 2 Receiver ID field
+        false,          /* is_beacon = false */
         phy_op_handle, PENDING_OP_FT_ASSOC_RESP,
-        true, /* use_lbt for unicast response */
-        0 /* target_start_time = 0 for immediate */
+        true,           /* use_lbt = true for unicast response */
+        0               /* target_start_time = 0 for immediate attempt after LBT */
     );
 
     k_mem_slab_free(&g_mac_sdu_slab, (void**)&full_mac_pdu_for_phy_slab);
@@ -1888,11 +1898,25 @@ static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t
     if (ret != 0) {
         LOG_ERR("FT_ASSOC_RESP: Failed to schedule TX to PT 0x%04X: %d", pt_short_rd_id, ret);
         if (accept_association && peer_slot_idx != -1) {
-            ctx->role_ctx.ft.connected_pts[peer_slot_idx].is_valid = false; // Failed to send acceptance
+            // If failed to send acceptance, invalidate the peer slot again
+            LOG_WRN("FT_ASSOC_RESP: Invalidating peer slot %d for PT 0x%04X due to failed AssocResp TX.",
+                    peer_slot_idx, pt_short_rd_id);
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].is_valid = false;
             ctx->role_ctx.ft.keys_provisioned_for_peer[peer_slot_idx] = false;
+            memset(&ctx->role_ctx.ft.peer_schedules[peer_slot_idx], 0, sizeof(dect_mac_schedule_t));
+            ctx->role_ctx.ft.peer_schedules[peer_slot_idx].is_active = false;
         }
     } else {
         LOG_INF("FT_SM: Association Response (%s) TX scheduled to PT 0x%04X (Hdl %u). Secure: %s",
                 accept_association ? "ACCEPT" : "REJECT", pt_short_rd_id, phy_op_handle, secure_this_response ? "Yes" : "No");
+        if (accept_association && peer_slot_idx != -1) {
+            // If successfully scheduled an ACCEPT, mark PT as fully identified if Long ID was present
+            if (pt_long_rd_id != 0) {
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].is_fully_identified = true;
+            }
+        }
     }
 }
+
+/**/
+
