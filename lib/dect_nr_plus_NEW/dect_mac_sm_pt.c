@@ -1331,8 +1331,8 @@ static void pt_send_association_request_action(void) {
         return;
     }
     uint8_t ft_max_rach_len_actual_units = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.max_rach_pdu_len_units + 1;
-    if (ft_max_rach_len_actual_units == 0) {
-        LOG_ERR("PT_SM_ASSOC_REQ: Target FT RACH max PDU length is 0 units. Cannot send. Restarting scan.");
+    if (ft_max_rach_len_actual_units == 0 || ft_max_rach_len_actual_units > 128) { // Max N-1 is 127 for 7 bits
+        LOG_ERR("PT_SM_ASSOC_REQ: Target FT RACH max PDU length invalid (%u units). Cannot send. Restarting scan.", ft_max_rach_len_actual_units);
         dect_mac_sm_pt_start_operation();
         return;
     }
@@ -1351,7 +1351,7 @@ static void pt_send_association_request_action(void) {
     uint8_t sdu_area_buf[128]; 
     dect_mac_assoc_req_ie_t assoc_req_fields;
     memset(&assoc_req_fields, 0, sizeof(assoc_req_fields));
-    dect_mac_rd_capability_ie_t rd_cap_fields;
+    dect_mac_rd_capability_ie_t rd_cap_fields; // PT's own capabilities
     memset(&rd_cap_fields, 0, sizeof(rd_cap_fields));
 
     // --- Populate Association Request IE Fields (dect_mac_assoc_req_ie_t) ---
@@ -1360,9 +1360,9 @@ static void pt_send_association_request_action(void) {
     assoc_req_fields.ft_mode_capable = IS_ENABLED(CONFIG_DECT_MAC_PT_CAN_BE_FT);
     
     assoc_req_fields.number_of_flows_val = 0; // Default: Request 0 specific flows.
-    // Example if requesting 1 flow with ID 5:
-    // assoc_req_fields.number_of_flows_val = 1;
-    // assoc_req_fields.flow_ids[0] = 5 & 0x3F; // Ensure 6-bit
+    // To request N flows (1-6):
+    // assoc_req_fields.number_of_flows_val = N;
+    // for (int i=0; i<N; ++i) assoc_req_fields.flow_ids[i] = your_flow_id_array[i] & 0x3F;
 
     assoc_req_fields.harq_params_present = true; 
     assoc_req_fields.harq_processes_tx_val = CONFIG_DECT_MAC_PT_HARQ_TX_PROC_CODE & 0x07;
@@ -1371,14 +1371,15 @@ static void pt_send_association_request_action(void) {
     assoc_req_fields.max_harq_re_rx_delay_code = CONFIG_DECT_MAC_PT_HARQ_RERX_DELAY_PT_CODE & 0x1F;
 
     if (assoc_req_fields.ft_mode_capable) {
-        assoc_req_fields.ft_beacon_periods_octet_present = true; 
-        assoc_req_fields.ft_network_beacon_period_code = CONFIG_DECT_MAC_PT_FT_MODE_NET_BEACON_PERIOD_CODE & 0x0F;
-        assoc_req_fields.ft_cluster_beacon_period_code = CONFIG_DECT_MAC_PT_FT_MODE_CLUS_BEACON_PERIOD_CODE & 0x0F;
+        assoc_req_fields.ft_beacon_periods_octet_present = IS_ENABLED(CONFIG_DECT_MAC_PT_FT_MODE_SIGNAL_PERIODS);
+        if (assoc_req_fields.ft_beacon_periods_octet_present) {
+            assoc_req_fields.ft_network_beacon_period_code = CONFIG_DECT_MAC_PT_FT_MODE_NET_BEACON_PERIOD_CODE & 0x0F;
+            assoc_req_fields.ft_cluster_beacon_period_code = CONFIG_DECT_MAC_PT_FT_MODE_CLUS_BEACON_PERIOD_CODE & 0x0F;
+        }
 
-        // Only include FT Param Flags octet if at least one sub-field is present
         assoc_req_fields.ft_next_channel_present = IS_ENABLED(CONFIG_DECT_MAC_PT_FT_MODE_NEXT_CHAN_PRESENT);
         assoc_req_fields.ft_time_to_next_present = IS_ENABLED(CONFIG_DECT_MAC_PT_FT_MODE_TIME_TO_NEXT_PRESENT);
-        assoc_req_fields.ft_current_channel_present = false; // Typically not set by PT in request
+        assoc_req_fields.ft_current_channel_present = false; // PT usually doesn't signal current channel when ft_mode_capable in AssocReq
 
         if (assoc_req_fields.ft_next_channel_present || assoc_req_fields.ft_time_to_next_present || assoc_req_fields.ft_current_channel_present) {
             assoc_req_fields.ft_param_flags_octet_present = true;
@@ -1392,7 +1393,6 @@ static void pt_send_association_request_action(void) {
         if (assoc_req_fields.ft_time_to_next_present) {
             assoc_req_fields.ft_time_to_next_us_val = CONFIG_DECT_MAC_PT_FT_MODE_TIME_TO_NEXT_US_VAL;
         }
-        // Current channel not typically set by PT in request
     } else {
         assoc_req_fields.ft_beacon_periods_octet_present = false;
         assoc_req_fields.ft_param_flags_octet_present = false;
@@ -1400,7 +1400,7 @@ static void pt_send_association_request_action(void) {
 
     // --- Populate PT's RD Capability IE Fields (dect_mac_rd_capability_ie_t) ---
     rd_cap_fields.release_version = 1; 
-    rd_cap_fields.num_phy_capabilities = 1; 
+    rd_cap_fields.num_phy_capabilities = 1; // PT provides one explicit 5-octet PHY capability set
 
     rd_cap_fields.supports_group_assignment = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_GROUP_ASSIGNMENT);
     rd_cap_fields.supports_paging = IS_ENABLED(CONFIG_DECT_MAC_PT_SUPPORTS_PAGING);
@@ -1464,11 +1464,12 @@ static void pt_send_association_request_action(void) {
         return;
     }
 
-    uint8_t pcc_pkt_len_f, pcc_mcs_f_ignored, pcc_pkt_len_type_f; // mcs is fixed for RACH
-    uint8_t rach_tx_mcs = 0; // RACH typically uses robust MCS0
+    uint8_t pcc_pkt_len_f, pcc_mcs_f_ignored, pcc_pkt_len_type_f;
+    uint8_t rach_tx_mcs = 0; 
     uint8_t ft_mu_for_rach_timing = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon;
-    if (ft_mu_for_rach_timing > 7) ft_mu_for_rach_timing = 0; // Sanitize, use mu_code 0 for mu=1 as default
-    uint8_t ft_beta_for_rach_timing = 0; // Assume beta_code 0 (beta=1) for RACH for now
+    if (ft_mu_for_rach_timing > 7) ft_mu_for_rach_timing = 0; 
+    uint8_t ft_beta_for_rach_timing = 0; // Assuming beta_code 0 (beta=1) for RACH for now
+                                         // TODO: PT should learn FT's beta for RACH if it can vary and is signalled.
 
     dect_mac_phy_ctrl_calculate_pcc_params(pdu_len - sizeof(dect_mac_header_type_octet_t),
                                            ft_mu_for_rach_timing,
@@ -1504,6 +1505,7 @@ static void pt_send_association_request_action(void) {
             uint32_t rach_contention_slot_ticks = get_subslot_duration_ticks_for_mu(ft_mu_for_rach_timing > 0 ? ft_mu_for_rach_timing : 0);
             if (rach_contention_slot_ticks == 0) rach_contention_slot_ticks = NRF_MODEM_DECT_LBT_PERIOD_MIN;
             uint32_t backoff_ms = (1 + (sys_rand32_get()%4)) * ((rach_contention_slot_ticks * 1000U) / NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ + 1);
+            if (backoff_ms == 0) backoff_ms = 10; // Ensure some delay
             k_timer_start(&ctx->rach_context.rach_backoff_timer, K_MSEC(MAX(10, backoff_ms)), K_NO_WAIT);
         }
     } else {
@@ -1511,8 +1513,6 @@ static void pt_send_association_request_action(void) {
                 phy_op_handle, ctx->role_ctx.pt.target_ft.short_rd_id);
     }
 }
-
-
 
 static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data, size_t mac_sdu_area_len,
                                                 uint32_t ft_tx_long_rd_id,
