@@ -207,29 +207,32 @@ void dect_mac_sm_ft_handle_auth_pdu(uint16_t pt_short_id, uint32_t pt_long_id, c
 
     if (peer_idx == -1 || !ctx->role_ctx.ft.connected_pts[peer_idx].is_valid ||
         ctx->role_ctx.ft.connected_pts[peer_idx].long_rd_id != pt_long_id) {
-        LOG_WRN("FT_AUTH_HANDLE_PDU: Received Auth PDU from unknown/invalid PT S:0x%04X L:0x%08X.", pt_short_id, pt_long_id);
+        LOG_WRN("FT_AUTH_HANDLE_PDU: Received Auth PDU from unknown/invalid PT S:0x%04X L:0x%08X. Ignoring.",
+                pt_short_id, pt_long_id);
         return;
     }
 
-    // The FT state machine should be in a state where it expects auth PDUs if a real protocol is used.
-    // e.g., if (ctx->role_ctx.ft.connected_pts[peer_idx].auth_state != EXPECTING_AUTH_MSG) return;
+    // A real auth protocol might involve the FT being in a specific auth sub-state for this peer.
+    // if (ctx->role_ctx.ft.connected_pts[peer_idx].auth_sub_state != EXPECTING_PT_AUTH_RESPONSE) {
+    //     LOG_WRN("FT_AUTH_HANDLE_PDU: Received Auth PDU from PT S:0x%04X in unexpected auth sub-state. Ignoring.");
+    //     return;
+    // }
 
-    LOG_INF("FT_AUTH_HANDLE_PDU: Received (stubbed) Auth PDU from PT S:0x%04X L:0x%08X (slot %d, len %zu). No action for PSK model.",
+    LOG_INF("FT_AUTH_HANDLE_PDU: Received (stubbed) Auth PDU from PT S:0x%04X L:0x%08X (slot %d, len %zu). No action for current PSK model.",
             pt_short_id, pt_long_id, peer_idx, pdu_len);
 
-    // In a real multi-step protocol:
-    // 1. Parse pdu_data (e.g., PT's Auth Response to FT's challenge).
-    // 2. If valid and final step:
-    //    ctx->role_ctx.ft.connected_pts[peer_idx].is_secure = true;
+    // For a real multi-step protocol:
+    // 1. Parse pdu_data (e.g., PT's response to FT's challenge).
+    // 2. If valid and final step for FT:
+    //    ctx->role_ctx.ft.connected_pts[peer_idx].is_secure = true; // Mark link as secure
     //    LOG_INF("FT_AUTH_HANDLE_PDU: Authentication with PT 0x%04X complete. Link SECURE.");
-    //    // FT might send a final "Secure Link Confirm" or just proceed to secure data.
-    // 3. If valid and more steps:
+    //    // Optionally send a final "Secure Link Confirm" PDU to PT.
+    // 3. If valid and more steps for FT (e.g., FT needs to send another message):
     //    // Build and send next auth PDU to PT.
     // 4. If invalid:
     //    // Send Auth Fail PDU and/or release PT.
     //
-    // Since our PSK model is FT-driven upon AssocReq (FT derives keys then),
-    // this handler is a placeholder. The link security status was set in ft_process_association_request_pdu.
+    // The FT's PSK-based key derivation and setting of `is_secure` happens in `ft_process_association_request_pdu`.
 }
 
 
