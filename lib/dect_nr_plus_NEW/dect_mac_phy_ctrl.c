@@ -600,18 +600,20 @@ void dect_mac_phy_ctrl_calculate_pcc_params(size_t mac_pdc_payload_len_bytes,
     *out_packet_length_type_field = 0; // 0 for subslots (PCC packet_length always refers to subslots for PDC)
 
     // PCC packet_length field is (N-1) coded, where N is number of subslots.
-    if (num_subslots_needed > 0 && num_subslots_needed <= MAX_PDSCH_SUB_SLOTS_CTRL) {
+    if (num_subslots_needed > 0 && num_subslots_needed <= TBS_MAX_SUB_SLOTS_J) { // New constant
         *out_packet_length_field = num_subslots_needed - 1;
-    } else if (num_subslots_needed == 0 && mac_pdc_payload_len_bytes > 0) {
-        // Should have been caught by found_fit logic or TBS entry is 0 case
+    } else if (num_subslots_needed == 0 && mac_pdc_payload_len_bytes > 0) { // Should be caught by found_fit
         LOG_ERR("PCC_CALC: Calculated 0 subslots for non-zero payload (%zu bytes). Defaulting to 1 subslot.", mac_pdc_payload_len_bytes);
         *out_packet_length_field = 0; // Represents 1 subslot
-        num_subslots_needed = 1; // For logging
-    } else { // num_subslots_needed > MAX_PDSCH_SUB_SLOTS_CTRL (should be clamped by found_fit logic)
-        LOG_ERR("PCC_CALC: Invalid num_subslots_needed %u. Clamping PCC field to max.", num_subslots_needed);
-        *out_packet_length_field = PCC_PACKET_LENGTH_FIELD_MAX_VALUE_CTRL; // Max field value (15 for 16 subslots)
-        num_subslots_needed = MAX_PDSCH_SUB_SLOTS_CTRL; // For logging
+        num_subslots_needed = 1; 
+    } else { 
+        // This case implies num_subslots_needed > TBS_MAX_SUB_SLOTS_J (already clamped by found_fit logic)
+        // or num_subslots_needed == 0 for zero payload (handled by initial if)
+        // If num_subslots_needed was clamped to TBS_MAX_SUB_SLOTS_J, this is correct:
+        *out_packet_length_field = TBS_MAX_SUB_SLOTS_J - 1; // Max field value for TBS_MAX_SUB_SLOTS_J
+        // num_subslots_needed is already TBS_MAX_SUB_SLOTS_J if clamped.
     }
+
 
     LOG_DBG("PCC_CALC: Payload %zuB (%ub), mu %u, beta %u, MCS %u -> %u subslots (PCC len_f 0x%X, type %u)",
             mac_pdc_payload_len_bytes, pdc_payload_len_bits, mu, beta, selected_mcs,
