@@ -134,13 +134,21 @@ void pt_rach_response_window_timer_expired_action(void) {
                 ctx->role_ctx.pt.current_assoc_retries + 1, // +1 for display
                 ctx->config.max_assoc_retries);
 
-        // For a timeout (no response), it's common to increase the contention window
-        // as if it were a collision/LBT busy, or at least not reset it to minimum,
-        // unless the strategy is to always start fresh for a full timeout.
-        // Let's increment CW for timeout as well, assuming channel might be congested.
-        if (ctx->rach_context.rach_cw_current_idx < ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmax_sig_code) {
-            ctx->rach_context.rach_cw_current_idx++;
+        // New CW handling for timeout (similar to LBT busy):
+        uint8_t ft_cwmin_sig_code = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmin_sig_code;
+        uint8_t ft_cwmax_sig_code = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmax_sig_code;
+
+        if (ctx->rach_context.rach_cw_current_idx < ft_cwmin_sig_code) {
+             ctx->rach_context.rach_cw_current_idx = ft_cwmin_sig_code;
         }
+        if (ctx->rach_context.rach_cw_current_idx < ft_cwmax_sig_code) {
+            ctx->rach_context.rach_cw_current_idx++;
+            LOG_DBG("PT_RACH_RESP_TIMEOUT: Increased CW index to %u for next attempt.", ctx->rach_context.rach_cw_current_idx);
+        } else {
+            LOG_DBG("PT_RACH_RESP_TIMEOUT: CW index already at max (%u) from FT.", ft_cwmax_sig_code);
+        }
+
+
         // If the next attempt is RACH, pt_send_association_request_action will handle LBT and potential further CW increase.
         // Directly call pt_send_association_request_action to re-attempt.
         // It will change state to PT_ASSOCIATING or PT_RACH_BACKOFF.
@@ -444,20 +452,54 @@ static void pt_handle_phy_op_complete_internal(const struct nrf_modem_dect_phy_o
                 LOG_WRN("PT_SM: RACH TX LBT busy for AssocReq (Hdl %u). Increasing CW and backing off.", event->handle);
                 dect_mac_change_state(MAC_STATE_PT_RACH_BACKOFF);
 
-                // Use CW_MIN/MAX from parsed RACH params for this FT
-                uint16_t current_cw_val;
-                if (ctx->rach_context.rach_cw_current_idx < ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmin_sig_code) {
-                    // This can happen if CW was reset and min_idx from config is lower than FT's min_idx
-                    ctx->rach_context.rach_cw_current_idx = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmin_sig_code;
+
+
+                // Ensure current_assoc_retries is incremented for LBT busy as it's a failed attempt
+                // Note: This might conflict if timeout also increments it. Typically, LBT busy is one type of failure.
+                // Let's assume LBT busy also counts towards retries for *this specific FT target*.
+                if (ctx->role_ctx.pt.current_assoc_retries < ctx->config.max_assoc_retries) {
+                    // ctx->role_ctx.pt.current_assoc_retries++; // Incrementing here might be too aggressive if backoff is short.
+                                                              // Let timeout handle retry count for simplicity for now.
+                } else {
+                    LOG_ERR("PT_SM_RACH_LBT_BUSY: Max association retries reached for FT 0x%04X after LBT busy. Restarting scan.",
+                            ctx->role_ctx.pt.target_ft.short_rd_id);
+                    dect_mac_sm_pt_start_operation();
+                    return; // Do not proceed with backoff
                 }
 
-                if (ctx->rach_context.rach_cw_current_idx < ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmax_sig_code) {
+                // Use CW_MIN/MAX codes from parsed RACH params for this FT
+                uint8_t ft_cwmin_sig_code = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmin_sig_code;
+                uint8_t ft_cwmax_sig_code = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.cwmax_sig_code;
+
+                // If current CW index is below FT's min, reset to FT's min.
+                // This can happen if CW was reset globally (e.g. after success with another FT).
+                if (ctx->rach_context.rach_cw_current_idx < ft_cwmin_sig_code) {
+                    ctx->rach_context.rach_cw_current_idx = ft_cwmin_sig_code;
+                }
+
+                // Double CW by incrementing index, up to FT's max.
+                if (ctx->rach_context.rach_cw_current_idx < ft_cwmax_sig_code) {
                     ctx->rach_context.rach_cw_current_idx++;
                 }
-                current_cw_val = 8 * (1U << ctx->rach_context.rach_cw_current_idx);
-                // Ensure it does not exceed FT's advertised CW_MAX_VAL (derived from its cwmax_sig_code)
-                if (current_cw_val > ctx->role_ctx.pt.current_ft_rach_params.cw_max_val) {
-                    current_cw_val = ctx->role_ctx.pt.current_ft_rach_params.cw_max_val;
+                // If already at max, it stays at max.
+
+                // Calculate current CW value (CW_CURRENT from ETSI 5.3.1)
+                // CW_Value = 8 * (2^CodeValue)
+                uint16_t current_cw_value = 8 * (1U << ctx->rach_context.rach_cw_current_idx);
+
+                // Ensure current_cw_value does not exceed the max value derived from ft_cwmax_sig_code.
+                // (This should be inherently handled if rach_cw_current_idx is capped by ft_cwmax_sig_code)
+                // uint16_t derived_ft_cw_max_val = ctx->role_ctx.pt.current_ft_rach_params.cw_max_val;
+                // if (current_cw_value > derived_ft_cw_max_val && derived_ft_cw_max_val > 0) {
+                //     current_cw_value = derived_ft_cw_max_val;
+                // }
+                // The derived cw_min_val and cw_max_val are already in current_ft_rach_params.
+                if (current_cw_value < ctx->role_ctx.pt.current_ft_rach_params.cw_min_val) {
+                    current_cw_value = ctx->role_ctx.pt.current_ft_rach_params.cw_min_val;
+                }
+                if (current_cw_value > ctx->role_ctx.pt.current_ft_rach_params.cw_max_val &&
+                    ctx->role_ctx.pt.current_ft_rach_params.cw_max_val > 0 ) { // Check cw_max_val is not 0 due to bad code
+                    current_cw_value = ctx->role_ctx.pt.current_ft_rach_params.cw_max_val;
                 }
 
 
