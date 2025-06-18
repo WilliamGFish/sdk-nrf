@@ -283,15 +283,24 @@ static void populate_cb_fields_from_ctx(dect_mac_context_t *ctx, dect_mac_cluste
 
 
 
-
 static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sfn_zero_anchor_time,
                                             uint8_t sfn_of_anchor_relevance, uint8_t target_sfn_val,
                                             uint16_t target_subslot_idx)
 {
+    if (!ctx) {
+        LOG_ERR("CALC_TIME: NULL MAC context provided!");
+        return UINT64_MAX; // Indicate error
+    }
+
+    if (sfn_zero_anchor_time == 0 && ctx->last_known_modem_time == 0) {
+        LOG_WRN("CALC_TIME: SFN Zero Anchor and last_known_modem_time are both 0. Cannot calculate precise target time. Returning large future estimate.");
+        // Return a time far enough in the future to likely be valid once modem time is known
+        return modem_us_to_ticks(500000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); // 500ms
+    }
     if (sfn_zero_anchor_time == 0) {
-        LOG_WRN("CALC_TIME: SFN Zero Anchor is 0. Cannot calculate precise target time. Returning future estimate.");
-        uint32_t fallback_delay_ticks = modem_us_to_ticks(FRAME_DURATION_MS_NOMINAL * 1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
-        return (ctx->last_known_modem_time > 0 ? ctx->last_known_modem_time : modem_us_to_ticks(1000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ)) + fallback_delay_ticks;
+        LOG_WRN("CALC_TIME: SFN Zero Anchor is 0. Using last_known_modem_time + fallback delay.");
+        uint32_t fallback_delay_ticks = modem_us_to_ticks(FRAME_DURATION_MS_NOMINAL * 1000 * 2, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ); // e.g. 2 frames
+        return ctx->last_known_modem_time + fallback_delay_ticks;
     }
 
     uint32_t frame_duration_ticks_val = 0;
@@ -299,80 +308,69 @@ static uint64_t calculate_target_modem_time(dect_mac_context_t *ctx, uint64_t sf
         frame_duration_ticks_val = (uint32_t)FRAME_DURATION_MS_NOMINAL * (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
     }
     if (frame_duration_ticks_val == 0) {
-        LOG_ERR("CALC_TIME: Calculated frame_duration_ticks is 0! Cannot calculate target time.");
+        LOG_ERR("CALC_TIME: Calculated frame_duration_ticks is 0! Modem tick rate likely 0. Cannot calculate target time.");
         return UINT64_MAX; // Indicate error
     }
 
-    // Subslot duration in modem ticks - mu aware
-    // TODO: This 'link_mu' should ideally be a parameter to this function if it's truly generic,
-    // or it should consistently use the mu of the entity FOR WHICH the time is being calculated
-    // (e.g., FT's mu for FT's beacon, target PT's mu for DL schedule TO that PT if their mu can differ).
-    // For now, using ctx->phy_link_params.mu assumes it's the relevant one for the calculation context.
-    uint8_t link_mu = 1; // Default
-    if (ctx->phy_link_params.is_valid && ctx->phy_link_params.mu > 0 && ctx->phy_link_params.mu <= 8) {
-        link_mu = ctx->phy_link_params.mu;
-    } else if (ctx->role == MAC_ROLE_PT && ctx->role_ctx.pt.associated_ft.is_valid &&
-               ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon > 0 &&
-               ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon <= 8) {
-        // If PT is calculating for schedule based on FT's beacon, use FT's mu from RACH params
-        link_mu = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon;
-        LOG_DBG("CALC_TIME: Using FT's mu=%u for subslot duration.", link_mu);
-    } else {
-        LOG_WRN("CALC_TIME: Using default mu=1 for subslot duration calc (ctx mu invalid or not applicable).");
-    }
+    // Determine the relevant mu_code for this timing calculation.
+    // This depends on whose schedule/timing we are calculating (FT's own, or for a PT link).
+    uint8_t mu_code_for_timing_calc = 0; // Default to mu-code 0 (actual mu=1)
 
-    uint32_t base_symbol_duration_ticks = NRF_MODEM_DECT_SYMBOL_DURATION;
-    uint32_t actual_symbol_duration_ticks = base_symbol_duration_ticks;
-    if (link_mu > 1) { // Assuming NRF_MODEM_DECT_SYMBOL_DURATION is for mu=1
-         actual_symbol_duration_ticks = base_symbol_duration_ticks / (1U << (link_mu - 1));
+    if (ctx->role == MAC_ROLE_FT) {
+        // If FT is calculating for its own beacon or RACH listen based on its own parameters.
+        if (ctx->own_phy_params.is_valid) {
+            mu_code_for_timing_calc = ctx->own_phy_params.mu;
+        } else {
+            LOG_WRN("CALC_TIME (FT): Own PHY params not valid, using default mu_code=0.");
+        }
+    } else { // PT role
+        // If PT is calculating for a schedule received from FT, or for RACH to FT, use FT's mu.
+        if (ctx->role_ctx.pt.associated_ft.is_valid && ctx->role_ctx.pt.associated_ft.peer_phy_params_known) {
+            mu_code_for_timing_calc = ctx->role_ctx.pt.associated_ft.peer_mu;
+        } else if (ctx->role_ctx.pt.target_ft.is_valid && ctx->role_ctx.pt.target_ft.peer_phy_params_known) {
+            // For RACH to a target FT before full association, if its capabilities (mu) are known
+            mu_code_for_timing_calc = ctx->role_ctx.pt.target_ft.peer_mu;
+        } else if (ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon != 0 &&
+                   ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon <= 7) {
+            // Fallback to mu from the RACH IE itself if peer_phy_params not yet fully known
+            mu_code_for_timing_calc = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon;
+        } else {
+            LOG_WRN("CALC_TIME (PT): Peer FT mu not known, using default mu_code=0.");
+        }
     }
-    uint32_t subslot_duration_ticks_val = actual_symbol_duration_ticks * 5; // 5 OFDM symbols per subslot
+    // Sanitize mu_code (0-7 maps to mu=1,2,4,8,16,32,64,128. DECT NR+ typically uses 0-3 for mu=1,2,4,8)
+    if (mu_code_for_timing_calc > 3) { // If using mu beyond typical DECT NR+ range
+        LOG_WRN("CALC_TIME: mu_code %u is high, ensure NRF_MODEM_DECT_SYMBOL_DURATION scaling is correct.", mu_code_for_timing_calc);
+    }
+    // get_subslot_duration_ticks_for_mu expects mu_code 0-7.
+
+    uint32_t subslot_duration_ticks_val = get_subslot_duration_ticks_for_mu(mu_code_for_timing_calc);
     if (subslot_duration_ticks_val == 0) {
-        LOG_ERR("CALC_TIME: Calculated subslot_duration_ticks is 0 for mu %u! Cannot calculate target time.", link_mu);
-        return UINT64_MAX;
+        LOG_ERR("CALC_TIME: Calculated subslot_duration_ticks is 0 for mu_code %u! Cannot calculate target time.", mu_code_for_timing_calc);
+        return UINT64_MAX; // Indicate error
     }
 
+    // Modem time of the start of the frame where SFN was sfn_of_anchor_relevance
     uint64_t anchor_relevance_frame_start_time = sfn_zero_anchor_time +
                                                  ((uint64_t)sfn_of_anchor_relevance * frame_duration_ticks_val);
 
+    // Calculate the shortest signed difference in frames from anchor SFN to target SFN
     int16_t sfn_diff = (int16_t)target_sfn_val - (int16_t)sfn_of_anchor_relevance;
-
-    if (sfn_diff < -128) { // target_sfn_val is "after" sfn_of_anchor_relevance due to SFN wrap
-        sfn_diff += 256;
-    } else if (sfn_diff > 128 && target_sfn_val < sfn_of_anchor_relevance) {
-        // This case means target_sfn is in the previous SFN cycle relative to a sfn_of_anchor_relevance
-        // e.g. anchor_sfn=10, target_sfn=250. diff=240. This would push time far in future.
-        // If target_sfn is truly in the past relative to anchor_sfn (but later in the cycle), sfn_diff will be negative.
-        // Example: anchor=10, target_sfn=5. diff=-5. target_frame is 5 frames before anchor_relevance_frame.
-        // Example: anchor=250, target_sfn=245. diff=-5. target_frame is 5 frames before.
-        // The "> 128" only applies if target_sfn_val is ALSO smaller than sfn_of_anchor_relevance, implying anchor wrapped.
+    if (sfn_diff > 128) {      // e.g., anchor=5, target=250. True diff is -11 frames (wraps backward).
         sfn_diff -= 256;
+    } else if (sfn_diff < -128) { // e.g., anchor=250, target=5. True diff is +11 frames (wraps forward).
+        sfn_diff += 256;
     }
-    // Now, sfn_diff should be the shortest signed distance in frames.
+    // Now sfn_diff is in the range [-128, 127] representing the shortest path.
 
     uint64_t target_frame_start_time = anchor_relevance_frame_start_time + ((int64_t)sfn_diff * frame_duration_ticks_val);
-
-    // Heuristic check: If the calculated target_frame_start_time is significantly before the sfn_zero_anchor_time,
-    // it might imply that the target SFN is in the *next full cycle* of 256 frames from the SFN 0 anchor.
-    // This is more likely if sfn_of_anchor_relevance was small, and target_sfn_val is also small,
-    // but sfn_diff ended up negative (e.g. anchor_sfn=5, target_sfn=2, diff=-3)
-    // AND the result is before sfn_zero_anchor_time.
-    // This condition is tricky and depends on the interpretation of "shortest path".
-    // If target_sfn_val < sfn_of_anchor_relevance, and sfn_diff is calculated as negative:
-    // E.g., anchor SFN=5, target SFN=2. sfn_diff = -3. target_frame_start_time correctly before anchor_relevance_frame.
-    // E.g., anchor SFN=5, target SFN=250 (from previous cycle). sfn_diff would be large positive after initial calc, then -6 via (250-5 = 245 -> 245-256 = -11).
-    // This means target_frame_start is 11 frames before anchor_relevance_frame.
-
-    // A simpler approach might be: if target_frame_start_time < ctx->last_known_modem_time (for future events)
-    // then add 256*frame_duration_ticks until it's in the future. This is handled by callers.
-    // The current sfn_diff logic should give the frame closest to anchor_relevance_frame.
 
     uint64_t target_subslot_offset_in_frame_ticks = (uint64_t)target_subslot_idx * subslot_duration_ticks_val;
     uint64_t final_target_time = target_frame_start_time + target_subslot_offset_in_frame_ticks;
 
-    LOG_DBG("CALC_TIME: AnchorSFN %u @ %llu (SFN0 @ %llu), TargetSFN %u, TargetSS %u (mu %u) => FinalTime %llu",
-            sfn_of_anchor_relevance, anchor_relevance_frame_start_time, sfn_zero_anchor_time,
-            target_sfn_val, target_subslot_idx, link_mu, final_target_time);
+    LOG_DBG("CALC_TIME: AnchorSFN %u (rel. to SFN0@%llu), TargetSFN %u, TargetSS %u (using mu_code %u) => FinalTime %llu",
+            sfn_of_anchor_relevance, sfn_zero_anchor_time,
+            target_sfn_val, target_subslot_idx, mu_code_for_timing_calc, final_target_time);
 
     return final_target_time;
 }
@@ -1535,8 +1533,29 @@ static void ft_process_association_request_pdu(const uint8_t *mac_sdu_area_data,
     }
 
     // Association Decision Logic
-    bool accept_association = true; // Default to accept
+    bool accept_association = true;
     int peer_slot_idx = ft_find_and_init_peer_slot(pt_tx_long_rd_id, pt_tx_short_rd_id, rssi_from_pcc);
+
+    if (peer_slot_idx >= 0 && pt_cap_ie_found && pt_cap_fields.num_phy_capabilities >= 1) {
+        // Store PT's primary mu and beta from its first reported PHY capability set
+        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu = pt_cap_fields.phy_variants[0].mu_value;
+        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta = pt_cap_fields.phy_variants[0].beta_value;
+        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code = pt_cap_fields.phy_variants[0].max_mcs_code;
+        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known = true;
+        LOG_INF("FT_SM_ASSOC: Stored PT's (0x%04X) PHY params: mu_code=%u, beta_code=%u, max_mcs_code=%u",
+                pt_tx_short_rd_id,
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu,
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta,
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code);
+    } else if (peer_slot_idx >= 0) {
+        LOG_WRN("FT_SM_ASSOC: PT 0x%04X RD Cap IE not found or no explicit PHY sets. Using default mu/beta for this PT link.", pt_tx_short_rd_id);
+        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu = 1; // Default mu code 0 -> val 1
+        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta = 1; // Default beta code 0 -> val 1
+        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known = false;
+    }
+
+
+
 
     if (peer_slot_idx < 0) {
         LOG_WRN("FT_SM_ASSOC: No peer slots available for PT 0x%04X (L:0x%08X). Rejecting.",

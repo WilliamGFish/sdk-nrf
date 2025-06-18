@@ -85,6 +85,24 @@ config DECT_MAC_PROVISIONED_LONG_RD_ID
 	  If set to 0 or 0xFFFFFFFF, the MAC core will attempt to derive one
 	  from the hardware ID (e.g., using hw_id_get()).
 
+config DECT_MAC_OWN_MU_CODE
+    int "Own Default Mu (Subcarrier Scaling) Code (0-7)"
+    default 0 # Code 0 => mu = 2^0 = 1 (27kHz for base)
+    range 0 7 # Corresponds to mu values 1, 2, 4, 8, 16, 32, 64, 128 (though only 1,2,4,8 are typical for DECT NR+)
+    help
+      Code for this device's primary/default operational subcarrier scaling factor mu.
+      Actual mu = 2^code. (Refer to ETSI TS 103 636-3 Annex B & Table 4.3-1).
+      Typical DECT NR+ values for mu are 1, 2, 4, 8 (codes 0, 1, 2, 3).
+
+config DECT_MAC_OWN_BETA_CODE
+    int "Own Default Beta (FFT Scaling) Code (0-15)"
+    default 0 # Code 0 => beta = 1 (code + 1)
+    range 0 15 # Corresponds to beta values 1 to 16
+    help
+      Code for this device's primary/default FFT scaling factor beta.
+      Actual beta = code + 1. (Refer to ETSI TS 103 636-3 Annex B & Table 4.3-1).
+
+
 # MAC Security Configuration
 config DECT_MAC_SECURITY_ENABLE
     bool "Enable MAC Layer Security (Mode 1)"

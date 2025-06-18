@@ -192,24 +192,67 @@ typedef struct {
 
 /** @brief Information about a peer device. */
 typedef struct {
-    bool is_valid;
-    bool is_secure;
-    bool is_fully_identified;
-    uint32_t long_rd_id;
-    uint16_t short_rd_id;
-    int16_t rssi_2; // Q7.1 format
-    uint16_t operating_carrier;
-    uint32_t hpc; // Peer's last known TX HPC (tracked by us)
+    bool is_valid;                  // Is this peer slot/context entry currently in use and valid?
+    bool is_secure;                 // Is the link with this peer currently secured?
+    bool is_fully_identified;       // True if the Long RD ID of this peer is known.
+    uint32_t long_rd_id;            // Peer's Long RD ID.
+    uint16_t short_rd_id;           // Peer's Short RD ID.
+    int16_t rssi_2;                 // Last measured RSSI-2 (Q7.1 format) from this peer.
+    uint16_t operating_carrier;     // Primary operating carrier of this peer (if known, e.g., for an FT).
 
-    struct { // Pending HARQ feedback TO SEND to this peer
-        bool valid;
-        bool is_ack;
-        uint8_t harq_process_num_for_peer; // Peer's HARQ proc num we are ACK/NACKing
-    } pending_feedback_to_send[2]; // Max 2 feedback items per nRF Feedback Format 3
+    // --- HPC and Security Synchronization State with this Peer ---
+    // For RX path: Tracking the HPC of PDUs received *from* this peer.
+    uint32_t hpc;                   // HPC value used for the IV of the *current or last successfully processed PDU* received from this peer.
+                                    // This is updated from a MAC Sec Info IE or incremented based on PSN wrap from this peer.
+    uint32_t highest_rx_peer_hpc;   // Highest HPC value ever validated and received *in a MAC Sec Info IE* from this peer.
+                                    // This is the primary reference for the anti-replay receive window. Initialized to 0.
+    
+    // For TX path: Flags related to HPC synchronization *initiated by either side*.
+    bool peer_requested_hpc_resync; // True if this peer sent *us* a MAC Sec Info IE with SecIVType HPC_RESYNC_INITIATE,
+                                    // meaning *we* should send our current TX HPC to them.
+                                    // (For PT: this flag on associated_ft means FT wants PT's HPC)
+                                    // (For FT: this flag on a connected_pt means that PT wants FT's HPC) -> This interpretation needs care.
+                                    // Let's clarify: This flag on peer_info means THE PEER requested OUR HPC.
+                                    // So, if PT's associated_ft has this true, FT requested PT's HPC.
+                                    // If FT's connected_pts[i] has this true, PT[i] requested FT's HPC.
+
+    bool self_needs_to_request_hpc_from_peer; // True if *we* (this local device) need to send a MAC Sec Info IE
+                                              // with SecIVType HPC_RESYNC_INITIATE to *this peer* (e.g., due to our MIC failures on RX from them).
+    uint8_t consecutive_mic_failures; // Count of consecutive MIC failures on PDUs received from this peer.
+
+    uint8_t current_key_index_for_peer; // The key index this peer is currently using for TX to us (if known from SecIE).
+                                        // Or the key index we should use for TX *to* this peer. Context dependent.
+                                        // For simplicity, this could be the key index *we* use for TX to this peer.
+
+    // --- Peer's PHY Parameters (learned from its RD Capability IE) ---
+    uint8_t peer_mu;                // Peer's operational mu (subcarrier scaling factor code, e.g., 0 for mu=1 (2^0)).
+    uint8_t peer_beta;              // Peer's operational beta (FFT scaling factor code, e.g., 0 for beta=1 (code+1)).
+    uint8_t peer_max_mcs_code;      // Peer's max supported MCS for reception (code 0-11).
+    // Add other relevant parsed capabilities from peer's RD_Capability_IE.phy_variants[0] as needed:
+    // uint8_t peer_dlc_service_support_code;
+    // uint8_t peer_rx_for_tx_diversity_code;
+    // uint8_t peer_max_nss_for_rx_code;
+    // uint8_t peer_harq_soft_buffer_size_code;
+    // uint8_t peer_num_harq_processes_code;
+    // uint8_t peer_harq_feedback_delay_code;
+    // bool    peer_supports_dect_delay;
+    // bool    peer_supports_half_duplex;
+    bool peer_phy_params_known;     // True if RD Capability IE has been successfully parsed for this peer.
+
+
+    // --- Pending HARQ Feedback TO SEND to this peer (for PDUs *we* received from *them*) ---
+    struct {
+        bool valid;                 // True if this feedback slot is pending
+        bool is_ack;                // True for ACK, false for NACK
+        uint8_t harq_process_num_for_peer; // The HARQ process number *of the peer's transmission* that this feedback is for.
+    } pending_feedback_to_send[2];  // Max 2 feedback items can be sent in one nRF PHY Type 2 PCC feedback field (using Format 3)
     uint8_t num_pending_feedback_items;
 
-    // Other peer-specific state (timers, QoS, schedules) can be added here
-    // e.g. struct k_timer link_supervision_timer;
+    // Other peer-specific state (timers for link supervision, QoS parameters, active schedules for this peer, etc.)
+    // struct k_timer link_supervision_timer_for_peer; // Example
+    // dect_mac_schedule_t peer_dl_schedule; // If FT, schedule for DL to this PT
+    // dect_mac_schedule_t peer_ul_schedule; // If FT, schedule for UL from this PT
+
 } dect_mac_peer_info_t;
 
 /** @brief Stores a parsed resource allocation schedule for a link. */
@@ -283,6 +326,15 @@ typedef struct {
     uint32_t active_to_idle_tx_us;
     // Add other relevant latencies as needed
 } dect_phy_latency_values_t;
+
+/** @brief Stores own primary PHY operational parameters */
+typedef struct {
+    bool is_valid;      // True if these parameters have been set/determined
+    uint8_t mu;         // Own operational mu (subcarrier scaling factor code, e.g., 0 for 1, 1 for 2, etc. as per RD Cap IE)
+    uint8_t beta;       // Own operational beta (FFT scaling factor code, e.g., 0 for 1, 1 for 2, etc. as per RD Cap IE)
+    // Other primary PHY params like default MCS could also go here if not in config
+} dect_mac_own_phy_params_t;
+
 
 /** @brief Stores MAC layer configuration parameters. */
 typedef struct {
@@ -363,9 +415,13 @@ typedef struct dect_mac_context {
     dect_mac_role_t role;
     dect_mac_config_params_t config;
 
+
+
     uint32_t own_long_rd_id;
     uint16_t own_short_rd_id;
-    uint32_t network_id_32bit; // Full 32-bit Network ID
+    uint32_t network_id_32bit;
+
+    dect_mac_own_phy_params_t own_phy_params; // <<-- NEW FIELD
 
     uint32_t pending_op_handle;
     pending_op_type_t pending_op_type;
@@ -373,26 +429,27 @@ typedef struct dect_mac_context {
     dect_mac_rach_context_t rach_context;
 
     dect_harq_tx_process_t harq_tx_processes[MAX_HARQ_PROCESSES];
-    uint16_t psn; // Own Packet Sequence Number for outgoing MAC PDUs (12-bit)
-    uint32_t hpc; // Own Hyper Packet Counter for security TX (32-bit)
+    uint16_t psn;
+    uint32_t hpc;
 
     dect_phy_latency_values_t phy_latency;
 
-    // Global Master Pre-Shared Key (PSK) - Provisioned or hardcoded
     uint8_t master_psk[16];
     bool master_psk_provisioned;
 
-    // Session keys derived from PSK (used by PT for its FT link)
-    // For FT, per-peer keys are in ft_context_t. These might be unused or template for FT.
-    uint8_t integrity_key[16];
-    uint8_t cipher_key[16];
-    bool keys_provisioned; // For PT: Are session keys derived? For FT: Are *its own global/template* keys set (if any)?
-    uint8_t current_key_index; // Currently active key index (0-7) for MAC Security Info IE
-    bool send_mac_sec_info_ie_on_next_tx;
+    uint8_t integrity_key[16]; // For PT: session key with FT. For FT: unused (per-peer keys).
+    uint8_t cipher_key[16];    // For PT: session key with FT. For FT: unused.
+    bool keys_provisioned;     // For PT: session keys derived. For FT: unused.
+    uint8_t current_key_index; // Own current key index for TX.
+    bool send_mac_sec_info_ie_on_next_tx; // Global flag, e.g. for PT to send its HPC if FT requested.
 
     uint64_t last_known_modem_time;
-    uint64_t ft_sfn_zero_modem_time_anchor; // For FT: Modem time of its SFN 0. For PT: Estimated from FT beacon.
-    uint8_t  current_sfn_at_anchor_update;  // SFN value when anchor was last updated (PT uses FT's beacon SFN)
+    uint64_t ft_sfn_zero_modem_time_anchor;
+    uint8_t  current_sfn_at_anchor_update;
+
+
+
+
 
     union {
         pt_context_t pt;

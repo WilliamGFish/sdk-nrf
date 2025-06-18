@@ -468,18 +468,18 @@ static void pt_handle_phy_op_complete_internal(const struct nrf_modem_dect_phy_o
                 // For simplicity, let's use a fixed small unit time per "RACH backoff slot", e.g. ~200us (1 subslot time for mu=1)
                 // This needs to align with how contention slots are actually defined/perceived in the system.
                 // NRF_MODEM_DECT_LBT_PERIOD_MIN is 2 symbols.
-                uint8_t ft_mu = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon;
-                if (ft_mu == 0 || ft_mu > 8) ft_mu = 1;
-                uint32_t ft_base_symbol_duration_ticks = NRF_MODEM_DECT_SYMBOL_DURATION;
-                uint32_t ft_actual_symbol_duration_ticks = ft_base_symbol_duration_ticks;
-                if (ft_mu > 1) ft_actual_symbol_duration_ticks = ft_base_symbol_duration_ticks / (1U << (ft_mu - 1));
-                
-                // Assuming MINIMUM_LBT_PERIOD is a good proxy for a "RACH contention slot time unit"
-                uint32_t rach_contention_slot_ticks = NRF_MODEM_DECT_LBT_PERIOD_MIN; // (2 * base_symbol_duration_ticks)
-                 // If STF length is longer for higher mu, this may need adjustment.
-                 // For example, STF for mu > 1 might be 9 base symbols, so LBT_PERIOD_MIN might be too short.
-                 // Let's use FT's actual subslot duration as a backoff unit for more realism.
-                rach_contention_slot_ticks = ft_actual_symbol_duration_ticks * 5; // One subslot of FT's numerology
+
+                // Use FT's mu (from its RACH IE) to determine subslot duration for backoff units
+                uint8_t ft_mu_for_rach = ctx->role_ctx.pt.current_ft_rach_params.advertised_beacon_ie_fields.mu_value_for_ft_beacon;
+                if (ft_mu_for_rach == 0 || ft_mu_for_rach > 8) { // Sanitize from parsed IE
+                    LOG_WRN("PT_RACH_BKOFF: Invalid mu %u from FT RACH IE for backoff timing, defaulting to mu=1.", ft_mu_for_rach);
+                    ft_mu_for_rach = 1; // mu_code 0
+                }
+                uint32_t rach_contention_slot_ticks = get_subslot_duration_ticks_for_mu(ft_mu_for_rach);
+                if (rach_contention_slot_ticks == 0) { // Fallback if helper returned error
+                    LOG_ERR("PT_RACH_BKOFF: Failed to get subslot duration for FT mu_code %u. Using default backoff time.", ft_mu_for_rach);
+                    rach_contention_slot_ticks = NRF_MODEM_DECT_LBT_PERIOD_MIN; // Fallback to a small unit
+                }
 
 
                 uint32_t backoff_duration_ticks = backoff_slots_to_wait * rach_contention_slot_ticks;
@@ -1636,12 +1636,34 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
         memset(&ctx->role_ctx.pt.target_ft, 0, sizeof(dect_mac_peer_info_t));
         ctx->role_ctx.pt.target_ft.is_valid = false;
 
-        if (ft_cap_found) {
-            // TODO: Store/use relevant FT capabilities if needed by PT for future interactions
-            LOG_DBG("PT_SM: FT Capabilities: Release %u, MACSecModes 0x%X",
-                    ft_cap_fields.release_version, ft_cap_fields.mac_security_modes_code);
+        if (ft_cap_found) { // ft_cap_found was set if parse_rd_capability_ie_payload succeeded
+            LOG_DBG("PT_SM_ASSOC_RESP: FT RD Cap IE parsed. ReleaseVer: %u, NumPHYAddSets: %u.",
+                    ft_cap_fields.release_version, ft_cap_fields.num_phy_capabilities);
+            if (ft_cap_fields.num_phy_capabilities >= 1) { // Check if at least one explicit 5-octet set was present and parsed
+                // Store FT's primary mu, beta, and max_mcs from its first reported PHY capability set
+                ctx->role_ctx.pt.associated_ft.peer_mu = ft_cap_fields.phy_variants[0].mu_value;
+                ctx->role_ctx.pt.associated_ft.peer_beta = ft_cap_fields.phy_variants[0].beta_value;
+                ctx->role_ctx.pt.associated_ft.peer_max_mcs_code = ft_cap_fields.phy_variants[0].max_mcs_code;
+                // Copy other relevant parsed capabilities from phy_variants[0] if needed
+                // e.g., ctx->role_ctx.pt.associated_ft.peer_dlc_service_support_code = ft_cap_fields.phy_variants[0].dlc_service_type_support_code;
+                ctx->role_ctx.pt.associated_ft.peer_phy_params_known = true;
+                LOG_INF("PT_SM_ASSOC_RESP: Stored FT's PHY params: mu_code=%u (val 2^%u), beta_code=%u (val %u), max_mcs_code=%u",
+                        ctx->role_ctx.pt.associated_ft.peer_mu, ctx->role_ctx.pt.associated_ft.peer_mu,
+                        ctx->role_ctx.pt.associated_ft.peer_beta, ctx->role_ctx.pt.associated_ft.peer_beta + 1,
+                        ctx->role_ctx.pt.associated_ft.peer_max_mcs_code);
+            } else {
+                LOG_WRN("PT_SM_ASSOC_RESP: FT RD Cap IE parsed but indicates no explicit 5-octet PHY sets. Using defaults for FT link mu/beta.");
+                ctx->role_ctx.pt.associated_ft.peer_mu = 0; // Code for mu=1
+                ctx->role_ctx.pt.associated_ft.peer_beta = 0; // Code for beta=1
+                ctx->role_ctx.pt.associated_ft.peer_max_mcs_code = 0; // Default to MCS0
+                ctx->role_ctx.pt.associated_ft.peer_phy_params_known = false;
+            }
         } else {
-            LOG_WRN("PT_SM: FT RD Capability IE missing in accepted Association Response.");
+            LOG_WRN("PT_SM_ASSOC_RESP: FT RD Capability IE missing in accepted Association Response. Using defaults for FT link mu/beta.");
+            ctx->role_ctx.pt.associated_ft.peer_mu = 0; // Code for mu=1
+            ctx->role_ctx.pt.associated_ft.peer_beta = 0; // Code for beta=1
+            ctx->role_ctx.pt.associated_ft.peer_max_mcs_code = 0; // Default to MCS0
+            ctx->role_ctx.pt.associated_ft.peer_phy_params_known = false;
         }
 
         if (res_alloc_found) {

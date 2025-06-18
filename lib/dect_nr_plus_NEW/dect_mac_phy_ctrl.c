@@ -14,6 +14,68 @@
 
 LOG_MODULE_REGISTER(dect_mac_phy_ctrl, CONFIG_DECT_MAC_PHY_CTRL_LOG_LEVEL);
 
+
+/**
+ * @brief Calculates the duration of one subslot in modem time ticks for a given mu_code.
+ *
+ * A subslot is 5 OFDM symbols. Symbol duration depends on mu.
+ * NRF_MODEM_DECT_SYMBOL_DURATION is assumed to be for mu=1 (code 0).
+ * mu_actual = 2^mu_code. Symbol_duration_mu = Symbol_duration_mu1 / (2^(mu_code)).
+ *
+ * @param mu_code The mu code (0-7, where actual mu = 2^mu_code).
+ *                Typical DECT NR+ uses mu_codes 0,1,2,3 for mu=1,2,4,8.
+ * @return Subslot duration in modem ticks, or 0 if invalid mu_code or calculation error.
+ */
+static uint32_t get_subslot_duration_ticks_for_mu(uint8_t mu_code)
+{
+    if (mu_code > 7) { // mu=2^7 = 128 is likely too high, ETSI Table 4.3-1 goes up to mu=8 (code=3)
+        LOG_ERR("PHY_TIMING: Invalid mu_code %u for subslot duration.", mu_code);
+        return 0;
+    }
+
+    uint32_t base_symbol_duration_ticks = NRF_MODEM_DECT_SYMBOL_DURATION; // Ticks for mu=1 symbol
+    uint32_t actual_symbol_duration_ticks = base_symbol_duration_ticks;
+
+    if (mu_code > 0) { // For mu_code 0 (mu=1), actual_symbol_duration_ticks is base_symbol_duration_ticks
+        actual_symbol_duration_ticks = base_symbol_duration_ticks / (1U << mu_code);
+    }
+    
+    if (actual_symbol_duration_ticks == 0 && base_symbol_duration_ticks != 0) {
+        // This implies mu_code was too large, leading to division to zero.
+        LOG_ERR("PHY_TIMING: Calculated symbol duration is 0 for mu_code %u (base_sym_ticks %u).",
+                mu_code, base_symbol_duration_ticks);
+        return 0;
+    }
+    return actual_symbol_duration_ticks * 5; // 5 OFDM symbols per subslot
+}
+
+/**
+ * @brief Gets the number of subslots per ETSI slot (0.41667 ms) for a given mu_code.
+ *
+ * ETSI TS 103 636-3, Table 4.3-1: N_slot_subslot
+ * mu=1 (code 0) -> 2 subslots/slot
+ * mu=2 (code 1) -> 4 subslots/slot
+ * mu=4 (code 2) -> 8 subslots/slot
+ * mu=8 (code 3) -> 16 subslots/slot
+ *
+ * @param mu_code The mu code (0-7).
+ * @return Number of subslots per ETSI slot.
+ */
+static uint8_t get_subslots_per_etsi_slot_for_mu(uint8_t mu_code)
+{
+    if (mu_code > 3) { // ETSI Table 4.3-1 currently defines N_slot_subslot up to mu=8 (code=3)
+        LOG_WRN("PHY_TIMING: mu_code %u > 3, N_slot_subslot may not be standard. Defaulting for mu=8.", mu_code);
+        return 16; // Value for mu=8 (code=3)
+    }
+    // N_slot_subslot = 2 * (2^mu_code) = 2 * mu_actual
+    // mu_code 0 (mu=1) -> 2 * 1 = 2
+    // mu_code 1 (mu=2) -> 2 * 2 = 4
+    // mu_code 2 (mu=4) -> 2 * 4 = 8
+    // mu_code 3 (mu=8) -> 2 * 8 = 16
+    return 2 * (1U << mu_code);
+}
+
+
 // Global buffer for constructing the PCC (Physical Control Channel header) to be sent to nRF PHY API.
 // This buffer is filled before each TX operation.
 static union nrf_modem_dect_phy_hdr g_phy_pcc_tx_constructor_buf;
@@ -244,11 +306,18 @@ int dect_mac_phy_ctrl_start_tx_assembled(uint16_t carrier,
     // TODO: More advanced MCS selection based on link quality, QoS, etc.
 
     // TODO: Determine mu and beta for the current link/operation from context.
-    uint8_t current_link_mu = 1;   // Placeholder
-    uint8_t current_link_beta = 1; // Placeholder
+    // Use the device's own configured/operational mu and beta for its transmissions
+    uint8_t own_mu_code = ctx->own_phy_params.is_valid ? ctx->own_phy_params.mu : 0; // Default to mu-code 0 (mu=1)
+    uint8_t own_beta_code = ctx->own_phy_params.is_valid ? ctx->own_phy_params.beta : 0; // Default to beta-code 0 (beta=1)
+    if (own_mu_code == 0 && !ctx->own_phy_params.is_valid) {
+        LOG_WRN("PHY_CTRL_TX: Own PHY mu not valid, using default mu_code=0 (mu=1).");
+    }
+    if (own_beta_code == 0 && !ctx->own_phy_params.is_valid && ctx->own_phy_params.beta != 0) { // Check if beta was explicitly 0 or just default
+         LOG_WRN("PHY_CTRL_TX: Own PHY beta not valid, using default beta_code=0 (beta=1).");
+    }
 
     dect_mac_phy_ctrl_calculate_pcc_params(pdc_content_len_for_phy,
-                                           current_link_mu, current_link_beta,
+                                           own_mu_code, own_beta_code
                                            &calculated_pcc_packet_len_field,
                                            &mcs_to_use_for_pcc_calc, // Input is desired, output is actual used for calc
                                            &calculated_pcc_pkt_len_type_field);

@@ -936,7 +936,7 @@ int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payloa
         LOG_ERR("RD_CAP_PARSE: NULL input pointers.");
         return -EINVAL;
     }
-    if (ie_payload_len < 2) {
+    if (ie_payload_len < 2) { // Min 2 octets for summary
         LOG_ERR("RD_CAP_PARSE: Payload too short (%u bytes) for mandatory part (2 bytes).", ie_payload_len);
         return -EMSGSIZE;
     }
@@ -949,7 +949,7 @@ int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payloa
     // Octet 0: Number of PHY Capabilities (3 MSB), Release (5 LSB)
     if (*remaining_bits < 8) return -EMSGSIZE;
     uint8_t octet0 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
-    out_cap_fields->num_phy_capabilities = (octet0 >> 5) & 0x07;
+    out_cap_fields->num_phy_capabilities = (octet0 >> 5) & 0x07; // This is N-1 value
     out_cap_fields->release_version      = octet0 & 0x1F;
 
     // Octet 1: Flags
@@ -962,53 +962,68 @@ int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payloa
     out_cap_fields->supports_sched_data       = (octet1 >> 2) & 0x01;
     out_cap_fields->mac_security_modes_code   = octet1 & 0x03;
 
-    // Conditional: First PHY Capability Set (Octets 2 to 6)
-    if (out_cap_fields->num_phy_capabilities >= 1) { // If field value is N-1, then N-1 >= 1 means N >= 2 sets total (base + >=1 explicit)
-                                                    // Or, if field value N means N explicit sets, then if >=1.
-                                                    // ETSI Table 6.4.3.5-1: "Num PHY Capabilities. (N-1)". So if value is 0, means 1 set (the base), no 5-octet parts.
-                                                    // If value is 1, means 1 additional 5-octet set.
-        if (*remaining_bits < (5 * 8)) { LOG_ERR("RD_CAP_PARSE: num_phy_cap >= 1, but not enough bits for 5-octet set."); return -EMSGSIZE; }
+    LOG_DBG("RD_CAP_PARSE: Summary: NumPHYAddSets:%u, RelVer:%u, GrpAs:%d Paging:%d OpM:0x%X Mesh:%d Sched:%d MACSec:0x%X",
+            out_cap_fields->num_phy_capabilities, out_cap_fields->release_version,
+            out_cap_fields->supports_group_assignment, out_cap_fields->supports_paging,
+            out_cap_fields->operating_modes_code, out_cap_fields->supports_mesh,
+            out_cap_fields->supports_sched_data, out_cap_fields->mac_security_modes_code);
+
+    // Conditional: Parse first explicit PHY Capability Set if present
+    // num_phy_capabilities field stores (N-1). If it's 0, N=1 (base set only, no 5-octet part).
+    // If it's 1, N=2 (base + 1 explicit 5-octet set).
+    if (out_cap_fields->num_phy_capabilities >= 1) { // At least one explicit 5-octet set follows
+        if (*remaining_bits < (5 * 8)) {
+            LOG_ERR("RD_CAP_PARSE: num_phy_cap >= 1, but not enough bits (%d) for one 5-octet set.", *remaining_bits);
+            // Continue with summary, but phy_variants[0] will be zeroed.
+            out_cap_fields->num_phy_capabilities = 0; // Indicate no valid explicit sets were parsed
+            return 0; // Or -EMSGSIZE if strict
+        }
         
         dect_mac_phy_capability_set_t *phy_set0 = &out_cap_fields->phy_variants[0];
         uint8_t phy_octet;
 
-        // Set Octet 0: DLC Svc (3b), RX Div (3b), Rsvd (2b)
+        // Set Octet 0 of 5-octet set: DLC Svc (3b), RX Div (3b), Rsvd (2b)
         phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
         phy_set0->dlc_service_type_support_code = (phy_octet >> 5) & 0x07;
         phy_set0->rx_for_tx_diversity_code = (phy_octet >> 2) & 0x07;
 
-        // Set Octet 1: mu (3b), beta (4b), Rsvd (1b)
+        // Set Octet 1 of 5-octet set: mu (3b), beta (4b), Rsvd (1b)
         phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
-        phy_set0->mu_value = (phy_octet >> 5) & 0x07;
-        phy_set0->beta_value = (phy_octet >> 1) & 0x0F;
+        phy_set0->mu_value = (phy_octet >> 5) & 0x07;   // This is the mu_code (0-7)
+        phy_set0->beta_value = (phy_octet >> 1) & 0x0F; // This is the beta_code (0-15)
 
-        // Set Octet 2: Max NSS (3b), Max MCS (4b), Rsvd (1b)
+        // Set Octet 2 of 5-octet set: Max NSS (3b), Max MCS (4b), Rsvd (1b)
         phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
         phy_set0->max_nss_for_rx_code = (phy_octet >> 5) & 0x07;
         phy_set0->max_mcs_code = (phy_octet >> 1) & 0x0F;
 
-        // Set Octet 3: HARQ Buf (4b), Num HARQ Proc (2b), Rsvd (2b)
+        // Set Octet 3 of 5-octet set: HARQ Buf (4b), Num HARQ Proc (2b), Rsvd (2b)
         phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
         phy_set0->harq_soft_buffer_size_code = (phy_octet >> 4) & 0x0F;
         phy_set0->num_harq_processes_code = (phy_octet >> 2) & 0x03;
 
-        // Set Octet 4: HARQ Delay (4b), D_Delay (1b), HalfDup (1b), Rsvd (2b)
+        // Set Octet 4 of 5-octet set: HARQ Delay (4b), D_Delay (1b), HalfDup (1b), Rsvd (2b)
         phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
         phy_set0->harq_feedback_delay_code = (phy_octet >> 4) & 0x0F;
         phy_set0->supports_dect_delay = (phy_octet >> 3) & 0x01;
         phy_set0->supports_half_duplex = (phy_octet >> 2) & 0x01;
 
-        LOG_DBG("RD_CAP_PARSE: Parsed PHY Set 0: mu=%u, beta=%u, max_mcs=%u",
-                phy_set0->mu_value, phy_set0->beta_value, phy_set0->max_mcs_code);
+        LOG_DBG("RD_CAP_PARSE: Parsed PHY Set 0: mu_code=%u, beta_code=%u, max_mcs_code=%u, dlc_svc_code=%u",
+                phy_set0->mu_value, phy_set0->beta_value, phy_set0->max_mcs_code, phy_set0->dlc_service_type_support_code);
+        // TODO: Loop here to parse more sets if out_cap_fields->num_phy_capabilities > 1
+        //       and if phy_variants was an array capable of holding more.
+    } else {
+        LOG_DBG("RD_CAP_PARSE: No explicit 5-octet PHY capability sets indicated (num_phy_capabilities field is 0).");
     }
-    // TODO: Loop here to parse more sets if out_cap_fields->num_phy_capabilities > 1 and phy_variants was an array.
 
-    if (*remaining_bits >= 8) { /* Log warning about unparsed data */ }
-    else if (*remaining_bits > 0) { /* Log warning about unparsed bits */ }
+    if (*remaining_bits >= 8) {
+        LOG_WRN("RD_CAP_PARSE: %d unparsed bits (>=1 byte) remain. Payload len %u.", *remaining_bits, ie_payload_len);
+    } else if (*remaining_bits > 0) {
+        LOG_WRN("RD_CAP_PARSE: %d unparsed bits remain (padding or error). Payload len %u.", *remaining_bits, ie_payload_len);
+    }
 
     return 0;
 }
-
 
 
 

@@ -146,23 +146,37 @@ int dect_mac_core_init(dect_mac_role_t role, uint32_t provisioned_long_rd_id)
             (role == MAC_ROLE_PT) ? "PT" : "FT",
             ctx->own_long_rd_id, ctx->own_short_rd_id, ctx->network_id_32bit);
 
+    // // Default MAC configurations
+    // ctx->config.rssi_threshold_min_dbm = CONFIG_DECT_MAC_RSSI_THR_MIN_DBM;
+    // ctx->config.rssi_threshold_max_dbm = CONFIG_DECT_MAC_RSSI_THR_MAX_DBM;
+    // ctx->config.rach_cw_min_idx = CONFIG_DECT_MAC_RACH_CW_MIN_IDX;
+    // ctx->config.rach_cw_max_idx = CONFIG_DECT_MAC_RACH_CW_MAX_IDX;
+    // ctx->config.rach_response_window_ms = CONFIG_DECT_MAC_RACH_RESP_WIN_MS;
+    // ctx->config.keep_alive_period_ms = CONFIG_DECT_MAC_KEEP_ALIVE_MS;
+    // ctx->config.mobility_scan_interval_ms = CONFIG_DECT_MAC_MOBILITY_SCAN_MS;
+    // ctx->config.ft_cluster_beacon_period_ms = CONFIG_DECT_MAC_FT_CLUSTER_BEACON_MS;
+    // ctx->config.ft_network_beacon_period_ms = CONFIG_DECT_MAC_FT_NETWORK_BEACON_MS;
+    // ctx->config.max_assoc_retries = MAX_RACH_ATTEMPTS_CONFIG;
+    // ctx->config.ft_policy_secure_on_assoc = IS_ENABLED(CONFIG_DECT_MAC_FT_SECURE_ON_ASSOC);
+    // ctx->config.default_tx_power_code = DEFAULT_TX_POWER_CODE; // From context.h default
+    // ctx->config.default_data_mcs_code = CONFIG_DECT_MAC_DEFAULT_DATA_MCS;
+
+    // Initialize own primary PHY parameters
+    ctx->own_phy_params.is_valid = true; // Mark as valid once set from config
+    ctx->own_phy_params.mu = CONFIG_DECT_MAC_OWN_MU_CODE;
+    ctx->own_phy_params.beta = CONFIG_DECT_MAC_OWN_BETA_CODE;
+    LOG_INF("MAC Core: Own PHY Params -> mu_code: %u (val 2^%u), beta_code: %u (val %u)",
+            ctx->own_phy_params.mu, ctx->own_phy_params.mu,
+            ctx->own_phy_params.beta, ctx->own_phy_params.beta + 1);
+
     // Default MAC configurations
     ctx->config.rssi_threshold_min_dbm = CONFIG_DECT_MAC_RSSI_THR_MIN_DBM;
-    ctx->config.rssi_threshold_max_dbm = CONFIG_DECT_MAC_RSSI_THR_MAX_DBM;
-    ctx->config.rach_cw_min_idx = CONFIG_DECT_MAC_RACH_CW_MIN_IDX;
-    ctx->config.rach_cw_max_idx = CONFIG_DECT_MAC_RACH_CW_MAX_IDX;
-    ctx->config.rach_response_window_ms = CONFIG_DECT_MAC_RACH_RESP_WIN_MS;
-    ctx->config.keep_alive_period_ms = CONFIG_DECT_MAC_KEEP_ALIVE_MS;
-    ctx->config.mobility_scan_interval_ms = CONFIG_DECT_MAC_MOBILITY_SCAN_MS;
-    ctx->config.ft_cluster_beacon_period_ms = CONFIG_DECT_MAC_FT_CLUSTER_BEACON_MS;
-    ctx->config.ft_network_beacon_period_ms = CONFIG_DECT_MAC_FT_NETWORK_BEACON_MS;
-    ctx->config.max_assoc_retries = MAX_RACH_ATTEMPTS_CONFIG;
-    ctx->config.ft_policy_secure_on_assoc = IS_ENABLED(CONFIG_DECT_MAC_FT_SECURE_ON_ASSOC);
-    ctx->config.default_tx_power_code = DEFAULT_TX_POWER_CODE; // From context.h default
+    // ... (other ctx->config initializations) ...
     ctx->config.default_data_mcs_code = CONFIG_DECT_MAC_DEFAULT_DATA_MCS;
 
     // Placeholder PHY latencies (will be updated from PHY via dect_mac_phy_if.c)
     memset(&ctx->phy_latency, 0, sizeof(dect_phy_latency_values_t));
+
 
     // Initialize common RACH context and timers
     k_timer_init(&ctx->rach_context.rach_response_window_timer, rach_response_window_timer_expiry_fn, NULL);
