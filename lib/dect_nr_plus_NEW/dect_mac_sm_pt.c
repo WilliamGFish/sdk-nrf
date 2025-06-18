@@ -1744,86 +1744,131 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
         ctx->role_ctx.pt.target_ft.is_valid = false;
 
 
-
         if (res_alloc_found) {
-            LOG_INF("PT_SM: Storing schedule from FT 0x%04X.", ctx->role_ctx.pt.associated_ft.short_rd_id);
-            uint32_t frame_duration_ticks = (uint32_t)FRAME_DURATION_MS_NOMINAL * (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
-            uint16_t schedule_channel = res_alloc_fields.channel_present ? \
-                                        res_alloc_fields.channel_val : ctx->role_ctx.pt.associated_ft.operating_carrier;
+            LOG_INF("PT_SM: Storing schedule from FT 0x%04X (FT mu_code for schedule: %u).",
+                    ctx->role_ctx.pt.associated_ft.short_rd_id,
+                    ctx->role_ctx.pt.associated_ft.peer_mu); // This is the FT's mu_code
 
-            // --- Downlink Schedule (Res1 in ResAlloc IE) ---
-            ctx->role_ctx.pt.dl_schedule.is_active = true;
-            ctx->role_ctx.pt.dl_schedule.alloc_type = RES_ALLOC_TYPE_DOWNLINK;
-            ctx->role_ctx.pt.dl_schedule.dl_start_subslot = res_alloc_fields.start_subslot_val_res1;
-            ctx->role_ctx.pt.dl_schedule.dl_duration_subslots = res_alloc_fields.length_val_res1 + 1;
-            ctx->role_ctx.pt.dl_schedule.dl_length_is_slots = res_alloc_fields.length_type_is_slots_res1;
-            ctx->role_ctx.pt.dl_schedule.repeat_type = res_alloc_fields.repeat_val;
-            ctx->role_ctx.pt.dl_schedule.repetition_value = res_alloc_fields.repetition_val;
-            ctx->role_ctx.pt.dl_schedule.validity_value = res_alloc_fields.validity_val;
-            ctx->role_ctx.pt.dl_schedule.channel = schedule_channel;
-            ctx->role_ctx.pt.dl_schedule.schedule_init_modem_time = assoc_resp_pcc_rx_time;
-            ctx->role_ctx.pt.dl_schedule.res1_is_9bit_subslot = res_alloc_fields.res1_is_9bit_subslot; // Copy from parsed
+            uint32_t frame_duration_ticks_val = 0;
+            if (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ > 0) {
+                    frame_duration_ticks_val = (uint32_t)FRAME_DURATION_MS_NOMINAL * (NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ / 1000U);
+            }
+            if (frame_duration_ticks_val == 0) { LOG_ERR("PT_SCHED: Frame duration ticks is 0!"); /* Handle error */ return; }
+
+            uint8_t ft_mu_code = ctx->role_ctx.pt.associated_ft.peer_phy_params_known ?
+                                    ctx->role_ctx.pt.associated_ft.peer_mu : 0; // Default to mu_code 0 (mu=1)
+            if (ft_mu_code > 7) ft_mu_code = 0; // Sanitize
+
+            uint8_t subslots_per_ft_slot = get_subslots_per_etsi_slot_for_mu(ft_mu_code);
+
+            uint16_t schedule_channel = res_alloc_fields.channel_present ?
+                                        res_alloc_fields.channel_val :
+                                        ctx->role_ctx.pt.associated_ft.operating_carrier;
+
+            // --- Populate Downlink Schedule (Resource 1 from ResAlloc IE) ---
+            dect_mac_schedule_t *dl_sched = &ctx->role_ctx.pt.dl_schedule;
+            memset(dl_sched, 0, sizeof(dect_mac_schedule_t)); // Clear previous schedule
+            dl_sched->is_active = true;
+            dl_sched->alloc_type = RES_ALLOC_TYPE_DOWNLINK; // From PT's perspective this is DL
+            dl_sched->res1_is_9bit_subslot = res_alloc_fields.res1_is_9bit_subslot; // Copied from parser output
+            dl_sched->dl_start_subslot = res_alloc_fields.start_subslot_val_res1;
+            dl_sched->dl_length_is_slots = res_alloc_fields.length_type_is_slots_res1;
+            dl_sched->dl_duration_subslots = res_alloc_fields.length_val_res1 + 1; // N-1 coded
+            if (dl_sched->dl_length_is_slots) {
+                dl_sched->dl_duration_subslots *= subslots_per_ft_slot;
+            }
+
+            dl_sched->repeat_type = res_alloc_fields.repeat_val;
+            dl_sched->repetition_value = res_alloc_fields.repetition_value;
+            dl_sched->validity_value = res_alloc_fields.validity_value;
+            dl_sched->channel = schedule_channel;
+            dl_sched->schedule_init_modem_time = assoc_resp_pcc_rx_time; // Time ResAlloc was received
 
             if (res_alloc_fields.sfn_present) {
-                ctx->role_ctx.pt.dl_schedule.sfn_of_initial_occurrence = res_alloc_fields.sfn_val;
-                ctx->role_ctx.pt.dl_schedule.next_occurrence_modem_time =
+                dl_sched->sfn_of_initial_occurrence = res_alloc_fields.sfn_val;
+                dl_sched->next_occurrence_modem_time =
                     calculate_target_modem_time(ctx, ctx->ft_sfn_zero_modem_time_anchor,
-                                                ctx->current_sfn_at_anchor_update,
-                                                res_alloc_fields.sfn_val,
-                                                res_alloc_fields.start_subslot_val_res1);
-            } else {
-                ctx->role_ctx.pt.dl_schedule.sfn_of_initial_occurrence = ctx->current_sfn_at_anchor_update;
-                uint64_t now_plus_processing_delay = assoc_resp_pcc_rx_time + modem_us_to_ticks(5000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
-                uint64_t current_frame_start_approx = (now_plus_processing_delay / frame_duration_ticks) * frame_duration_ticks;
-                uint64_t candidate_time = current_frame_start_approx + (uint64_t)res_alloc_fields.start_subslot_val_res1 * get_subslot_duration_ticks(ctx);
-                if (candidate_time <= now_plus_processing_delay) { candidate_time += frame_duration_ticks; }
-                ctx->role_ctx.pt.dl_schedule.next_occurrence_modem_time = candidate_time;
-            }
-            update_next_occurrence(ctx, &ctx->role_ctx.pt.dl_schedule, ctx->last_known_modem_time);
-            LOG_INF("PT_SM: DL Schedule Init: NextOcc @ %llu, StartSS %u, Dur %u, Rep %u, Valid %u, Chan %u",
-                    ctx->role_ctx.pt.dl_schedule.next_occurrence_modem_time, ctx->role_ctx.pt.dl_schedule.dl_start_subslot,
-                    ctx->role_ctx.pt.dl_schedule.dl_duration_subslots, ctx->role_ctx.pt.dl_schedule.repetition_value,
-                    ctx->role_ctx.pt.dl_schedule.validity_value, ctx->role_ctx.pt.dl_schedule.channel);
+                                                ctx->current_sfn_at_anchor_update, // SFN when anchor was last updated
+                                                res_alloc_fields.sfn_val,          // Target SFN for schedule start
+                                                dl_sched->dl_start_subslot);
+            } else { // SFN not present, schedule relative to current time + processing
+                dl_sched->sfn_of_initial_occurrence = ctx->current_sfn_at_anchor_update; // Or SFN of current frame
+                uint64_t now_plus_processing_delay = assoc_resp_pcc_rx_time +
+                                modem_us_to_ticks(CONFIG_DECT_MAC_SCHEDULE_PROCESSING_DELAY_US, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+                uint64_t current_frame_start_approx = (now_plus_processing_delay / frame_duration_ticks_val) * frame_duration_ticks_val;
+                if (current_frame_start_approx < ctx->ft_sfn_zero_modem_time_anchor) current_frame_start_approx = ctx->ft_sfn_zero_modem_time_anchor;
 
+                uint32_t ft_subslot_duration = get_subslot_duration_ticks_for_mu(ft_mu_code);
+                uint64_t candidate_time = current_frame_start_approx + (uint64_t)dl_sched->dl_start_subslot * ft_subslot_duration;
+                
+                // Ensure it's in the future of now_plus_processing_delay
+                while(candidate_time <= now_plus_processing_delay) {
+                        candidate_time += frame_duration_ticks_val; // Advance by one full frame
+                }
+                dl_sched->next_occurrence_modem_time = candidate_time;
+            }
+            update_next_occurrence(ctx, dl_sched, ctx->last_known_modem_time); // Ensure it's truly future
+            LOG_INF("PT_SM: DL Schedule Init: NextOcc @ %llu, StartSS %u, Dur %u subslots, Rep %u, Valid %u, Chan %u",
+                    dl_sched->next_occurrence_modem_time, dl_sched->dl_start_subslot,
+                    dl_sched->dl_duration_subslots, dl_sched->repetition_value,
+                    dl_sched->validity_value, dl_sched->channel);
+
+            // --- Populate Uplink Schedule (Resource 2 from ResAlloc IE, if BIDIR) ---
             if (res_alloc_fields.alloc_type_val == RES_ALLOC_TYPE_BIDIR) {
-                ctx->role_ctx.pt.ul_schedule.is_active = true;
-                ctx->role_ctx.pt.ul_schedule.alloc_type = RES_ALLOC_TYPE_UPLINK;
-                ctx->role_ctx.pt.ul_schedule.ul_start_subslot = res_alloc_fields.start_subslot_val_res2;
-                ctx->role_ctx.pt.ul_schedule.ul_duration_subslots = res_alloc_fields.length_val_res2 + 1;
-                ctx->role_ctx.pt.ul_schedule.ul_length_is_slots = res_alloc_fields.length_type_is_slots_res2;
-                ctx->role_ctx.pt.ul_schedule.repeat_type = res_alloc_fields.repeat_val;
-                ctx->role_ctx.pt.ul_schedule.repetition_value = res_alloc_fields.repetition_val;
-                ctx->role_ctx.pt.ul_schedule.validity_value = res_alloc_fields.validity_value;
-                ctx->role_ctx.pt.ul_schedule.channel = schedule_channel;
-                ctx->role_ctx.pt.ul_schedule.schedule_init_modem_time = assoc_resp_pcc_rx_time;
-                ctx->role_ctx.pt.ul_schedule.res1_is_9bit_subslot = res_alloc_fields.res2_is_9bit_subslot; // For UL part it's Res2
+                dect_mac_schedule_t *ul_sched = &ctx->role_ctx.pt.ul_schedule;
+                memset(ul_sched, 0, sizeof(dect_mac_schedule_t));
+                ul_sched->is_active = true;
+                ul_sched->alloc_type = RES_ALLOC_TYPE_UPLINK;
+                ul_sched->res1_is_9bit_subslot = res_alloc_fields.res2_is_9bit_subslot; // Res2 from IE maps to Res1 for UL sched
+                ul_sched->ul_start_subslot = res_alloc_fields.start_subslot_val_res2;
+                ul_sched->ul_length_is_slots = res_alloc_fields.length_type_is_slots_res2;
+                ul_sched->ul_duration_subslots = res_alloc_fields.length_val_res2 + 1;
+                if (ul_sched->ul_length_is_slots) {
+                    ul_sched->ul_duration_subslots *= subslots_per_ft_slot;
+                }
+                // Copy common schedule parameters
+                ul_sched->repeat_type = res_alloc_fields.repeat_val;
+                ul_sched->repetition_value = res_alloc_fields.repetition_value;
+                ul_sched->validity_value = res_alloc_fields.validity_value;
+                ul_sched->channel = schedule_channel;
+                ul_sched->schedule_init_modem_time = assoc_resp_pcc_rx_time;
 
                 if (res_alloc_fields.sfn_present) {
-                    ctx->role_ctx.pt.ul_schedule.sfn_of_initial_occurrence = res_alloc_fields.sfn_val;
-                    ctx->role_ctx.pt.ul_schedule.next_occurrence_modem_time =
+                    ul_sched->sfn_of_initial_occurrence = res_alloc_fields.sfn_val;
+                    ul_sched->next_occurrence_modem_time =
                         calculate_target_modem_time(ctx, ctx->ft_sfn_zero_modem_time_anchor,
                                                     ctx->current_sfn_at_anchor_update,
                                                     res_alloc_fields.sfn_val,
-                                                    res_alloc_fields.start_subslot_val_res2);
+                                                    ul_sched->ul_start_subslot);
                 } else {
-                    ctx->role_ctx.pt.ul_schedule.sfn_of_initial_occurrence = ctx->current_sfn_at_anchor_update;
-                    uint64_t now_plus_processing_delay = assoc_resp_pcc_rx_time + modem_us_to_ticks(5000, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
-                    uint64_t current_frame_start_approx = (now_plus_processing_delay / frame_duration_ticks) * frame_duration_ticks;
-                    uint64_t candidate_time = current_frame_start_approx + (uint64_t)res_alloc_fields.start_subslot_val_res2 * get_subslot_duration_ticks(ctx);
-                    if (candidate_time <= now_plus_processing_delay) { candidate_time += frame_duration_ticks; }
-                    ctx->role_ctx.pt.ul_schedule.next_occurrence_modem_time = candidate_time;
+                    ul_sched->sfn_of_initial_occurrence = ctx->current_sfn_at_anchor_update;
+                    uint64_t now_plus_processing_delay = assoc_resp_pcc_rx_time +
+                                modem_us_to_ticks(CONFIG_DECT_MAC_SCHEDULE_PROCESSING_DELAY_US, NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ);
+                    uint64_t current_frame_start_approx = (now_plus_processing_delay / frame_duration_ticks_val) * frame_duration_ticks_val;
+                    if (current_frame_start_approx < ctx->ft_sfn_zero_modem_time_anchor) current_frame_start_approx = ctx->ft_sfn_zero_modem_time_anchor;
+                    
+                    uint32_t ft_subslot_duration = get_subslot_duration_ticks_for_mu(ft_mu_code);
+                    uint64_t candidate_time = current_frame_start_approx + (uint64_t)ul_sched->ul_start_subslot * ft_subslot_duration;
+                    
+                    while(candidate_time <= now_plus_processing_delay) {
+                            candidate_time += frame_duration_ticks_val;
+                    }
+                    ul_sched->next_occurrence_modem_time = candidate_time;
                 }
-                update_next_occurrence(ctx, &ctx->role_ctx.pt.ul_schedule, ctx->last_known_modem_time);
-                 LOG_INF("PT_SM: UL Schedule Init: NextOcc @ %llu, StartSS %u, Dur %u",
-                        ctx->role_ctx.pt.ul_schedule.next_occurrence_modem_time, ctx->role_ctx.pt.ul_schedule.ul_start_subslot,
-                        ctx->role_ctx.pt.ul_schedule.ul_duration_subslots);
+                update_next_occurrence(ctx, ul_sched, ctx->last_known_modem_time);
+                LOG_INF("PT_SM: UL Schedule Init: NextOcc @ %llu, StartSS %u, Dur %u subslots",
+                        ul_sched->next_occurrence_modem_time, ul_sched->ul_start_subslot,
+                        ul_sched->ul_duration_subslots);
+            } else { // If not BIDIR, ensure UL schedule is marked inactive
+                ctx->role_ctx.pt.ul_schedule.is_active = false;
             }
         } else {
-            LOG_WRN("PT_SM: Association accepted by FT 0x%04X but NO Resource Allocation IE found! Link unusable.", ctx->role_ctx.pt.associated_ft.short_rd_id);
-            // This is a critical failure for data exchange. PT should probably rescan or release.
-            dect_mac_sm_pt_start_operation(); // Restart scan
-            return;
+            LOG_WRN("PT_SM: Association accepted by FT 0x%04X but NO Resource Allocation IE found! Link may be unusable for data.",
+                    ctx->role_ctx.pt.associated_ft.short_rd_id);
+            ctx->role_ctx.pt.dl_schedule.is_active = false;
+            ctx->role_ctx.pt.ul_schedule.is_active = false;
         }
+
 
         // Proceed to "authentication" (simplified PSK key derivation)
         // New call to the authentication protocol initiator stub:
