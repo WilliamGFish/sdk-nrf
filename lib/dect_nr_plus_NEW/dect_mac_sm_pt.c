@@ -1564,12 +1564,41 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
                 resp_ie_found = true;
                 LOG_DBG("PT_SM_ASSOC_RESP: Parsed Assoc Resp IE (ACK: %d).", resp_fields.ack_nack);
             } else { LOG_ERR("PT_SM_ASSOC_RESP: Failed to parse Assoc Resp IE payload."); }
+            
+        // This modification is for pt_process_association_response_pdu, not pt_handle_phy_pdc_internal's beacon parsing.
+        // The context is parsing IEs from an Association Response.
+        // ... (inside the MUX parsing loop of pt_process_association_response_pdu)
         } else if (ie_type == IE_TYPE_RD_CAPABILITY) {
-            if (parse_rd_capability_ie_payload(ie_payload_ptr, ie_payload_len, &ft_cap_fields) == 0) {
-                ft_cap_found = true;
-                LOG_DBG("PT_SM_ASSOC_RESP: Parsed FT RD Capability IE.");
-            } else { LOG_ERR("PT_SM_ASSOC_RESP: Failed to parse FT RD Cap IE."); }
+            if (!ft_cap_found) { // Parse only the first RD Capability IE encountered
+                if (parse_rd_capability_ie_payload(ie_payload_data, ie_len, &ft_cap_fields) == 0) {
+                    ft_cap_found = true; // Mark that we have parsed it
+                    LOG_DBG("PT_SM_ASSOC_RESP: Parsed FT RD Capability IE (Release %u, NumPHYAddSets %u).",
+                            ft_cap_fields.release_version, ft_cap_fields.num_phy_capabilities);
+
+                    // If an explicit PHY set was parsed, store its mu, beta, max_mcs
+                    if (ft_cap_fields.num_phy_capabilities >= 1) { // num_phy_capabilities is N-1
+                        // Store into the target_ft context first, will be copied to associated_ft if ACK
+                        ctx->role_ctx.pt.target_ft.peer_mu = ft_cap_fields.phy_variants[0].mu_value;
+                        ctx->role_ctx.pt.target_ft.peer_beta = ft_cap_fields.phy_variants[0].beta_value;
+                        ctx->role_ctx.pt.target_ft.peer_max_mcs_code = ft_cap_fields.phy_variants[0].max_mcs_code;
+                        ctx->role_ctx.pt.target_ft.peer_phy_params_known = true;
+                        LOG_INF("PT_SM_ASSOC_RESP: Prelim FT PHY Params: mu_code=%u, beta_code=%u, max_mcs_code=%u",
+                                ft_cap_fields.phy_variants[0].mu_value,
+                                ft_cap_fields.phy_variants[0].beta_value,
+                                ft_cap_fields.phy_variants[0].max_mcs_code);
+                    } else {
+                        LOG_WRN("PT_SM_ASSOC_RESP: FT RD Cap IE has no explicit PHY sets. Using defaults for FT link.");
+                        ctx->role_ctx.pt.target_ft.peer_mu = 0; // Default mu_code 0 (mu=1)
+                        ctx->role_ctx.pt.target_ft.peer_beta = 0; // Default beta_code 0 (beta=1)
+                        ctx->role_ctx.pt.target_ft.peer_max_mcs_code = 0; // Default MCS0
+                        ctx->role_ctx.pt.target_ft.peer_phy_params_known = false;
+                    }
+                } else {
+                    LOG_ERR("PT_SM_ASSOC_RESP: Failed to parse FT RD Capability IE payload.");
+                }
+            }
         } else if (ie_type == IE_TYPE_RES_ALLOC) {
+
             // Determine the mu of the FT that sent this Resource Allocation IE.
             // This should have been parsed from the FT's RD Capability IE (if ft_caps_found is true).
             uint8_t ft_mu_for_res_alloc_parse = 0; // Default to mu_code 0 (actual mu=1)
@@ -1612,42 +1641,27 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
         LOG_INF("PT_SM: Association ACCEPTED by FT LongID 0x%08X (ShortID 0x%04X).",
                 ctx->role_ctx.pt.target_ft.long_rd_id, ctx->role_ctx.pt.target_ft.short_rd_id);
 
-        // Promote target_ft to associated_ft
+
+        // Promote target_ft (which now contains parsed peer_mu/beta if RD Cap was present) to associated_ft
         memcpy(&ctx->role_ctx.pt.associated_ft, &ctx->role_ctx.pt.target_ft, sizeof(dect_mac_peer_info_t));
         ctx->role_ctx.pt.associated_ft.is_valid = true; // Now truly associated
+
+        // Log the PHY params that are now part of associated_ft context
+        if (ctx->role_ctx.pt.associated_ft.peer_phy_params_known) {
+            LOG_INF("PT_SM_ASSOC_RESP: Final FT PHY Params for associated_ft: mu_code=%u, beta_code=%u, max_mcs_code=%u",
+                    ctx->role_ctx.pt.associated_ft.peer_mu,
+                    ctx->role_ctx.pt.associated_ft.peer_beta,
+                    ctx->role_ctx.pt.associated_ft.peer_max_mcs_code);
+        } else {
+            LOG_WRN("PT_SM_ASSOC_RESP: associated_ft using default PHY params (mu_code=%u, beta_code=%u) as RD Cap was not fully processed or missing.",
+                    ctx->role_ctx.pt.associated_ft.peer_mu, ctx->role_ctx.pt.associated_ft.peer_beta);
+        }
+        
         // Clear target_ft as we are now associated (or moving to auth with this one)
         memset(&ctx->role_ctx.pt.target_ft, 0, sizeof(dect_mac_peer_info_t));
         ctx->role_ctx.pt.target_ft.is_valid = false;
 
-        if (ft_cap_found) { // ft_cap_found was set if parse_rd_capability_ie_payload succeeded
-            LOG_DBG("PT_SM_ASSOC_RESP: FT RD Cap IE parsed. ReleaseVer: %u, NumPHYAddSets: %u.",
-                    ft_cap_fields.release_version, ft_cap_fields.num_phy_capabilities);
-            if (ft_cap_fields.num_phy_capabilities >= 1) { // Check if at least one explicit 5-octet set was present and parsed
-                // Store FT's primary mu, beta, and max_mcs from its first reported PHY capability set
-                ctx->role_ctx.pt.associated_ft.peer_mu = ft_cap_fields.phy_variants[0].mu_value;
-                ctx->role_ctx.pt.associated_ft.peer_beta = ft_cap_fields.phy_variants[0].beta_value;
-                ctx->role_ctx.pt.associated_ft.peer_max_mcs_code = ft_cap_fields.phy_variants[0].max_mcs_code;
-                // Copy other relevant parsed capabilities from phy_variants[0] if needed
-                // e.g., ctx->role_ctx.pt.associated_ft.peer_dlc_service_support_code = ft_cap_fields.phy_variants[0].dlc_service_type_support_code;
-                ctx->role_ctx.pt.associated_ft.peer_phy_params_known = true;
-                LOG_INF("PT_SM_ASSOC_RESP: Stored FT's PHY params: mu_code=%u (val 2^%u), beta_code=%u (val %u), max_mcs_code=%u",
-                        ctx->role_ctx.pt.associated_ft.peer_mu, ctx->role_ctx.pt.associated_ft.peer_mu,
-                        ctx->role_ctx.pt.associated_ft.peer_beta, ctx->role_ctx.pt.associated_ft.peer_beta + 1,
-                        ctx->role_ctx.pt.associated_ft.peer_max_mcs_code);
-            } else {
-                LOG_WRN("PT_SM_ASSOC_RESP: FT RD Cap IE parsed but indicates no explicit 5-octet PHY sets. Using defaults for FT link mu/beta.");
-                ctx->role_ctx.pt.associated_ft.peer_mu = 0; // Code for mu=1
-                ctx->role_ctx.pt.associated_ft.peer_beta = 0; // Code for beta=1
-                ctx->role_ctx.pt.associated_ft.peer_max_mcs_code = 0; // Default to MCS0
-                ctx->role_ctx.pt.associated_ft.peer_phy_params_known = false;
-            }
-        } else {
-            LOG_WRN("PT_SM_ASSOC_RESP: FT RD Capability IE missing in accepted Association Response. Using defaults for FT link mu/beta.");
-            ctx->role_ctx.pt.associated_ft.peer_mu = 0; // Code for mu=1
-            ctx->role_ctx.pt.associated_ft.peer_beta = 0; // Code for beta=1
-            ctx->role_ctx.pt.associated_ft.peer_max_mcs_code = 0; // Default to MCS0
-            ctx->role_ctx.pt.associated_ft.peer_phy_params_known = false;
-        }
+
 
         if (res_alloc_found) {
             LOG_INF("PT_SM: Storing schedule from FT 0x%04X.", ctx->role_ctx.pt.associated_ft.short_rd_id);

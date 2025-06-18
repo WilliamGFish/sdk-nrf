@@ -1534,28 +1534,34 @@ static void ft_process_association_request_pdu(const uint8_t *mac_sdu_area_data,
     }
 
     // Association Decision Logic
-    bool accept_association = true;
+    bool accept_association = true; // Default to accept
     int peer_slot_idx = ft_find_and_init_peer_slot(pt_tx_long_rd_id, pt_tx_short_rd_id, rssi_from_pcc);
 
-    if (peer_slot_idx >= 0 && pt_cap_ie_found && pt_cap_fields.num_phy_capabilities >= 1) {
-        // Store PT's primary mu and beta from its first reported PHY capability set
-        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu = pt_cap_fields.phy_variants[0].mu_value;
-        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta = pt_cap_fields.phy_variants[0].beta_value;
-        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code = pt_cap_fields.phy_variants[0].max_mcs_code;
-        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known = true;
-        LOG_INF("FT_SM_ASSOC: Stored PT's (0x%04X) PHY params: mu_code=%u, beta_code=%u, max_mcs_code=%u",
-                pt_tx_short_rd_id,
-                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu,
-                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta,
-                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code);
-    } else if (peer_slot_idx >= 0) {
-        LOG_WRN("FT_SM_ASSOC: PT 0x%04X RD Cap IE not found or no explicit PHY sets. Using default mu/beta for this PT link.", pt_tx_short_rd_id);
-        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu = 1; // Default mu code 0 -> val 1
-        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta = 1; // Default beta code 0 -> val 1
-        ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known = false;
+    if (peer_slot_idx >= 0) { // If a slot was found/assigned for the PT
+        if (pt_cap_ie_found && pt_cap_fields.num_phy_capabilities >= 1) {
+            // Store PT's primary mu, beta, and max_mcs from its first reported PHY capability set
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu = pt_cap_fields.phy_variants[0].mu_value;
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta = pt_cap_fields.phy_variants[0].beta_value;
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code = pt_cap_fields.phy_variants[0].max_mcs_code;
+            // Copy other relevant capabilities from pt_cap_fields.phy_variants[0] if needed
+            // e.g. ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_dlc_support = pt_cap_fields.phy_variants[0].dlc_service_type_support_code;
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known = true;
+            LOG_INF("FT_SM_ASSOC: Stored PT's (S:0x%04X, L:0x%08X, Slot %d) PHY params: mu_code=%u, beta_code=%u, max_mcs_code=%u",
+                    pt_tx_short_rd_id, pt_tx_long_rd_id, peer_slot_idx,
+                    ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu,
+                    ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta,
+                    ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code);
+        } else {
+            LOG_WRN("FT_SM_ASSOC: PT 0x%04X (Slot %d) RD Cap IE not found or no explicit PHY sets. Using default mu/beta for this PT link.",
+                    pt_tx_short_rd_id, peer_slot_idx);
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu = 0; // Default mu_code 0 (actual mu=1)
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta = 0; // Default beta_code 0 (actual beta=1)
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code = 0; // Default to MCS0
+            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known = false;
+        }
+    } else { // No peer slot available
+        // accept_association will be set to false later based on this
     }
-
-
 
 
     if (peer_slot_idx < 0) {
