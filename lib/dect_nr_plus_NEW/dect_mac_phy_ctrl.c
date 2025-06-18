@@ -233,6 +233,7 @@ int dect_mac_phy_ctrl_assemble_final_pdu(
 }
 
 
+
 int dect_mac_phy_ctrl_start_tx_assembled(uint16_t carrier,
                                          const uint8_t *full_mac_pdu_to_send, uint16_t full_mac_pdu_len,
                                          uint16_t target_receiver_short_id, bool is_beacon,
@@ -241,19 +242,20 @@ int dect_mac_phy_ctrl_start_tx_assembled(uint16_t carrier,
                                          uint64_t phy_op_target_start_time)
 {
     dect_mac_context_t* ctx = get_mac_context();
+    if (!ctx) { // Should ideally not happen if init order is correct
+        LOG_ERR("PHY_CTRL_TX: MAC Context is NULL!");
+        return -EFAULT;
+    }
+
     if (ctx->pending_op_type != PENDING_OP_NONE && ctx->pending_op_handle != phy_op_handle) {
-        // Strict check: if any op is pending and it's not this exact one being re-issued/updated, reject.
         if (ctx->pending_op_type != op_type || ctx->pending_op_handle != phy_op_handle) {
             LOG_WRN("PHY_CTRL_TX: Op %s (H:%u) busy with %s (H:%u). New TX for %s (H:%u) rejected.",
                     dect_pending_op_to_str(ctx->pending_op_type), ctx->pending_op_handle,
-                    dect_pending_op_to_str(ctx->pending_op_type), ctx->pending_op_handle, // Log current pending
-                    dect_pending_op_to_str(op_type), phy_op_handle); // Log requested
+                    dect_pending_op_to_str(ctx->pending_op_type), ctx->pending_op_handle,
+                    dect_pending_op_to_str(op_type), phy_op_handle);
             return -EBUSY;
         }
     }
-    // If op_type and handle match, it might be an update to an existing pending op, allow.
-    // Or, if no op pending, this is a new op.
-
     ctx->pending_op_handle = phy_op_handle;
     ctx->pending_op_type = op_type;
 
@@ -263,99 +265,92 @@ int dect_mac_phy_ctrl_start_tx_assembled(uint16_t carrier,
         LOG_ERR("PHY_CTRL_TX: Invalid PDU or length: %p, len %u (min_hdr_type %zu, max_pdu %d)",
                 full_mac_pdu_to_send, full_mac_pdu_len,
                 sizeof(dect_mac_header_type_octet_t), CONFIG_DECT_MAC_PDU_MAX_SIZE);
-        if (ctx->pending_op_handle == phy_op_handle && ctx->pending_op_type == op_type) {
-            ctx->pending_op_type = PENDING_OP_NONE;
-            ctx->pending_op_handle = 0;
-        }
+        if (ctx->pending_op_handle == phy_op_handle) {ctx->pending_op_type = PENDING_OP_NONE; ctx->pending_op_handle = 0;}
         return -EINVAL;
     }
 
-    // The PDC content for the PHY is the MAC PDU excluding the first MAC Header Type octet.
-    // The MAC Header Type octet's info (security, type) is used to construct the PCC.
     const uint8_t *pdc_content_for_phy = full_mac_pdu_to_send + sizeof(dect_mac_header_type_octet_t);
     uint16_t pdc_content_len_for_phy = full_mac_pdu_len - sizeof(dect_mac_header_type_octet_t);
 
-    // Copy PDC content to global buffer for PHY API
     if (pdc_content_len_for_phy > sizeof(g_phy_pdc_tx_constructor_buf_ctrl)) {
         LOG_ERR("PHY_CTRL_TX: Effective PDC content for PHY TX too large (%u > %zu)",
                 pdc_content_len_for_phy, sizeof(g_phy_pdc_tx_constructor_buf_ctrl));
-        if (ctx->pending_op_handle == phy_op_handle && ctx->pending_op_type == op_type) {
-            ctx->pending_op_type = PENDING_OP_NONE;
-            ctx->pending_op_handle = 0;
-        }
-        return -ENOMEM; // Or -EMSGSIZE
+        if (ctx->pending_op_handle == phy_op_handle) {ctx->pending_op_type = PENDING_OP_NONE; ctx->pending_op_handle = 0;}
+        return -ENOMEM;
     }
     if (pdc_content_len_for_phy > 0) {
         memcpy(g_phy_pdc_tx_constructor_buf_ctrl, pdc_content_for_phy, pdc_content_len_for_phy);
     }
 
-
     memset(&g_phy_pcc_tx_constructor_buf, 0, sizeof(g_phy_pcc_tx_constructor_buf));
-    uint8_t pcc_nrf_phy_type_val; // nRF PHY Type 0 for Beacon (ETSI Type 1 PCC), 1 for Data (ETSI Type 2 PCC)
-    uint8_t calculated_pcc_packet_len_field; // N-1 coded value for PCC packet_length field
-    uint8_t mcs_to_use_for_pcc_calc;         // The MCS code to be used for this TX
-    uint8_t calculated_pcc_pkt_len_type_field; // 0 for subslots, 1 for slots
+    uint8_t pcc_nrf_phy_type_val;
+    uint8_t calculated_pcc_packet_len_field;
+    uint8_t mcs_to_use_for_pcc_calc;
+    uint8_t calculated_pcc_pkt_len_type_field;
 
-    // Determine MCS to use for this transmission
     mcs_to_use_for_pcc_calc = ctx->config.default_data_mcs_code;
     if (is_beacon) {
-        mcs_to_use_for_pcc_calc = 0; // Beacons typically use a robust MCS like MCS0
+        mcs_to_use_for_pcc_calc = 0;
     }
     if (op_type == PENDING_OP_PT_RACH_ASSOC_REQ) {
-        mcs_to_use_for_pcc_calc = 0; // Use robust MCS for RACH Association Request
+        mcs_to_use_for_pcc_calc = 0;
     }
-    // TODO: More advanced MCS selection based on link quality, QoS, etc.
 
-    // TODO: Determine mu and beta for the current link/operation from context.
     // Use the device's own configured/operational mu and beta for its transmissions
-    uint8_t own_mu_code = ctx->own_phy_params.is_valid ? ctx->own_phy_params.mu : 0; // Default to mu-code 0 (mu=1)
-    uint8_t own_beta_code = ctx->own_phy_params.is_valid ? ctx->own_phy_params.beta : 0; // Default to beta-code 0 (beta=1)
-    if (own_mu_code == 0 && !ctx->own_phy_params.is_valid) {
-        LOG_WRN("PHY_CTRL_TX: Own PHY mu not valid, using default mu_code=0 (mu=1).");
+    uint8_t own_mu_code = 0; // Default to mu-code 0 (actual mu=1)
+    uint8_t own_beta_code = 0; // Default to beta-code 0 (actual beta=1)
+
+    if (ctx->own_phy_params.is_valid) {
+        own_mu_code = ctx->own_phy_params.mu;
+        own_beta_code = ctx->own_phy_params.beta;
+    } else {
+        LOG_WRN("PHY_CTRL_TX: Own PHY params not marked valid in context. Using default mu_code=0, beta_code=0.");
+        // Kconfig defaults would have been loaded into own_phy_params, but is_valid might be false if init failed.
+        // Or, if own_phy_params is not fully initialized yet, use Kconfig defaults directly as ultimate fallback.
+        own_mu_code = CONFIG_DECT_MAC_OWN_MU_CODE;
+        own_beta_code = CONFIG_DECT_MAC_OWN_BETA_CODE;
     }
-    if (own_beta_code == 0 && !ctx->own_phy_params.is_valid && ctx->own_phy_params.beta != 0) { // Check if beta was explicitly 0 or just default
-         LOG_WRN("PHY_CTRL_TX: Own PHY beta not valid, using default beta_code=0 (beta=1).");
-    }
+    // Sanitize codes just in case Kconfig allows out of typical range for DECT NR+
+    if (own_mu_code > 7) { LOG_WRN("PHY_CTRL_TX: own_mu_code %u invalid, using 0.", own_mu_code); own_mu_code = 0; }
+    if (own_beta_code > 15) { LOG_WRN("PHY_CTRL_TX: own_beta_code %u invalid, using 0.", own_beta_code); own_beta_code = 0; }
+
 
     dect_mac_phy_ctrl_calculate_pcc_params(pdc_content_len_for_phy,
-                                           own_mu_code, own_beta_code
+                                           own_mu_code, own_beta_code,
                                            &calculated_pcc_packet_len_field,
-                                           &mcs_to_use_for_pcc_calc, // Input is desired, output is actual used for calc
+                                           &mcs_to_use_for_pcc_calc,
                                            &calculated_pcc_pkt_len_type_field);
 
-    // Populate PCC Header (g_phy_pcc_tx_constructor_buf)
     if (is_beacon) {
-        pcc_nrf_phy_type_val = 0; // nRF PHY Type 0 (ETSI PCC Type 1 for beacons)
+        pcc_nrf_phy_type_val = 0; 
         struct nrf_modem_dect_phy_hdr_type_1 *pcc1 = &g_phy_pcc_tx_constructor_buf.hdr_type_1;
-        pcc1->header_format = 0b000; // Per ETSI Figure 6.2.1-1, for Type 1, these are just 000.
-        pcc1->packet_length_type = calculated_pcc_pkt_len_type_field; // Should be 0 (subslots)
-        pcc1->packet_length = calculated_pcc_packet_len_field;       // N-1 coded
+        pcc1->header_format = 0b000; 
+        pcc1->packet_length_type = calculated_pcc_pkt_len_type_field; 
+        pcc1->packet_length = calculated_pcc_packet_len_field;       
         pcc1->short_network_id = (uint8_t)(ctx->network_id_32bit & 0xFF);
         uint16_t be_tx_short_id = sys_cpu_to_be16(ctx->own_short_rd_id);
         pcc1->transmitter_id_hi = (uint8_t)(be_tx_short_id >> 8);
         pcc1->transmitter_id_lo = (uint8_t)(be_tx_short_id & 0xFF);
         pcc1->transmit_power = ctx->config.default_tx_power_code;
-        pcc1->df_mcs = mcs_to_use_for_pcc_calc & 0x07; // 3 bits for Type 1 PCC's DF MCS
+        pcc1->df_mcs = mcs_to_use_for_pcc_calc & 0x07; 
         pcc1->reserved = 0;
-    } else { // Data or other control PDU (e.g. Unicast AssocResp)
-        pcc_nrf_phy_type_val = 1; // nRF PHY Type 1 (ETSI PCC Type 2 for unicast data/control)
+    } else { 
+        pcc_nrf_phy_type_val = 1; 
         struct nrf_modem_dect_phy_hdr_type_2 *pcc2 = &g_phy_pcc_tx_constructor_buf.hdr_type_2;
-        // Default to HARQ fields present (000) unless specific logic determines no HARQ feedback is needed for this DF.
-        // TODO: This could be a parameter or determined by op_type/flow_id if some flows don't use HARQ feedback.
-        pcc2->header_format = 0b000; // Assumes HARQ feedback is expected/managed for this DF
-        pcc2->packet_length_type = calculated_pcc_pkt_len_type_field; // Should be 0 (subslots)
-        pcc2->packet_length = calculated_pcc_packet_len_field;       // N-1 coded
+        pcc2->header_format = 0b000; 
+        pcc2->packet_length_type = calculated_pcc_pkt_len_type_field; 
+        pcc2->packet_length = calculated_pcc_packet_len_field;       
         pcc2->short_network_id = (uint8_t)(ctx->network_id_32bit & 0xFF);
         uint16_t be_tx_short_id = sys_cpu_to_be16(ctx->own_short_rd_id);
         pcc2->transmitter_id_hi = (uint8_t)(be_tx_short_id >> 8);
         pcc2->transmitter_id_lo = (uint8_t)(be_tx_short_id & 0xFF);
         pcc2->transmit_power = ctx->config.default_tx_power_code;
-        pcc2->df_mcs = mcs_to_use_for_pcc_calc & 0x0F; // 4 bits for Type 2 PCC's DF MCS
+        pcc2->df_mcs = mcs_to_use_for_pcc_calc & 0x0F; 
 
         uint16_t be_rx_short_id = sys_cpu_to_be16(target_receiver_short_id);
         pcc2->receiver_id_hi = (uint8_t)(be_rx_short_id >> 8);
         pcc2->receiver_id_lo = (uint8_t)(be_rx_short_id & 0xFF);
-        pcc2->num_spatial_streams = 0; // Default: Single spatial stream (00 for 1 stream)
+        pcc2->num_spatial_streams = 0; 
 
         bool is_harq_data_op = (op_type >= PENDING_OP_PT_DATA_TX_HARQ0 && op_type <= PENDING_OP_FT_DATA_TX_HARQ_MAX);
         if (is_harq_data_op) {
@@ -363,34 +358,21 @@ int dect_mac_phy_ctrl_start_tx_assembled(uint16_t carrier,
             int harq_idx = op_type - harq_idx_base;
 
             if (harq_idx >= 0 && harq_idx < MAX_HARQ_PROCESSES && ctx->harq_tx_processes[harq_idx].is_active) {
-                 pcc2->df_harq_process_num = harq_idx & 0x07; // 3 bits
-                 pcc2->df_new_data_indication = (ctx->harq_tx_processes[harq_idx].tx_attempts == 1) ? 1 : 0; // 1 for new data (first attempt)
-                 pcc2->df_redundancy_version = ctx->harq_tx_processes[harq_idx].redundancy_version & 0x03; // 2 bits
+                 pcc2->df_harq_process_num = harq_idx & 0x07; 
+                 pcc2->df_new_data_indication = (ctx->harq_tx_processes[harq_idx].tx_attempts == 1) ? 1 : 0; 
+                 pcc2->df_redundancy_version = ctx->harq_tx_processes[harq_idx].redundancy_version & 0x03; 
             } else {
                 LOG_WRN("PHY_CTRL_TX: HARQ op_type %s but no active/valid HARQ proc %d. Using default HARQ fields in PCC.",
                         dect_pending_op_to_str(op_type), harq_idx);
                 pcc2->df_new_data_indication = 1; pcc2->df_redundancy_version = 0; pcc2->df_harq_process_num = 0;
             }
-        } else { // For other control messages (e.g., AssocReq, AssocResp, KeepAlive) that are not data HARQ processes
-            pcc2->df_new_data_indication = 1; // Typically new data for control messages
-            pcc2->df_redundancy_version = 0;  // RV0
-            pcc2->df_harq_process_num = 0;    // Use a default process number or a dedicated one for control (if any)
-                                              // ETSI implies control messages might not use HARQ in the same way.
+        } else { 
+            pcc2->df_new_data_indication = 1; 
+            pcc2->df_redundancy_version = 0;  
+            pcc2->df_harq_process_num = 0;    
         }
-
-        // Populate pcc2->feedback if this TX PDU is also carrying HARQ feedback to the peer.
-        // This is determined by the caller (e.g., dect_mac_data_path_service_tx) by checking
-        // the peer_info->pending_feedback_to_send array for the target_receiver_short_id.
-        // For now, assume g_phy_pcc_tx_constructor_buf.hdr_type_2.feedback is pre-populated by caller if needed.
-        // If no feedback to send, it should be set to NRF_MODEM_DECT_PHY_FEEDBACK_FORMAT_NONE (all zeros for format field).
-        // Clearing here if not set by caller (safer default):
-        // if (no_feedback_to_send_flag_from_caller) { // This flag needs to be passed or checked
-        //    memset(&pcc2->feedback, 0, sizeof(pcc2->feedback));
-        //    pcc2->feedback.format1.format = NRF_MODEM_DECT_PHY_FEEDBACK_FORMAT_NONE;
-        // }
-        // Current data_path logic doesn't explicitly pre-populate g_phy_pcc_tx_constructor_buf.hdr_type_2.feedback.
-        // It should. For now, ensuring it's zeroed if not explicitly filled:
-        // NOTE: This memset is already done at the top of the function for the whole g_phy_pcc_tx_constructor_buf
+        // Note: pcc2->feedback is populated by the caller (e.g., data_path) if feedback is to be sent.
+        // If not pre-populated, it remains zeroed from memset.
     }
 
     struct nrf_modem_dect_phy_tx_params tx_params = {
@@ -407,10 +389,10 @@ int dect_mac_phy_ctrl_start_tx_assembled(uint16_t carrier,
         .data_size = pdc_content_len_for_phy
     };
 
-    LOG_DBG("PHY_CTRL_TX: Starting TX. Hdl:%u, C:%u, FullMACLen:%u (PDC:%u), OpT:%s, LBT:%d, PCC nRFType:%u, TargetStart:%llu",
+    LOG_DBG("PHY_CTRL_TX: Starting TX. Hdl:%u, C:%u, FullMACLen:%u (PDC:%u), OpT:%s, LBT:%d, PCC nRFType:%u, TargetStart:%llu, OwnMuCode:%u, OwnBetaCode:%u",
             phy_op_handle, carrier, full_mac_pdu_len, pdc_content_len_for_phy,
             dect_pending_op_to_str(op_type), use_lbt, pcc_nrf_phy_type_val,
-            phy_op_target_start_time);
+            phy_op_target_start_time, own_mu_code, own_beta_code);
 
     int ret = nrf_modem_dect_phy_tx(&tx_params);
     if (ret != 0) {
