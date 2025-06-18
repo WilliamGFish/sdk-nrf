@@ -841,12 +841,23 @@ static int serialize_rd_capability_ie_payload(uint8_t *buf, size_t buf_max_len,
         LOG_ERR("RD_CAP_SER: NULL input pointers.");
         return -EINVAL;
     }
-    size_t min_len_needed = 2; // Mandatory summary octets
-    if (cap_fields->num_phy_capabilities >= 1) {
-        min_len_needed += 5; // Add 5 bytes for the first PHY set
+
+    // num_phy_capabilities is N-1. Max value of field is 7 (for N=8 sets).
+    // We support serializing up to MAX_PHY_CAPABILITY_SETS_IN_IE explicit sets.
+    uint8_t num_explicit_sets_to_serialize = cap_fields->num_phy_capabilities;
+    if (num_explicit_sets_to_serialize > MAX_PHY_CAPABILITY_SETS_IN_IE) {
+        LOG_WRN("RD_CAP_SER: Requested to serialize %u explicit PHY sets, but struct only supports %d. Clamping.",
+                num_explicit_sets_to_serialize, MAX_PHY_CAPABILITY_SETS_IN_IE);
+        num_explicit_sets_to_serialize = MAX_PHY_CAPABILITY_SETS_IN_IE;
     }
+    // The value written to the IE field must be N-1, and max 7.
+    uint8_t num_phy_cap_field_val = (num_explicit_sets_to_serialize > 7) ? 7 : num_explicit_sets_to_serialize;
+
+
+    size_t min_len_needed = 2 + (num_explicit_sets_to_serialize * 5);
     if (buf_max_len < min_len_needed) {
-        LOG_ERR("RD_CAP_SER: Buffer too small (%zu bytes) for RD Cap IE (needs min %zu).", buf_max_len, min_len_needed);
+        LOG_ERR("RD_CAP_SER: Buffer too small (%zu bytes) for RD Cap IE (needs %zu for %u sets).",
+                buf_max_len, min_len_needed, num_explicit_sets_to_serialize);
         return -ENOMEM;
     }
 
@@ -854,10 +865,10 @@ static int serialize_rd_capability_ie_payload(uint8_t *buf, size_t buf_max_len,
     int bit_offset = 0;
     int ret;
 
-    // Octet 0: Number of PHY Capabilities (3 MSB), Release (5 LSB)
-    if (cap_fields->num_phy_capabilities > 0x07) LOG_WRN("RD_CAP_SER: num_phy_cap %u > 3bit. Clamping.", cap_fields->num_phy_capabilities);
+    // Octet 0: Number of PHY Capabilities (N-1 value), Release
+    if (num_phy_cap_field_val > 0x07) LOG_WRN("RD_CAP_SER: num_phy_cap_field_val %u > 3bit. Clamping.", num_phy_cap_field_val); // Should be caught by earlier clamp
     if (cap_fields->release_version > 0x1F) LOG_WRN("RD_CAP_SER: release_ver %u > 5bit. Clamping.", cap_fields->release_version);
-    uint8_t octet0 = ((cap_fields->num_phy_capabilities & 0x07) << 5) |
+    uint8_t octet0 = ((num_phy_cap_field_val & 0x07) << 5) |
                      (cap_fields->release_version & 0x1F);
     ret = write_bits(buf, buf_max_len, bit_offset, octet0, 8);
     if (ret < 0) { LOG_ERR("RD_CAP_SER: Write octet0 failed: %d", ret); return ret; }
@@ -877,42 +888,39 @@ static int serialize_rd_capability_ie_payload(uint8_t *buf, size_t buf_max_len,
     if (ret < 0) { LOG_ERR("RD_CAP_SER: Write octet1 failed: %d", ret); return ret; }
     bit_offset = ret;
 
-    // Conditional: First PHY Capability Set (Octets 2 to 6)
-    if (cap_fields->num_phy_capabilities >= 1) {
-        const dect_mac_phy_capability_set_t *phy_set0 = &cap_fields->phy_variants[0];
+    // Conditional: PHY Capability Sets
+    for (uint8_t i = 0; i < num_explicit_sets_to_serialize; i++) {
+        const dect_mac_phy_capability_set_t *phy_set = &cap_fields->phy_variants[i];
         uint8_t phy_octet;
 
-        // Set Octet 0: DLC Svc (3b), RX Div (3b), Rsvd (2b)
-        phy_octet = ((phy_set0->dlc_service_type_support_code & 0x07) << 5) |
-                    ((phy_set0->rx_for_tx_diversity_code & 0x07) << 2); // Rsvd are 0
+        // Set Octet 0 of 5-octet set
+        phy_octet = ((phy_set->dlc_service_type_support_code & 0x07) << 5) |
+                    ((phy_set->rx_for_tx_diversity_code & 0x07) << 2);
         ret = write_bits(buf, buf_max_len, bit_offset, phy_octet, 8); if (ret < 0) return ret; bit_offset = ret;
 
-        // Set Octet 1: mu (3b), beta (4b), Rsvd (1b)
-        phy_octet = ((phy_set0->mu_value & 0x07) << 5) |
-                    ((phy_set0->beta_value & 0x0F) << 1); // Rsvd is 0
+        // Set Octet 1
+        phy_octet = ((phy_set->mu_value & 0x07) << 5) |
+                    ((phy_set->beta_value & 0x0F) << 1);
         ret = write_bits(buf, buf_max_len, bit_offset, phy_octet, 8); if (ret < 0) return ret; bit_offset = ret;
 
-        // Set Octet 2: Max NSS (3b), Max MCS (4b), Rsvd (1b)
-        phy_octet = ((phy_set0->max_nss_for_rx_code & 0x07) << 5) |
-                    ((phy_set0->max_mcs_code & 0x0F) << 1); // Rsvd is 0
+        // Set Octet 2
+        phy_octet = ((phy_set->max_nss_for_rx_code & 0x07) << 5) |
+                    ((phy_set->max_mcs_code & 0x0F) << 1);
         ret = write_bits(buf, buf_max_len, bit_offset, phy_octet, 8); if (ret < 0) return ret; bit_offset = ret;
 
-        // Set Octet 3: HARQ Buf (4b), Num HARQ Proc (2b), Rsvd (2b)
-        phy_octet = ((phy_set0->harq_soft_buffer_size_code & 0x0F) << 4) |
-                    ((phy_set0->num_harq_processes_code & 0x03) << 2); // Rsvd are 0
+        // Set Octet 3
+        phy_octet = ((phy_set->harq_soft_buffer_size_code & 0x0F) << 4) |
+                    ((phy_set->num_harq_processes_code & 0x03) << 2);
         ret = write_bits(buf, buf_max_len, bit_offset, phy_octet, 8); if (ret < 0) return ret; bit_offset = ret;
 
-        // Set Octet 4: HARQ Delay (4b), D_Delay (1b), HalfDup (1b), Rsvd (2b)
-        phy_octet = ((phy_set0->harq_feedback_delay_code & 0x0F) << 4) |
-                    ((phy_set0->supports_dect_delay ? 1 : 0) << 3) |
-                    ((phy_set0->supports_half_duplex ? 1 : 0) << 2); // Rsvd are 0
+        // Set Octet 4
+        phy_octet = ((phy_set->harq_feedback_delay_code & 0x0F) << 4) |
+                    ((phy_set->supports_dect_delay ? 1 : 0) << 3) |
+                    ((phy_set->supports_half_duplex ? 1 : 0) << 2);
         ret = write_bits(buf, buf_max_len, bit_offset, phy_octet, 8); if (ret < 0) return ret; bit_offset = ret;
     }
-    // TODO: Loop here if cap_fields->num_phy_capabilities > 1 and phy_variants was an array
-
     return (bit_offset + 7) / 8;
 }
-
 
 
 
@@ -936,7 +944,7 @@ int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payloa
         LOG_ERR("RD_CAP_PARSE: NULL input pointers.");
         return -EINVAL;
     }
-    if (ie_payload_len < 2) { // Min 2 octets for summary
+    if (ie_payload_len < 2) {
         LOG_ERR("RD_CAP_PARSE: Payload too short (%u bytes) for mandatory part (2 bytes).", ie_payload_len);
         return -EMSGSIZE;
     }
@@ -946,13 +954,13 @@ int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payloa
     int remaining_bits_from_len = ie_payload_len * 8;
     int *remaining_bits = &remaining_bits_from_len;
 
-    // Octet 0: Number of PHY Capabilities (3 MSB), Release (5 LSB)
+    // Octet 0
     if (*remaining_bits < 8) return -EMSGSIZE;
     uint8_t octet0 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
-    out_cap_fields->num_phy_capabilities = (octet0 >> 5) & 0x07; // This is N-1 value
+    out_cap_fields->num_phy_capabilities = (octet0 >> 5) & 0x07; // N-1 value
     out_cap_fields->release_version      = octet0 & 0x1F;
 
-    // Octet 1: Flags
+    // Octet 1
     if (*remaining_bits < 8) { LOG_ERR("RD_CAP_PARSE: Payload too short for Octet 1 flags."); return -EMSGSIZE; }
     uint8_t octet1 = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
     out_cap_fields->supports_group_assignment = (octet1 >> 7) & 0x01;
@@ -962,59 +970,57 @@ int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payloa
     out_cap_fields->supports_sched_data       = (octet1 >> 2) & 0x01;
     out_cap_fields->mac_security_modes_code   = octet1 & 0x03;
 
-    LOG_DBG("RD_CAP_PARSE: Summary: NumPHYAddSets:%u, RelVer:%u, GrpAs:%d Paging:%d OpM:0x%X Mesh:%d Sched:%d MACSec:0x%X",
+    LOG_DBG("RD_CAP_PARSE: Summary: NumPHYAddSets(N-1):%u, RelVer:%u, GrpAs:%d Paging:%d OpM:0x%X Mesh:%d Sched:%d MACSec:0x%X",
             out_cap_fields->num_phy_capabilities, out_cap_fields->release_version,
             out_cap_fields->supports_group_assignment, out_cap_fields->supports_paging,
             out_cap_fields->operating_modes_code, out_cap_fields->supports_mesh,
             out_cap_fields->supports_sched_data, out_cap_fields->mac_security_modes_code);
 
-    // Conditional: Parse first explicit PHY Capability Set if present
-    // num_phy_capabilities field stores (N-1). If it's 0, N=1 (base set only, no 5-octet part).
-    // If it's 1, N=2 (base + 1 explicit 5-octet set).
-    if (out_cap_fields->num_phy_capabilities >= 1) { // At least one explicit 5-octet set follows
+    // Conditional: Parse PHY Capability Sets
+    uint8_t num_explicit_sets_in_ie = out_cap_fields->num_phy_capabilities; // This is N-1
+    out_cap_fields->actual_num_phy_variants_parsed = 0;
+
+    for (uint8_t i = 0; i < num_explicit_sets_in_ie && i < MAX_PHY_CAPABILITY_SETS_IN_IE; i++) {
         if (*remaining_bits < (5 * 8)) {
-            LOG_ERR("RD_CAP_PARSE: num_phy_cap >= 1, but not enough bits (%d) for one 5-octet set.", *remaining_bits);
-            // Continue with summary, but phy_variants[0] will be zeroed.
-            out_cap_fields->num_phy_capabilities = 0; // Indicate no valid explicit sets were parsed
-            return 0; // Or -EMSGSIZE if strict
+            LOG_ERR("RD_CAP_PARSE: Not enough bits (%d) for explicit PHY set %u (needs 40).", *remaining_bits, i);
+            // Do not increment actual_num_phy_variants_parsed further if data runs out
+            break; 
         }
         
-        dect_mac_phy_capability_set_t *phy_set0 = &out_cap_fields->phy_variants[0];
+        dect_mac_phy_capability_set_t *phy_set = &out_cap_fields->phy_variants[i];
         uint8_t phy_octet;
 
-        // Set Octet 0 of 5-octet set: DLC Svc (3b), RX Div (3b), Rsvd (2b)
         phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
-        phy_set0->dlc_service_type_support_code = (phy_octet >> 5) & 0x07;
-        phy_set0->rx_for_tx_diversity_code = (phy_octet >> 2) & 0x07;
+        phy_set->dlc_service_type_support_code = (phy_octet >> 5) & 0x07;
+        phy_set->rx_for_tx_diversity_code = (phy_octet >> 2) & 0x07;
 
-        // Set Octet 1 of 5-octet set: mu (3b), beta (4b), Rsvd (1b)
         phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
-        phy_set0->mu_value = (phy_octet >> 5) & 0x07;   // This is the mu_code (0-7)
-        phy_set0->beta_value = (phy_octet >> 1) & 0x0F; // This is the beta_code (0-15)
+        phy_set->mu_value = (phy_octet >> 5) & 0x07;
+        phy_set->beta_value = (phy_octet >> 1) & 0x0F;
 
-        // Set Octet 2 of 5-octet set: Max NSS (3b), Max MCS (4b), Rsvd (1b)
         phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
-        phy_set0->max_nss_for_rx_code = (phy_octet >> 5) & 0x07;
-        phy_set0->max_mcs_code = (phy_octet >> 1) & 0x0F;
+        phy_set->max_nss_for_rx_code = (phy_octet >> 5) & 0x07;
+        phy_set->max_mcs_code = (phy_octet >> 1) & 0x0F;
 
-        // Set Octet 3 of 5-octet set: HARQ Buf (4b), Num HARQ Proc (2b), Rsvd (2b)
         phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
-        phy_set0->harq_soft_buffer_size_code = (phy_octet >> 4) & 0x0F;
-        phy_set0->num_harq_processes_code = (phy_octet >> 2) & 0x03;
+        phy_set->harq_soft_buffer_size_code = (phy_octet >> 4) & 0x0F;
+        phy_set->num_harq_processes_code = (phy_octet >> 2) & 0x03;
 
-        // Set Octet 4 of 5-octet set: HARQ Delay (4b), D_Delay (1b), HalfDup (1b), Rsvd (2b)
         phy_octet = read_bits_adv(ie_payload, &bit_offset, remaining_bits, 8);
-        phy_set0->harq_feedback_delay_code = (phy_octet >> 4) & 0x0F;
-        phy_set0->supports_dect_delay = (phy_octet >> 3) & 0x01;
-        phy_set0->supports_half_duplex = (phy_octet >> 2) & 0x01;
-
-        LOG_DBG("RD_CAP_PARSE: Parsed PHY Set 0: mu_code=%u, beta_code=%u, max_mcs_code=%u, dlc_svc_code=%u",
-                phy_set0->mu_value, phy_set0->beta_value, phy_set0->max_mcs_code, phy_set0->dlc_service_type_support_code);
-        // TODO: Loop here to parse more sets if out_cap_fields->num_phy_capabilities > 1
-        //       and if phy_variants was an array capable of holding more.
-    } else {
-        LOG_DBG("RD_CAP_PARSE: No explicit 5-octet PHY capability sets indicated (num_phy_capabilities field is 0).");
+        phy_set->harq_feedback_delay_code = (phy_octet >> 4) & 0x0F;
+        phy_set->supports_dect_delay = (phy_octet >> 3) & 0x01;
+        phy_set->supports_half_duplex = (phy_octet >> 2) & 0x01;
+        
+        out_cap_fields->actual_num_phy_variants_parsed++;
+        LOG_DBG("RD_CAP_PARSE: Parsed PHY Set %u: mu_code=%u, beta_code=%u, max_mcs_code=%u",
+                i, phy_set->mu_value, phy_set->beta_value, phy_set->max_mcs_code);
     }
+    
+    if (out_cap_fields->actual_num_phy_variants_parsed < num_explicit_sets_in_ie) {
+        LOG_WRN("RD_CAP_PARSE: Expected %u explicit PHY sets from IE, but only parsed %u (possibly due to insufficient data).",
+                num_explicit_sets_in_ie, out_cap_fields->actual_num_phy_variants_parsed);
+    }
+
 
     if (*remaining_bits >= 8) {
         LOG_WRN("RD_CAP_PARSE: %d unparsed bits (>=1 byte) remain. Payload len %u.", *remaining_bits, ie_payload_len);
@@ -1024,7 +1030,6 @@ int parse_rd_capability_ie_payload(const uint8_t *ie_payload, uint16_t ie_payloa
 
     return 0;
 }
-
 
 
 

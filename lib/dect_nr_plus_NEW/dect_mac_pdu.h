@@ -144,6 +144,11 @@ typedef struct { // ETSI TS 103 636-4, Table 6.4.3.3-1 Resource Allocation IE fi
 } dect_mac_resource_alloc_ie_fields_t;
 
 
+#define MAX_PHY_CAPABILITY_VARIANTS_IN_IE 4 // Example: Allow up to 4 explicit 5-octet sets
+                                            // num_phy_capabilities field (N-1) can be 0-7.
+                                            // If N-1=7, then N=8 sets. Base + 7 explicit.
+                                            // So array should be at least 7 if supporting max.
+                                            // Let's use a smaller practical max for now.
 
 typedef struct { // ETSI TS 103 636-4, Table 6.4.3.5-1 RD Capability IE fields
     // --- Octet 0 ---
@@ -159,11 +164,13 @@ typedef struct { // ETSI TS 103 636-4, Table 6.4.3.5-1 RD Capability IE fields
     bool supports_sched_data;       // Bit 2
     uint8_t mac_security_modes_code;// Bits 1-0 (00=None, 01=Mode1)
 
-    // --- Conditional: PHY Capability Sets (Octets 2 to (1 + N*5)) ---
-    // For this task, we will implement storage and (de)serialization for ONE explicit set if num_phy_capabilities >= 1.
-    // A full implementation would use num_phy_capabilities to size/manage an array.
-    dect_mac_phy_capability_set_t phy_variants[1]; // Store the first explicit set if present.
-                                                  // Caller checks num_phy_capabilities to know if phy_variants[0] is valid.
+    // Conditional: PHY Capability Sets (Octets 2 to (1 + (num_phy_capabilities_field_value) * 5))
+    // num_phy_capabilities field stores (Actual_Num_Explicit_Sets - 1) if we follow N-1 for explicit sets.
+    // Or, if num_phy_capabilities field stores X, there are X explicit sets.
+    // ETSI: "Num PHY Capabilities (N-1)". If field is X, there are X explicit 5-octet sets.
+    // So, if field is 0, 0 explicit sets. If 1, 1 explicit set. Max field value 7 -> 7 explicit sets.
+    dect_mac_phy_capability_set_t phy_variants[MAX_PHY_CAPABILITY_VARIANTS_IN_IE];
+    uint8_t actual_num_phy_variants_parsed; // Helper: How many were actually parsed/populated
 } dect_mac_rd_capability_ie_t;
 
 
@@ -241,9 +248,6 @@ typedef struct {
     bool supports_half_duplex;              // Bit 2: If half-duplex operation (diff chan for RACH resp/DL sched) is supported
     // 2 LSB Reserved
 } dect_mac_phy_capability_set_t;
-
-
-
 
 
 #define MAX_FLOW_IDS_IN_ASSOC_REQ 6 // Max value for "Number of Flows" field coding for a list
