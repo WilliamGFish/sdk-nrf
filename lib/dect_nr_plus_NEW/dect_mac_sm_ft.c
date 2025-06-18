@@ -1638,31 +1638,49 @@ static void ft_process_association_request_pdu(const uint8_t *mac_sdu_area_data,
     bool accept_association = true; // Default to accept
     int peer_slot_idx = ft_find_and_init_peer_slot(pt_tx_long_rd_id, pt_tx_short_rd_id, rssi_from_pcc);
 
-    if (peer_slot_idx >= 0) { // If a slot was found/assigned for the PT
-        if (pt_cap_ie_found && pt_cap_fields.num_phy_capabilities >= 1) {
-            // Store PT's primary mu, beta, and max_mcs from its first reported PHY capability set
-            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu = pt_cap_fields.phy_variants[0].mu_value;
-            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta = pt_cap_fields.phy_variants[0].beta_value;
-            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code = pt_cap_fields.phy_variants[0].max_mcs_code;
-            // Copy other relevant capabilities from pt_cap_fields.phy_variants[0] if needed
-            // e.g. ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_dlc_support = pt_cap_fields.phy_variants[0].dlc_service_type_support_code;
-            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known = true;
-            LOG_INF("FT_SM_ASSOC: Stored PT's (S:0x%04X, L:0x%08X, Slot %d) PHY params: mu_code=%u, beta_code=%u, max_mcs_code=%u",
-                    pt_tx_short_rd_id, pt_tx_long_rd_id, peer_slot_idx,
-                    ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu,
-                    ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta,
-                    ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code);
-        } else {
-            LOG_WRN("FT_SM_ASSOC: PT 0x%04X (Slot %d) RD Cap IE not found or no explicit PHY sets. Using default mu/beta for this PT link.",
-                    pt_tx_short_rd_id, peer_slot_idx);
-            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu = 0; // Default mu_code 0 (actual mu=1)
-            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta = 0; // Default beta_code 0 (actual beta=1)
-            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code = 0; // Default to MCS0
-            ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known = false;
+        // Store parsed PT capabilities (already done in previous step, just confirming its place)
+        if (peer_slot_idx >= 0) { // peer_slot_idx is determined after parsing all IEs
+            if (pt_cap_ie_found && pt_cap_fields.num_phy_capabilities >= 1) {
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu = pt_cap_fields.phy_variants[0].mu_value;
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta = pt_cap_fields.phy_variants[0].beta_value;
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_max_mcs_code = pt_cap_fields.phy_variants[0].max_mcs_code;
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known = true;
+                LOG_INF("FT_SM_ASSOC: Stored PT's (S:0x%04X) PHY params: mu_code=%u, beta_code=%u, max_mcs_code=%u",
+                        pt_tx_short_rd_id, pt_cap_fields.phy_variants[0].mu_value,
+                        pt_cap_fields.phy_variants[0].beta_value, pt_cap_fields.phy_variants[0].max_mcs_code);
+            } else {
+                LOG_WRN("FT_SM_ASSOC: PT 0x%04X RD Cap IE not fully parsed or no explicit sets. Using defaults.", pt_tx_short_rd_id);
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_mu = 0; // Default mu_code 0 (mu=1)
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_beta = 0; // Default beta_code 0 (beta=1)
+                ctx->role_ctx.ft.connected_pts[peer_slot_idx].peer_phy_params_known = false;
+            }
+
+            // Store PT's requested parameters from Association Request IE
+            if (assoc_req_ie_found) {
+                dect_mac_peer_info_t *peer_ctx = &ctx->role_ctx.ft.connected_pts[peer_slot_idx];
+                peer_ctx->pt_requested_harq_params_valid = req_fields.harq_params_present;
+                if (req_fields.harq_params_present) {
+                    peer_ctx->pt_req_harq_procs_tx = req_fields.harq_processes_tx_val;
+                    peer_ctx->pt_req_max_harq_retx_delay = req_fields.max_harq_re_tx_delay_code;
+                    peer_ctx->pt_req_harq_procs_rx = req_fields.harq_processes_rx_val;
+                    peer_ctx->pt_req_max_harq_rerx_delay = req_fields.max_harq_re_rx_delay_code;
+                    LOG_DBG("FT_SM_ASSOC: PT 0x%04X requests HARQ: TXP %u, TXD %u, RXP %u, RXD %u",
+                            pt_tx_short_rd_id, peer_ctx->pt_req_harq_procs_tx, peer_ctx->pt_req_max_harq_retx_delay,
+                            peer_ctx->pt_req_harq_procs_rx, peer_ctx->pt_req_max_harq_rerx_delay);
+                }
+                peer_ctx->pt_req_num_flows = (req_fields.number_of_flows_val <= MAX_FLOW_IDS_IN_ASSOC_REQ) ? req_fields.number_of_flows_val : 0;
+                if (peer_ctx->pt_req_num_flows > 0) {
+                    memcpy(peer_ctx->pt_req_flow_ids, req_fields.flow_ids, peer_ctx->pt_req_num_flows);
+                    // LOG_HEXDUMP_DBG(peer_ctx->pt_req_flow_ids, peer_ctx->pt_req_num_flows, "PT Req Flow IDs:");
+                }
+                peer_ctx->pt_is_ft_capable = req_fields.ft_mode_capable;
+                if (peer_ctx->pt_is_ft_capable) {
+                    LOG_DBG("FT_SM_ASSOC: PT 0x%04X is FT capable.", pt_tx_short_rd_id);
+                    // TODO: Store req_fields.ft_network_beacon_period_code etc. if FT needs to act on them.
+                }
+            }
         }
-    } else { // No peer slot available
-        // accept_association will be set to false later based on this
-    }
+
 
 
     if (peer_slot_idx < 0) {

@@ -239,13 +239,26 @@ typedef struct {
     // bool    peer_supports_half_duplex;
     bool peer_phy_params_known;     // True if RD Capability IE has been successfully parsed for this peer.
 
+    // --- Parameters Requested by PT in Association Request ---
+    bool pt_requested_harq_params_valid; // True if PT included HARQ params in its request
+    uint8_t pt_req_harq_procs_tx;        // PT's requested number of TX HARQ processes (code)
+    uint8_t pt_req_max_harq_retx_delay;  // PT's requested max re-TX delay (code)
+    uint8_t pt_req_harq_procs_rx;        // PT's requested number of RX HARQ processes (code)
+    uint8_t pt_req_max_harq_rerx_delay;  // PT's requested max re-RX delay (code)
+
+    uint8_t pt_req_num_flows;            // Number of specific flows PT requested (0-6)
+    uint8_t pt_req_flow_ids[MAX_FLOW_IDS_IN_ASSOC_REQ]; // Actual 6-bit flow IDs PT requested
+
+    bool pt_is_ft_capable;              // From PT's AssocReq ft_mode_capable flag
+    // TODO: Add fields for pt_req_ft_beacon_periods, pt_req_ft_next_channel etc. if FT needs to store them.
+    // For now, FT might just log these if PT is FT capable.
 
     // --- Pending HARQ Feedback TO SEND to this peer (for PDUs *we* received from *them*) ---
     struct {
-        bool valid;                 // True if this feedback slot is pending
-        bool is_ack;                // True for ACK, false for NACK
-        uint8_t harq_process_num_for_peer; // The HARQ process number *of the peer's transmission* that this feedback is for.
-    } pending_feedback_to_send[2];  // Max 2 feedback items can be sent in one nRF PHY Type 2 PCC feedback field (using Format 3)
+        bool valid;
+        bool is_ack;
+        uint8_t harq_process_num_for_peer;
+    } pending_feedback_to_send[2];
     uint8_t num_pending_feedback_items;
 
     // Other peer-specific state (timers for link supervision, QoS parameters, active schedules for this peer, etc.)
