@@ -1766,37 +1766,59 @@ static void ft_send_association_response_action(uint32_t pt_long_rd_id, uint16_t
         resp_fields.number_of_flows_accepted = 0;
         resp_fields.group_assignment_active = false;
     } else { // Accept Association
-        // TODO: FT needs to decide if it modifies PT's requested HARQ params.
-        // For now, assume FT accepts PT's implicit request or has its own standard.
-        resp_fields.harq_mod_present = false; // Set to true if FT provides different HARQ params
-        if (resp_fields.harq_mod_present) {
-            // Populate resp_fields.harq_processes_tx_val_ft, max_harq_re_tx_delay_code_ft, etc.
-            // with FT's chosen parameters for this link.
-            // These would come from FT's policy or negotiation based on PT's request.
-            // Example:
-            // resp_fields.harq_processes_tx_val_ft = CONFIG_DECT_MAC_FT_HARQ_TX_PROC_CODE;
-            // resp_fields.max_harq_re_tx_delay_code_ft = CONFIG_DECT_MAC_FT_HARQ_RETX_DELAY_CODE;
-            // ... and for RX
+        dect_mac_peer_info_t *pt_peer_ctx = (peer_slot_idx != -1) ? &ctx->role_ctx.ft.connected_pts[peer_slot_idx] : NULL;
+
+        // HARQ Parameter Negotiation
+        if (pt_peer_ctx && pt_peer_ctx->pt_requested_harq_params_valid) {
+            // Example: FT accepts PT's request if reasonable, else uses its own defaults.
+            // For now, let's assume FT will try to match PT's request or offer its own standard config.
+            // If FT wants to propose different params than PT requested, set harq_mod_present = true.
+            resp_fields.harq_mod_present = true; // Let's assume FT always specifies its params for the link.
+            
+            // FT's parameters for communication towards this PT (FT is TX, PT is RX)
+            resp_fields.harq_processes_tx_val_ft = CONFIG_DECT_MAC_FT_HARQ_TX_PROC_CODE; // FT's capability/preference
+            resp_fields.max_harq_re_tx_delay_code_ft = CONFIG_DECT_MAC_FT_HARQ_RETX_DELAY_CODE;
+
+            // FT's parameters for communication from this PT (FT is RX, PT is TX)
+            resp_fields.harq_processes_rx_val_ft = CONFIG_DECT_MAC_FT_HARQ_RX_PROC_CODE;
+            resp_fields.max_harq_re_rx_delay_code_ft = CONFIG_DECT_MAC_FT_HARQ_RERX_DELAY_CODE;
+            LOG_DBG("FT_ASSOC_RESP: Setting HARQ params for PT 0x%04X: TXP %u,TXD %u, RXP %u,RXD %u",
+                    pt_short_rd_id, resp_fields.harq_processes_tx_val_ft, resp_fields.max_harq_re_tx_delay_code_ft,
+                    resp_fields.harq_processes_rx_val_ft, resp_fields.max_harq_re_rx_delay_code_ft);
+        } else {
+            resp_fields.harq_mod_present = false; // PT did not specify, or no peer_ctx
         }
 
-        // TODO: FT needs to decide which of PT's requested flows are accepted.
-        // PT's AssocReq (assoc_req_fields.number_of_flows_val and .flow_ids) should be available
-        // if ft_process_association_request_pdu stored them in pt_peer_ctx.
-        // For now, assume FT accepts all (0) initially requested flows.
-        resp_fields.number_of_flows_accepted = 0x07; // Code 7: "All flows requested in the corresponding Association Request message"
-                                                     // If PT requested 0 flows, this means 0 flows are set up beyond defaults.
-        // If specific flows were accepted (e.g., N flows):
-        // resp_fields.number_of_flows_accepted = N; // Where N is 1-6
-        // for (int i=0; i<N; ++i) resp_fields.accepted_flow_ids[i] = actual_accepted_flow_id_from_pt_req[i];
-
-        // TODO: FT decides if group assignment is active for this PT.
-        resp_fields.group_assignment_active = false;
-        if (resp_fields.group_assignment_active) {
-            // Populate resp_fields.group_id_val and resp_fields.resource_tag_val
-            // resp_fields.group_id_val = ... ; // 7-bit value
-            // resp_fields.resource_tag_val = ... ; // 7-bit value
+        // Flow ID Acceptance
+        if (pt_peer_ctx && pt_peer_ctx->pt_req_num_flows > 0 && pt_peer_ctx->pt_req_num_flows <= MAX_FLOW_IDS_IN_ASSOC_REQ) {
+            // Example: FT accepts all flows requested by PT, up to what FT can handle.
+            // For now, accept all that PT requested if PT requested any.
+            resp_fields.number_of_flows_accepted = pt_peer_ctx->pt_req_num_flows;
+            memcpy(resp_fields.accepted_flow_ids, pt_peer_ctx->pt_req_flow_ids, pt_peer_ctx->pt_req_num_flows);
+            LOG_DBG("FT_ASSOC_RESP: Accepting %u flows as requested by PT 0x%04X.",
+                    resp_fields.number_of_flows_accepted, pt_short_rd_id);
+        } else {
+            // If PT requested 0 flows, or special code 7 ("all previously configured" - not applicable for initial assoc)
+            // FT indicates 0 specific flows are being established by this response beyond defaults.
+            resp_fields.number_of_flows_accepted = 0; // No specific flows from this response.
+            // Or, if PT sent 7, FT could also send 7 if it means "ok, we use our existing understanding".
+            // For initial association, if PT sends 0, FT sending 7 means "I accept your 0 requested flows".
+            if (pt_peer_ctx && pt_peer_ctx->pt_req_num_flows == 0) {
+                 resp_fields.number_of_flows_accepted = 0x07; // "All (zero) requested flows accepted"
+            }
         }
+        
+        // Group Assignment
+        resp_fields.group_assignment_active = false; // Default: no group assignment
+        // if (ft_decides_to_assign_group) {
+        //    resp_fields.group_assignment_active = true;
+        //    resp_fields.group_id_val = assigned_group_id & 0x7F;
+        //    resp_fields.resource_tag_val = assigned_resource_tag & 0x7F;
+        // }
     }
+
+
+
     resp_fields.reserved_3bits = 0; // Ensure reserved bits are zero
 
     // --- SDU Area Construction ---

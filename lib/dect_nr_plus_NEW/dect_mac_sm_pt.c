@@ -1610,36 +1610,64 @@ static void pt_process_association_response_pdu(const uint8_t *mac_sdu_area_data
         if (ie_type == IE_TYPE_ASSOC_RESP) {
             if (parse_assoc_resp_ie_payload(ie_payload_ptr, ie_payload_len, &resp_fields) == 0) {
                 resp_ie_found = true;
-
-                    LOG_DBG("PT_SM_ASSOC_RESP: Parsed Assoc Resp IE (ACK: %d, HARQMod: %d, NumFlowsAcc: %u, GrpAct: %d).",
+                    LOG_DBG("PT_SM_ASSOC_RESP: Parsed Assoc Resp IE (ACK: %d, HARQModPresent: %d, NumFlowsAccCode: %u, GrpAct: %d).",
                             resp_fields.ack_nack, resp_fields.harq_mod_present,
                             resp_fields.number_of_flows_accepted, resp_fields.group_assignment_active);
+
                     if (!resp_fields.ack_nack) {
                         LOG_WRN("PT_SM_ASSOC_RESP: Rejected by FT. Cause: %u, TimerCode: %u",
                                 resp_fields.reject_cause, resp_fields.reject_timer_code);
-                    } else { // ACK
+                        // Further rejection handling (like honoring reject_timer_code) is below.
+                    } else { // ACK - Store and use the parameters
+                        // Store in associated_ft context (which was copied from target_ft)
+                        dect_mac_peer_info_t *assoc_ft = &ctx->role_ctx.pt.associated_ft;
+
                         if (resp_fields.harq_mod_present) {
-                            LOG_INF("PT_SM_ASSOC_RESP: FT provided HARQ Params -> TX Procs: %u, ReTX DelayCode: %u; RX Procs: %u, ReRX DelayCode: %u",
+                            LOG_INF("PT_SM_ASSOC_RESP: FT provided HARQ Params -> FT_TX(PT_RX) Procs: %u (code), ReTX_Delay: %u (code); FT_RX(PT_TX) Procs: %u (code), ReRX_Delay: %u (code)",
                                     resp_fields.harq_processes_tx_val_ft, resp_fields.max_harq_re_tx_delay_code_ft,
                                     resp_fields.harq_processes_rx_val_ft, resp_fields.max_harq_re_rx_delay_code_ft);
-                            // TODO: PT should store and use these FT-provided HARQ parameters for the link.
+                            // TODO: PT should store these parameters in assoc_ft context and configure its
+                            // local HARQ entities (e.g., number of processes to use for TX to this FT,
+                            // expected ACK/NACK turnaround time from FT).
+                            // Example:
+                            // assoc_ft->peer_harq_config.tx_procs_code = resp_fields.harq_processes_rx_val_ft; // What FT can RX from PT
+                            // assoc_ft->peer_harq_config.rx_procs_code = resp_fields.harq_processes_tx_val_ft; // What FT will TX to PT
+                        } else {
+                            LOG_INF("PT_SM_ASSOC_RESP: FT did not provide specific HARQ params (harq_mod_present=0). PT uses its requested/default.");
+                            // PT will use HARQ params it requested in AssocReq (or system defaults).
                         }
+
                         if (resp_fields.number_of_flows_accepted <= MAX_FLOW_IDS_IN_ASSOC_REQ && resp_fields.number_of_flows_accepted > 0) {
-                            // char flow_ids_str_pt[MAX_FLOW_IDS_IN_ASSOC_REQ * 3 + 1] = {0};
-                            // for(int k=0; k < resp_fields.number_of_flows_accepted; ++k) { snprintf(flow_ids_str_pt + strlen(flow_ids_str_pt), sizeof(flow_ids_str_pt)-strlen(flow_ids_str_pt), "%u,", resp_fields.accepted_flow_ids[k]); }
-                            // if(strlen(flow_ids_str_pt) > 0) flow_ids_str_pt[strlen(flow_ids_str_pt)-1] = '\0';
-                            // LOG_INF("PT_SM_ASSOC_RESP: FT Accepted Flows (%u): [%s]", resp_fields.number_of_flows_accepted, flow_ids_str_pt);
                             LOG_INF("PT_SM_ASSOC_RESP: FT Accepted %u specific flows.", resp_fields.number_of_flows_accepted);
-                            // TODO: PT should store these accepted flow_ids and configure DLC/CVG accordingly.
+                            // for(int k=0; k < resp_fields.number_of_flows_accepted; ++k) {
+                            //     LOG_INF("  Flow ID: %u", resp_fields.accepted_flow_ids[k]);
+                            // }
+                            // TODO: PT should store these accepted_flow_ids in assoc_ft context
+                            // and inform DLC/CVG to set up these logical channels/endpoints.
+                            // Example:
+                            // assoc_ft->num_active_flows = resp_fields.number_of_flows_accepted;
+                            // memcpy(assoc_ft->active_flow_ids, resp_fields.accepted_flow_ids, resp_fields.number_of_flows_accepted);
                         } else if (resp_fields.number_of_flows_accepted == 0x07) {
-                            LOG_INF("PT_SM_ASSOC_RESP: FT accepted all (0) requested flows.");
+                            LOG_INF("PT_SM_ASSOC_RESP: FT accepted all (implicitly 0 for initial) requested flows.");
+                            // assoc_ft->num_active_flows = 0; // Or based on what PT actually requested if it was non-zero.
+                        } else { // Number of flows is 0
+                            LOG_INF("PT_SM_ASSOC_RESP: FT indicates 0 specific flows established by this response.");
+                            // assoc_ft->num_active_flows = 0;
                         }
+
                         if (resp_fields.group_assignment_active) {
                             LOG_INF("PT_SM_ASSOC_RESP: FT activated Group Assignment -> GroupID: %u, ResourceTag: %u",
                                     resp_fields.group_id_val, resp_fields.resource_tag_val);
-                            // TODO: PT should store and use these for group communication.
+                            // TODO: PT should store group_id_val and resource_tag_val in assoc_ft context
+                            // and use them for group communication if applicable.
+                            // Example:
+                            // assoc_ft->group_id = resp_fields.group_id_val;
+                            // assoc_ft->resource_tag = resp_fields.resource_tag_val;
                         }
                     }
+
+
+
 
                 } else { 
                     LOG_ERR("PT_SM_ASSOC_RESP: Failed to parse Assoc Resp IE payload."); 
